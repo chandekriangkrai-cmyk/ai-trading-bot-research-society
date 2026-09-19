@@ -65,3 +65,28 @@ def create_mission(
     db.refresh(mission)
 
     return mission
+        db.add(mission)
+    db.commit()
+    db.refresh(mission)
+
+    return mission
+
+
+@router.delete(
+    "/{mission_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_mission(
+    mission_id: str,
+    db: Session = Depends(get_db),
+) -> None:
+    mission = db.get(Mission, mission_id)
+
+    if mission is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Mission not found.",
+        )
+
+    db.delete(mission)
+    db.commit()
