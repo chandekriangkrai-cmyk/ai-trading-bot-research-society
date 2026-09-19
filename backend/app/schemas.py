@@ -61,17 +61,66 @@ class MissionResponse(MissionBase):
 
 
 # =========================================================
+# Research Tasks
+# =========================================================
+
+class ResearchTaskBase(BaseModel):
+    mission_id: str = Field(
+        min_length=1,
+        description="UUID ของ Mission"
+    )
+
+    agent_id: str = Field(
+        min_length=1,
+        description="UUID ของ Agent"
+    )
+
+    title: str = Field(
+        min_length=3,
+        max_length=255,
+        description="ชื่อภารกิจย่อย"
+    )
+
+    description: str = Field(
+        min_length=3,
+        description="รายละเอียดภารกิจย่อย"
+    )
+
+
+class ResearchTaskCreate(ResearchTaskBase):
+    pass
+
+
+class ResearchTaskUpdate(BaseModel):
+    status: Optional[str] = Field(
+        default=None,
+        description="สถานะของ Task"
+    )
+
+    result: Optional[str] = Field(
+        default=None,
+        description="ผลลัพธ์จาก Agent"
+    )
+
+
+class ResearchTaskResponse(ResearchTaskBase):
+    id: str
+    status: str
+    result: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# =========================================================
 # EA Files
 # =========================================================
 
 class EAFileCreate(BaseModel):
-    """
-    ใช้สำหรับบันทึกไฟล์ EA จาก source code โดยตรง
-    """
-
     mission_id: str = Field(
         min_length=1,
-        description="UUID ของ Mission ที่ต้องการเชื่อมโยง"
+        description="UUID ของ Mission"
     )
 
     filename: str = Field(
@@ -82,15 +131,11 @@ class EAFileCreate(BaseModel):
 
     source_code: str = Field(
         min_length=1,
-        description="Source code ภาษา MQL5 ทั้งหมด"
+        description="Source code ภาษา MQL5"
     )
 
 
 class EAFileResponse(BaseModel):
-    """
-    ข้อมูลสรุปของไฟล์ EA ที่ถูกอัปโหลด
-    """
-
     id: str
     mission_id: str
     filename: str
@@ -103,10 +148,6 @@ class EAFileResponse(BaseModel):
 
 
 class EAAnalysisResponse(BaseModel):
-    """
-    ผลการวิเคราะห์โครงสร้างเบื้องต้นของ EA
-    """
-
     ea_file_id: str
     filename: str
     line_count: int
