@@ -3,19 +3,23 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import agents, health, missions, tasks, ea_files
+from app.api import (
+    agents,
+    health,
+    missions,
+    tasks,
+    ea_files,
+)
+
 from app.config import settings
 from app.database import Base, engine
 
-# Import model เพื่อให้ SQLAlchemy รู้จักตาราง EA Files
+# ลงทะเบียนโมเดล EAFile ให้ SQLAlchemy รู้จัก
 from app.ea_files import EAFile
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    สร้างตารางฐานข้อมูลเมื่อ Backend เริ่มทำงาน
-    """
     Base.metadata.create_all(bind=engine)
     yield
 
