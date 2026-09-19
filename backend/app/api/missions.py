@@ -3,7 +3,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Mission
+from app.models import Mission, ResearchTask
+from app.ea_files import EAFile
 from app.schemas import MissionCreate, MissionResponse
 
 
@@ -83,5 +84,35 @@ def delete_mission(
             detail="Mission not found.",
         )
 
-    db.delete(mission)
-    db.commit()
+    try:
+        # -----------------------------------------
+        # 1. ลบ Research Tasks ของ Mission ก่อน
+        # -----------------------------------------
+        db.query(ResearchTask).filter(
+            ResearchTask.mission_id == mission_id
+        ).delete(
+            synchronize_session=False
+        )
+
+        # -----------------------------------------
+        # 2. ลบ EA Files ของ Mission
+        # -----------------------------------------
+        db.query(EAFile).filter(
+            EAFile.mission_id == mission_id
+        ).delete(
+            synchronize_session=False
+        )
+
+        # -----------------------------------------
+        # 3. ลบ Mission
+        # -----------------------------------------
+        db.delete(mission)
+
+        # -----------------------------------------
+        # 4. Commit ทุกอย่างพร้อมกัน
+        # -----------------------------------------
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
