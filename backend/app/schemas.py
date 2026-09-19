@@ -81,9 +81,9 @@ class ResearchTaskBase(BaseModel):
         description="ชื่อภารกิจย่อย"
     )
 
-    description: str = Field(
+    instructions: str = Field(
         min_length=3,
-        description="รายละเอียดภารกิจย่อย"
+        description="รายละเอียดและคำสั่งของภารกิจย่อย"
     )
 
 
