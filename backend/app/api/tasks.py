@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Agent, Mission, ResearchTask
+from app.agent_runner import run_agent
+from app.ea_files import EAFile
 from app.schemas import (
     ResearchTaskCreate,
     ResearchTaskResponse,
@@ -220,7 +222,8 @@ def update_task(
             detail="Research task not found.",
         )
 
-    task.status = payload.status
+    if payload.status is not None:
+        task.status = payload.status
 
     if payload.result is not None:
         task.result = payload.result
@@ -294,3 +297,88 @@ def seed_tasks_for_mission(
             db.refresh(task)
 
     return created_tasks
+
+
+# --------------------------------------------------
+# Run one research task with AI agent
+# --------------------------------------------------
+
+@router.post(
+    "/{task_id}/run",
+    response_model=ResearchTaskResponse,
+)
+def run_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+) -> ResearchTask:
+
+    task = db.get(ResearchTask, task_id)
+
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Research task not found.",
+        )
+
+    mission = db.get(Mission, task.mission_id)
+
+    if not mission:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Mission not found.",
+        )
+
+    agent = db.get(Agent, task.agent_id)
+
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found.",
+        )
+
+    ea_file = (
+        db.query(EAFile)
+        .filter(EAFile.mission_id == mission.id)
+        .order_by(EAFile.created_at.desc())
+        .first()
+    )
+
+    task.status = "running"
+    db.commit()
+    db.refresh(task)
+
+    try:
+        result = run_agent(
+            mission=mission,
+            agent=agent,
+            task=task,
+            ea_filename=ea_file.filename if ea_file else None,
+            ea_source=ea_file.source_code if ea_file else None,
+        )
+
+    except Exception as exc:
+        db.rollback()
+
+        task = db.get(ResearchTask, task_id)
+
+        if task is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Research task not found.",
+            )
+
+        task.status = "failed"
+        task.result = f"Agent execution failed: {str(exc)}"
+
+        db.commit()
+        db.refresh(task)
+
+        return task
+
+    task.status = "completed"
+    task.result = result
+
+    db.commit()
+    db.refresh(task)
+
+    return task
