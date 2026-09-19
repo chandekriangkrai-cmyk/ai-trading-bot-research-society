@@ -3,15 +3,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import agents, health, missions, tasks
+from app.api import agents, health, missions, tasks, ea_files
 from app.config import settings
 from app.database import Base, engine
+
+# Import model เพื่อให้ SQLAlchemy รู้จักตาราง EA Files
+from app.ea_files import EAFile
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create database tables when the application starts.
-    # This includes the research_tasks table.
+    """
+    สร้างตารางฐานข้อมูลเมื่อ Backend เริ่มทำงาน
+    """
     Base.metadata.create_all(bind=engine)
     yield
 
@@ -32,7 +36,6 @@ app.add_middleware(
     allow_origins=[
         origin.strip()
         for origin in settings.cors_origins.split(",")
-        if origin.strip()
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -40,34 +43,20 @@ app.add_middleware(
 )
 
 
-# -------------------------
+# =========================================================
 # API Routers
-# -------------------------
+# =========================================================
 
-app.include_router(
-    health.router,
-    prefix="/api",
-)
-
-app.include_router(
-    agents.router,
-    prefix="/api",
-)
-
-app.include_router(
-    missions.router,
-    prefix="/api",
-)
-
-app.include_router(
-    tasks.router,
-    prefix="/api",
-)
+app.include_router(health.router, prefix="/api")
+app.include_router(agents.router, prefix="/api")
+app.include_router(missions.router, prefix="/api")
+app.include_router(tasks.router, prefix="/api")
+app.include_router(ea_files.router, prefix="/api")
 
 
-# -------------------------
+# =========================================================
 # Root Endpoint
-# -------------------------
+# =========================================================
 
 @app.get("/", tags=["System"])
 def root() -> dict[str, str]:
