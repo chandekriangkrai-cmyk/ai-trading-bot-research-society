@@ -1,7 +1,15 @@
 import re
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    UploadFile,
+    File,
+    Form,
+)
+
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -13,89 +21,245 @@ from app.schemas import (
     EAAnalysisResponse,
 )
 
+
 router = APIRouter(
     prefix="/ea-files",
     tags=["EA Files"],
 )
 
 
+# =========================================================
+# MQL5 Analyzer
+# =========================================================
+
 def analyze_mq5_code(source_code: str) -> dict:
     """
     ตรวจหาองค์ประกอบสำคัญในโค้ด MQL5
     """
 
+    source_lower = source_code.lower()
+
     def contains(*terms: str) -> bool:
-        return any(term.lower() in source_code.lower() for term in terms)
+        return any(
+            term.lower() in source_lower
+            for term in terms
+        )
 
     def extract_number(name: str):
-        pattern = rf"\b{name}\s*=\s*([0-9]+(?:\.[0-9]+)?)"
+        pattern = (
+            rf"\b{name}\s*=\s*"
+            r"([0-9]+(?:\.[0-9]+)?)"
+        )
+
         match = re.search(pattern, source_code)
 
         if match:
             value = match.group(1)
-            return float(value) if "." in value else int(value)
+
+            if "." in value:
+                return float(value)
+
+            return int(value)
 
         return None
 
     return {
         "has_trade_library": contains(
             "Trade\\Trade.mqh",
-            "Trade/Trade.mqh"
+            "Trade/Trade.mqh",
         ),
-        "has_buy_logic": contains(".Buy(", "trade.Buy"),
-        "has_sell_logic": contains(".Sell(", "trade.Sell"),
-        "has_atr_filter": contains("ATR", "iATR", "GetATR"),
+
+        "has_buy_logic": contains(
+            ".Buy(",
+            "trade.Buy",
+        ),
+
+        "has_sell_logic": contains(
+            ".Sell(",
+            "trade.Sell",
+        ),
+
+        "has_atr_filter": contains(
+            "ATR",
+            "iATR",
+            "GetATR",
+        ),
+
         "has_breakout_logic": contains(
             "Breakout",
-            "IsValidBreakoutCandle"
+            "IsValidBreakoutCandle",
         ),
+
         "has_support_resistance": contains(
             "Support",
             "Resistance",
-            "GetSupportResistanceRange"
+            "GetSupportResistanceRange",
         ),
+
         "has_risk_guard": contains(
             "RiskGuard",
             "MaxDailyLoss",
-            "MaxTotalLoss"
+            "MaxTotalLoss",
         ),
+
         "has_news_guard": contains(
             "NewsGuard",
-            "IsNewsTime"
+            "IsNewsTime",
         ),
+
         "has_friday_filter": contains(
             "Friday",
-            "CheckFridayClose"
+            "CheckFridayClose",
         ),
+
         "has_rollover_filter": contains(
             "Rollover",
-            "IsRolloverTime"
+            "IsRolloverTime",
         ),
+
         "has_lot_calculation": contains(
             "CalculateLotSize",
-            "NormalizeVolume"
+            "NormalizeVolume",
         ),
+
         "parameters": {
-            "RiskPercent": extract_number("RiskPercent"),
-            "SRLookbackBars": extract_number("SRLookbackBars"),
-            "SLRangePercent": extract_number("SLRangePercent"),
-            "TargetRR": extract_number("TargetRR"),
-            "MaxSpreadPoints": extract_number("MaxSpreadPoints"),
+            "RiskPercent": extract_number(
+                "RiskPercent"
+            ),
+
+            "SRLookbackBars": extract_number(
+                "SRLookbackBars"
+            ),
+
+            "SLRangePercent": extract_number(
+                "SLRangePercent"
+            ),
+
+            "TargetRR": extract_number(
+                "TargetRR"
+            ),
+
+            "MaxSpreadPoints": extract_number(
+                "MaxSpreadPoints"
+            ),
+
             "MinBreakoutBodyPct": extract_number(
                 "MinBreakoutBodyPct"
             ),
-            "ATRPeriod": extract_number("ATRPeriod"),
-            "MinCandleATR": extract_number("MinCandleATR"),
-            "MaxCandleATR": extract_number("MaxCandleATR"),
+
+            "ATRPeriod": extract_number(
+                "ATRPeriod"
+            ),
+
+            "MinCandleATR": extract_number(
+                "MinCandleATR"
+            ),
+
+            "MaxCandleATR": extract_number(
+                "MaxCandleATR"
+            ),
+
             "MaxDailyLossPct": extract_number(
                 "MaxDailyLossPct"
             ),
+
             "MaxTotalLossPct": extract_number(
                 "MaxTotalLossPct"
             ),
         },
     }
 
+
+# =========================================================
+# Upload EA File Directly
+# =========================================================
+
+@router.post(
+    "/upload",
+    response_model=EAFileResponse,
+    summary="อัปโหลดไฟล์ EA .mq5 โดยตรง",
+)
+async def upload_ea_file(
+    mission_id: str = Form(
+        ...,
+        description="UUID ของ Mission",
+    ),
+
+    file: UploadFile = File(
+        ...,
+        description="ไฟล์ EA ภาษา MQL5 นามสกุล .mq5",
+    ),
+
+    db: Session = Depends(get_db),
+):
+    """
+    รับไฟล์ .mq5 โดยตรงผ่าน multipart/form-data
+    """
+
+    # ตรวจสอบ Mission
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id
+    ).first()
+
+    if not mission:
+        raise HTTPException(
+            status_code=404,
+            detail="Mission not found",
+        )
+
+    # ตรวจสอบชื่อไฟล์
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="กรุณาเลือกไฟล์ EA",
+        )
+
+    if not file.filename.lower().endswith(".mq5"):
+        raise HTTPException(
+            status_code=400,
+            detail="รองรับเฉพาะไฟล์ .mq5 เท่านั้น",
+        )
+
+    # อ่านไฟล์
+    raw_content = await file.read()
+
+    if not raw_content:
+        raise HTTPException(
+            status_code=400,
+            detail="ไฟล์ว่างเปล่า",
+        )
+
+    # แปลงเป็น Source Code
+    source_code = raw_content.decode(
+        "utf-8",
+        errors="replace",
+    )
+
+    line_count = len(
+        source_code.splitlines()
+    )
+
+    # บันทึกลงฐานข้อมูล
+    ea_file = EAFile(
+        id=str(uuid.uuid4()),
+        mission_id=mission_id,
+        filename=file.filename,
+        file_type="mq5",
+        source_code=source_code,
+        line_count=line_count,
+        analysis_status="uploaded",
+    )
+
+    db.add(ea_file)
+    db.commit()
+    db.refresh(ea_file)
+
+    return ea_file
+
+
+# =========================================================
+# Save EA from Source Code
+# =========================================================
 
 @router.post(
     "",
@@ -128,7 +292,9 @@ def create_ea_file(
         filename=payload.filename,
         file_type="mq5",
         source_code=payload.source_code,
-        line_count=len(payload.source_code.splitlines()),
+        line_count=len(
+            payload.source_code.splitlines()
+        ),
         analysis_status="uploaded",
     )
 
@@ -138,6 +304,10 @@ def create_ea_file(
 
     return ea_file
 
+
+# =========================================================
+# List EA Files
+# =========================================================
 
 @router.get(
     "",
@@ -151,6 +321,10 @@ def list_ea_files(
         EAFile.created_at.desc()
     ).all()
 
+
+# =========================================================
+# Analyze EA File
+# =========================================================
 
 @router.get(
     "/{ea_file_id}/analyze",
