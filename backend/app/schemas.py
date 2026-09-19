@@ -1,8 +1,12 @@
 from datetime import datetime
-from typing import Literal
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+
+# =========================================================
+# Health
+# =========================================================
 
 class HealthResponse(BaseModel):
     status: str
@@ -11,9 +15,9 @@ class HealthResponse(BaseModel):
     environment: str
 
 
-# -------------------------
-# Agent Schemas
-# -------------------------
+# =========================================================
+# Agents
+# =========================================================
 
 class AgentBase(BaseModel):
     name: str = Field(min_length=2, max_length=120)
@@ -33,9 +37,9 @@ class AgentResponse(AgentBase):
     model_config = ConfigDict(from_attributes=True)
 
 
-# -------------------------
-# Mission Schemas
-# -------------------------
+# =========================================================
+# Missions
+# =========================================================
 
 class MissionBase(BaseModel):
     title: str = Field(min_length=3, max_length=255)
@@ -56,38 +60,55 @@ class MissionResponse(MissionBase):
     model_config = ConfigDict(from_attributes=True)
 
 
-# -------------------------
-# Research Task Schemas
-# -------------------------
+# =========================================================
+# EA Files
+# =========================================================
 
-class ResearchTaskBase(BaseModel):
-    mission_id: str = Field(min_length=1)
-    agent_id: str = Field(min_length=1)
-    title: str = Field(min_length=3, max_length=255)
-    instructions: str = Field(min_length=3)
+class EAFileCreate(BaseModel):
+    """
+    ใช้สำหรับบันทึกไฟล์ EA จาก source code โดยตรง
+    """
+
+    mission_id: str = Field(
+        min_length=1,
+        description="UUID ของ Mission ที่ต้องการเชื่อมโยง"
+    )
+
+    filename: str = Field(
+        min_length=1,
+        max_length=255,
+        description="ชื่อไฟล์ EA เช่น M30Tradedabreak.mq5"
+    )
+
+    source_code: str = Field(
+        min_length=1,
+        description="Source code ภาษา MQL5 ทั้งหมด"
+    )
 
 
-class ResearchTaskCreate(ResearchTaskBase):
-    pass
+class EAFileResponse(BaseModel):
+    """
+    ข้อมูลสรุปของไฟล์ EA ที่ถูกอัปโหลด
+    """
 
-
-class ResearchTaskUpdate(BaseModel):
-    status: Literal[
-        "pending",
-        "in_progress",
-        "completed",
-        "failed",
-        "cancelled",
-    ]
-
-    result: str | None = None
-
-
-class ResearchTaskResponse(ResearchTaskBase):
     id: str
-    status: str
-    result: str | None
-    created_at: datetime
-    updated_at: datetime
+    mission_id: str
+    filename: str
+    file_type: str
+    line_count: int
+    analysis_status: str
+    created_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class EAAnalysisResponse(BaseModel):
+    """
+    ผลการวิเคราะห์โครงสร้างเบื้องต้นของ EA
+    """
+
+    ea_file_id: str
+    filename: str
+    line_count: int
+    detected_features: dict
+    analysis_status: str
