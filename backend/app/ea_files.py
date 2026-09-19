@@ -9,12 +9,15 @@ class EAFile(Base):
     __tablename__ = "ea_files"
 
     id = Column(String, primary_key=True)
-    mission_id = Column(String, ForeignKey("missions.id"), nullable=False)
+    mission_id = Column(
+        String,
+        ForeignKey("missions.id"),
+        nullable=False
+    )
 
     filename = Column(String, nullable=False)
     file_type = Column(String, nullable=False, default="mq5")
     source_code = Column(Text, nullable=False)
-
     line_count = Column(Integer, nullable=False, default=0)
     analysis_status = Column(
         String,
