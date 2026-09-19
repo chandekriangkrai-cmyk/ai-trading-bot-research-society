@@ -10,104 +10,101 @@ from app.ea_files import EAFile
 from app.schemas import (
     EAFileCreate,
     EAFileResponse,
-    EAAnalysisResponse
+    EAAnalysisResponse,
 )
-
 
 router = APIRouter(
     prefix="/ea-files",
-    tags=["EA Files"]
+    tags=["EA Files"],
 )
 
 
 def analyze_mq5_code(source_code: str) -> dict:
     """
-    วิเคราะห์โค้ด MQL5 จากเนื้อหาจริง
-    ไม่รัน EA และไม่ส่งคำสั่งซื้อขาย
+    ตรวจหาองค์ประกอบสำคัญในโค้ด MQL5
     """
 
-    def has(pattern: str) -> bool:
-        return re.search(
-            pattern,
-            source_code,
-            flags=re.IGNORECASE
-        ) is not None
+    def contains(*terms: str) -> bool:
+        return any(term.lower() in source_code.lower() for term in terms)
 
-    def extract_input(name: str):
-        pattern = (
-            r"\binput\s+[^;]*\b"
-            + re.escape(name)
-            + r"\s*=\s*([^;]+)"
-        )
-
-        match = re.search(
-            pattern,
-            source_code,
-            flags=re.IGNORECASE
-        )
+    def extract_number(name: str):
+        pattern = rf"\b{name}\s*=\s*([0-9]+(?:\.[0-9]+)?)"
+        match = re.search(pattern, source_code)
 
         if match:
-            return match.group(1).strip()
+            value = match.group(1)
+            return float(value) if "." in value else int(value)
 
         return None
 
-    features = {
-        "uses_trade_class": has(r"#include\s*[<\"]Trade\\Trade\.mqh[>\"]"),
-        "has_buy_order": has(r"\.Buy\s*\("),
-        "has_sell_order": has(r"\.Sell\s*\("),
-        "has_atr": has(r"\bATR\b|iATR|GetATR"),
-        "has_support_resistance": has(
-            r"Support|Resistance|GetSupportResistanceRange"
+    return {
+        "has_trade_library": contains(
+            "Trade\\Trade.mqh",
+            "Trade/Trade.mqh"
         ),
-        "has_breakout_filter": has(
-            r"Breakout|IsValidBreakoutCandle"
+        "has_buy_logic": contains(".Buy(", "trade.Buy"),
+        "has_sell_logic": contains(".Sell(", "trade.Sell"),
+        "has_atr_filter": contains("ATR", "iATR", "GetATR"),
+        "has_breakout_logic": contains(
+            "Breakout",
+            "IsValidBreakoutCandle"
         ),
-        "has_risk_guard": has(
-            r"RiskGuard|MaxDailyLoss|MaxTotalLoss"
+        "has_support_resistance": contains(
+            "Support",
+            "Resistance",
+            "GetSupportResistanceRange"
         ),
-        "has_news_filter": has(
-            r"NewsGuard|IsNewsTime"
+        "has_risk_guard": contains(
+            "RiskGuard",
+            "MaxDailyLoss",
+            "MaxTotalLoss"
         ),
-        "has_friday_filter": has(
-            r"Friday|CheckFridayClose"
+        "has_news_guard": contains(
+            "NewsGuard",
+            "IsNewsTime"
         ),
-        "has_rollover_filter": has(
-            r"Rollover|IsRolloverTime"
+        "has_friday_filter": contains(
+            "Friday",
+            "CheckFridayClose"
         ),
-        "has_lot_calculation": has(
-            r"CalculateLotSize|NormalizeVolume"
+        "has_rollover_filter": contains(
+            "Rollover",
+            "IsRolloverTime"
         ),
-        "inputs": {
-            "RiskPercent": extract_input("RiskPercent"),
-            "SRLookbackBars": extract_input("SRLookbackBars"),
-            "SLRangePercent": extract_input("SLRangePercent"),
-            "TargetRR": extract_input("TargetRR"),
-            "MaxSpreadPoints": extract_input("MaxSpreadPoints"),
-            "MinBreakoutBodyPct": extract_input(
+        "has_lot_calculation": contains(
+            "CalculateLotSize",
+            "NormalizeVolume"
+        ),
+        "parameters": {
+            "RiskPercent": extract_number("RiskPercent"),
+            "SRLookbackBars": extract_number("SRLookbackBars"),
+            "SLRangePercent": extract_number("SLRangePercent"),
+            "TargetRR": extract_number("TargetRR"),
+            "MaxSpreadPoints": extract_number("MaxSpreadPoints"),
+            "MinBreakoutBodyPct": extract_number(
                 "MinBreakoutBodyPct"
             ),
-            "ATRPeriod": extract_input("ATRPeriod"),
-            "MinCandleATR": extract_input("MinCandleATR"),
-            "MaxCandleATR": extract_input("MaxCandleATR"),
-            "MaxDailyLossPct": extract_input(
+            "ATRPeriod": extract_number("ATRPeriod"),
+            "MinCandleATR": extract_number("MinCandleATR"),
+            "MaxCandleATR": extract_number("MaxCandleATR"),
+            "MaxDailyLossPct": extract_number(
                 "MaxDailyLossPct"
             ),
-            "MaxTotalLossPct": extract_input(
+            "MaxTotalLossPct": extract_number(
                 "MaxTotalLossPct"
-            )
-        }
+            ),
+        },
     }
-
-    return features
 
 
 @router.post(
     "",
-    response_model=EAFileResponse
+    response_model=EAFileResponse,
+    summary="บันทึกไฟล์ EA จาก Source Code",
 )
-def upload_ea_file(
+def create_ea_file(
     payload: EAFileCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     mission = db.query(Mission).filter(
         Mission.id == payload.mission_id
@@ -116,19 +113,13 @@ def upload_ea_file(
     if not mission:
         raise HTTPException(
             status_code=404,
-            detail="Mission not found"
+            detail="Mission not found",
         )
 
     if not payload.filename.lower().endswith(".mq5"):
         raise HTTPException(
             status_code=400,
-            detail="Only .mq5 files are supported"
-        )
-
-    if not payload.source_code.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Source code cannot be empty"
+            detail="รองรับเฉพาะไฟล์ .mq5",
         )
 
     ea_file = EAFile(
@@ -138,7 +129,7 @@ def upload_ea_file(
         file_type="mq5",
         source_code=payload.source_code,
         line_count=len(payload.source_code.splitlines()),
-        analysis_status="uploaded"
+        analysis_status="uploaded",
     )
 
     db.add(ea_file)
@@ -150,10 +141,11 @@ def upload_ea_file(
 
 @router.get(
     "",
-    response_model=list[EAFileResponse]
+    response_model=list[EAFileResponse],
+    summary="แสดงรายการไฟล์ EA ทั้งหมด",
 )
 def list_ea_files(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     return db.query(EAFile).order_by(
         EAFile.created_at.desc()
@@ -162,11 +154,12 @@ def list_ea_files(
 
 @router.get(
     "/{ea_file_id}/analyze",
-    response_model=EAAnalysisResponse
+    response_model=EAAnalysisResponse,
+    summary="วิเคราะห์โครงสร้างไฟล์ EA",
 )
 def analyze_ea_file(
     ea_file_id: str,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     ea_file = db.query(EAFile).filter(
         EAFile.id == ea_file_id
@@ -175,7 +168,7 @@ def analyze_ea_file(
     if not ea_file:
         raise HTTPException(
             status_code=404,
-            detail="EA file not found"
+            detail="EA file not found",
         )
 
     detected_features = analyze_mq5_code(
@@ -185,11 +178,12 @@ def analyze_ea_file(
     ea_file.analysis_status = "analyzed"
 
     db.commit()
+    db.refresh(ea_file)
 
     return {
         "ea_file_id": ea_file.id,
         "filename": ea_file.filename,
         "line_count": ea_file.line_count,
         "detected_features": detected_features,
-        "analysis_status": ea_file.analysis_status
-  }
+        "analysis_status": ea_file.analysis_status,
+    }
