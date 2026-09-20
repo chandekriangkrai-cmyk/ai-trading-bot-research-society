@@ -13,6 +13,7 @@ from app.api import (
     research_runner,
     research_runner_v3,
     research_runner_v4,
+    research_runner_v5,
 )
 
 from app.config import settings
@@ -64,6 +65,7 @@ app.include_router(research.router, prefix="/api")
 app.include_router(research_runner.router, prefix="/api")
 app.include_router(research_runner_v3.router, prefix="/api")
 app.include_router(research_runner_v4.router, prefix="/api")
+app.include_router(research_runner_v5.router, prefix="/api")
 
 
 # =========================================================
