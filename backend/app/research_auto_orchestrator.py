@@ -34,10 +34,6 @@ POLICIES = os.getenv(
     "RESEARCH_V11_POLICIES",
     "flat,high_defensive,low_defensive,high_low_defensive",
 )
-BASELINE_2024_2025_EXPERIMENT_ID = os.getenv(
-    "RESEARCH_BASELINE_2024_2025_EXPERIMENT_ID",
-    "1e2e17b9-534f-4346-aafe-f0266cd80afe",
-)
 
 STAGES = [
     "v1_import_trades",
@@ -147,10 +143,14 @@ def _missing_for(stage: str, files: dict[str, Path | None]) -> list[str]:
 
 
 async def _run_v11_2_auto(experiment_id: str) -> Any:
-    """Run the locked 2024/2025 + current experiment unseen-year gate."""
+    """Run the locked 2024/2025 + unseen 2026 gate for the current experiment."""
+    baseline_id = os.getenv(
+        "RESEARCH_BASELINE_2024_2025_EXPERIMENT_ID",
+        "1e2e17b9-534f-4346-aafe-f0266cd80afe",
+    )
     return robustness_gate_3year(
         experiment_id=experiment_id,
-        baseline_2024_2025_experiment_id=BASELINE_2024_2025_EXPERIMENT_ID,
+        baseline_2024_2025_experiment_id=baseline_id,
         min_trades=MIN_TRADES,
     )
 
@@ -331,8 +331,24 @@ async def run_cycle() -> dict[str, Any]:
             ids = _experiment_ids()
             cycle = []
 
+            # Always attempt the locked three-year gate first. It needs no
+            # Swagger input and reads the existing 2024/2025 + 2026 results.
             for experiment_id in ids:
                 cycle.append(await _process_experiment(experiment_id))
+                try:
+                    cycle.append({
+                        "experiment_id": experiment_id,
+                        "stage": "v11_2_three_year",
+                        "status": "completed",
+                        "result": await _run_v11_2_auto(experiment_id),
+                    })
+                except Exception as exc:
+                    cycle.append({
+                        "experiment_id": experiment_id,
+                        "stage": "v11_2_three_year",
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
 
             _state["last_cycle"] = cycle
             _state["processed_experiments"] = len(cycle)
