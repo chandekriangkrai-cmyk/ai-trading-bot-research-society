@@ -157,16 +157,18 @@ def _missing_for(stage: str, files: dict[str, Path | None]) -> list[str]:
     return [x for x in required[stage] if files.get(x) is None]
 
 
-def _experiment_exists_for_mission(db, mission_id: str) -> Experiment | None:
-    return (
-        db.query(Experiment)
-        .filter(
-            Experiment.mission_id == mission_id,
-            Experiment.experiment_type == AUTO_EXPERIMENT_TYPE,
-        )
-        .order_by(Experiment.created_at.desc())
-        .first()
+def _experiment_exists_for_mission(
+    db,
+    mission_id: str,
+    ea_file_id: str | None = None,
+) -> Experiment | None:
+    query = db.query(Experiment).filter(
+        Experiment.mission_id == mission_id,
+        Experiment.experiment_type == AUTO_EXPERIMENT_TYPE,
     )
+    if ea_file_id is not None:
+        query = query.filter(Experiment.ea_file_id == ea_file_id)
+    return query.order_by(Experiment.created_at.desc()).first()
 
 
 def ensure_research_chain_for_mission(mission_id: str) -> list[str]:
@@ -280,7 +282,7 @@ def _ensure_research_chain() -> list[str]:
             if not ea:
                 continue
 
-            exp = _experiment_exists_for_mission(db, str(mission.id))
+            exp = _experiment_exists_for_mission(db, str(mission.id), str(ea.id))
             if exp:
                 continue
 

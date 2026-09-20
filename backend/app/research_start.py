@@ -11,7 +11,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from app.database import SessionLocal
 from app.ea_files import EAFile
 from app.models import Mission
-from app import research_auto_orchestrator
+from app import research_auto_orchestrator_auto as research_auto_orchestrator
 
 router = APIRouter(prefix="/research", tags=["One Click Research"])
 
