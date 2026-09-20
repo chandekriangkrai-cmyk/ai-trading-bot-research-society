@@ -140,7 +140,9 @@ async def start_research(
         if result:
             saved[field] = result
 
-    created = await research_auto_orchestrator.ensure_research_chain_for_mission(
+    # This helper is synchronous (it owns its SQLAlchemy session).
+    # Do not await the returned list.
+    created = research_auto_orchestrator.ensure_research_chain_for_mission(
         mission_id
     )
 
