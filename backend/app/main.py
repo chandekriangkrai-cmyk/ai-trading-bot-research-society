@@ -11,6 +11,7 @@ from app.api import (
     ea_files,
     research,
     research_runner,
+    research_runner_v3,
 )
 
 from app.config import settings
@@ -60,6 +61,7 @@ app.include_router(tasks.router, prefix="/api")
 app.include_router(ea_files.router, prefix="/api")
 app.include_router(research.router, prefix="/api")
 app.include_router(research_runner.router, prefix="/api")
+app.include_router(research_runner_v3.router, prefix="/api")
 
 
 # =========================================================
