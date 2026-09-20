@@ -62,7 +62,6 @@ def _fmt_number(value: Any, digits: int = 4) -> str:
 
 
 def _json_object(value: Any) -> dict[str, Any]:
-    """Decode a JSON object stored in an ExperimentResult Text column."""
     if isinstance(value, dict):
         return value
     if not isinstance(value, str) or not value.strip():
@@ -74,7 +73,54 @@ def _json_object(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _build_post(experiment: Experiment, result: ExperimentResult) -> tuple[str, str]:
+def _metric_payload(db, result: ExperimentResult) -> dict[str, Any]:
+    """Resolve the usable research metrics, following source_result_id when needed."""
+    seen: set[str] = set()
+    current = result
+
+    for _ in range(4):
+        result_id = str(getattr(current, "id", ""))
+        if result_id in seen:
+            break
+        seen.add(result_id)
+
+        metrics = _json_object(getattr(current, "metrics", None))
+        analysis = metrics.get("analysis")
+        if not isinstance(analysis, dict):
+            analysis = {}
+
+        overall = metrics.get("overall")
+        if not isinstance(overall, dict):
+            overall = analysis.get("overall")
+
+        if isinstance(overall, dict):
+            payload = dict(metrics)
+            payload["_overall"] = overall
+            payload["_result_id"] = result_id
+            payload["_conclusion"] = (
+                getattr(current, "conclusion", None)
+                or (metrics.get("summary", {}).get("conclusion")
+                    if isinstance(metrics.get("summary"), dict) else None)
+                or (analysis.get("summary", {}).get("conclusion")
+                    if isinstance(analysis.get("summary"), dict) else None)
+            )
+            return payload
+
+        source_id = metrics.get("source_result_id")
+        if not source_id:
+            break
+
+        source = db.query(ExperimentResult).filter(
+            ExperimentResult.id == str(source_id)
+        ).first()
+        if source is None:
+            break
+        current = source
+
+    return {}
+
+
+def _build_post(db, experiment: Experiment, result: ExperimentResult) -> tuple[str, str]:
     exp = _model_dict(experiment)
     res = _model_dict(result)
 
@@ -86,41 +132,17 @@ def _build_post(experiment: Experiment, result: ExperimentResult) -> tuple[str, 
         or "EURUSD M30 Research"
     )
 
-    net = _pick(res, "net_profit", "net_pnl", "profit", "total_profit")
-    pf = _pick(res, "profit_factor", "pf")
-    expectancy = _pick(res, "expectancy")
-    max_dd = _pick(res, "max_drawdown", "max_dd", "drawdown")
-    trades = _pick(res, "trades", "trade_count", "total_trades")
+    metric_payload = _metric_payload(db, result)
+    overall = metric_payload.get("_overall", {})
+    if not isinstance(overall, dict):
+        overall = {}
 
-    # ExperimentResult.metrics is a JSON Text column.
-    nested = _json_object(res.get("metrics"))
-    evidence = _json_object(res.get("evidence"))
-    overall = nested.get("overall")
-    overall = overall if isinstance(overall, dict) else nested
-
-    net = net if net is not None else _pick(
-        overall, "net_profit", "net_pnl", "profit", "total_profit"
-    )
-    pf = pf if pf is not None else _pick(overall, "profit_factor", "pf")
-    expectancy = expectancy if expectancy is not None else _pick(
-        overall, "expectancy"
-    )
-    max_dd = max_dd if max_dd is not None else _pick(
-        overall, "max_drawdown_absolute", "max_drawdown", "max_dd", "drawdown"
-    )
-    trades = trades if trades is not None else _pick(
-        overall, "trade_count", "trades", "total_trades"
-    )
-
-    summary = nested.get("summary")
-    summary = summary if isinstance(summary, dict) else {}
-    conclusion = _pick(res, "conclusion")
-    if conclusion is None:
-        conclusion = _pick(summary, "conclusion")
-    if conclusion is None:
-        conclusion = _pick(nested, "conclusion")
-    if conclusion is None:
-        conclusion = _pick(evidence, "conclusion")
+    net = _pick(overall, "net_profit", "net_pnl", "profit", "total_profit")
+    pf = _pick(overall, "profit_factor", "pf")
+    expectancy = _pick(overall, "expectancy")
+    max_dd = _pick(overall, "max_drawdown", "max_drawdown_absolute", "max_dd", "drawdown")
+    trades = _pick(overall, "trades", "trade_count", "total_trades", "closed_trade_count")
+    conclusion = metric_payload.get("_conclusion") or _pick(res, "conclusion")
 
     title = f"Research Update: {strategy}"
 
@@ -288,7 +310,7 @@ async def publish_research(experiment_id: str) -> dict[str, Any]:
                 detail="No research result found for this experiment",
             )
 
-        title, content = _build_post(experiment, result)
+        title, content = _build_post(db, experiment, result)
         published = await _publish(title, content)
 
         return {
@@ -326,7 +348,7 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
                 detail="No research result found for this experiment",
             )
 
-        title, content = _build_post(experiment, result)
+        title, content = _build_post(db, experiment, result)
         return {
             "status": "preview",
             "experiment_id": experiment_id,
