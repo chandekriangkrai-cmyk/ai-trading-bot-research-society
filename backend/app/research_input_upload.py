@@ -58,19 +58,20 @@ def _safe_experiment_id(value: str) -> str:
     return value
 
 
-
 OptionalUpload = Optional[Union[UploadFile, str]]
 
 
 def _normalize_upload(upload: OptionalUpload) -> Optional[UploadFile]:
-    # Swagger/OpenAPI may submit an empty string for an untouched optional
-    # file input. Treat that as no upload.
+    # Swagger sends "" for an untouched optional file input.
     if upload is None:
         return None
     if isinstance(upload, str):
         if not upload.strip():
             return None
-        raise HTTPException(status_code=400, detail="Invalid optional file upload.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid optional file upload.",
+        )
     return upload
 
 
@@ -165,14 +166,6 @@ def _folder(experiment_id: str) -> Path:
 
 @router.get("/{experiment_id}")
 def input_status(experiment_id: str) -> dict:
-    trades = _normalize_upload(trades)
-    market = _normalize_upload(market)
-    deals = _normalize_upload(deals)
-    is_deals = _normalize_upload(is_deals)
-    is_market = _normalize_upload(is_market)
-    oos_deals = _normalize_upload(oos_deals)
-    oos_market = _normalize_upload(oos_market)
-
     experiment_id = _safe_experiment_id(experiment_id)
     _experiment_exists(experiment_id)
 
@@ -206,6 +199,14 @@ async def upload_research_csv(
     oos_deals: OptionalUpload = File(None),
     oos_market: OptionalUpload = File(None),
 ) -> dict:
+    trades = _normalize_upload(trades)
+    market = _normalize_upload(market)
+    deals = _normalize_upload(deals)
+    is_deals = _normalize_upload(is_deals)
+    is_market = _normalize_upload(is_market)
+    oos_deals = _normalize_upload(oos_deals)
+    oos_market = _normalize_upload(oos_market)
+
     experiment_id = _safe_experiment_id(experiment_id)
     _experiment_exists(experiment_id)
 
