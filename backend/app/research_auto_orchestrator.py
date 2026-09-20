@@ -21,7 +21,7 @@ from app.api.research_runner_v7 import import_mt5_deals_context
 from app.api.research_runner_v8 import import_mt5_deals_entry_context
 from app.api.research_runner_v9 import walk_forward_entry_context
 from app.api.research_runner_v10 import robustness_gate
-from app.api.research_runner_v11 import regime_sizing_simulation
+from app.api import research_runner_v11
 from app.api.research_runner_v11_2 import robustness_gate_3year
 
 
@@ -218,7 +218,19 @@ async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | Non
             return robustness_gate(experiment_id, MIN_TRADES)
 
         if stage == "v11_sizing":
-            return await regime_sizing_simulation(
+            # Keep the worker boot-safe when Render has an older v11 module.
+            # Once regime_sizing_simulation exists, this stage runs normally.
+            runner = getattr(research_runner_v11, "regime_sizing_simulation", None)
+            if runner is None:
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        "research_runner_v11.regime_sizing_simulation is not "
+                        "available in the deployed module"
+                    ),
+                }
+
+            return await runner(
                 experiment_id,
                 _upload(files["deals"]),
                 _upload(files["market"]),
