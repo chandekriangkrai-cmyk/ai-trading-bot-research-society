@@ -16,6 +16,7 @@ import asyncio
 import json
 import urllib.error
 import urllib.request
+import uuid
 from fastapi import APIRouter, HTTPException
 
 from app.database import SessionLocal
@@ -30,6 +31,118 @@ MOLTBOOK_API_BASE = os.getenv(
 ).rstrip("/")
 MOLTBOOK_SUBMOLT = os.getenv("MOLTBOOK_SUBMOLT", "").strip()
 REQUEST_TIMEOUT = float(os.getenv("MOLTBOOK_TIMEOUT_SECONDS", "20"))
+
+
+def _request_json(
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any] | str]:
+    """Small stdlib JSON HTTP helper used for Moltbook API calls."""
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers=headers or {},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            try:
+                parsed: dict[str, Any] | str = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = {"raw": raw[:1000]}
+            return response.status, parsed
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = {"raw": raw[:1000]}
+        return exc.code, parsed
+
+
+async def _resolve_submolt() -> dict[str, str]:
+    """Resolve configured submolt name/UUID to the fields required by POST /posts."""
+    configured = MOLTBOOK_SUBMOLT
+    if not configured:
+        raise HTTPException(
+            status_code=503,
+            detail="MOLTBOOK_SUBMOLT is not configured",
+        )
+
+    # Moltbook's posts API currently requires all three fields:
+    # submolt (string), submolt_name (string), and submolt_id (UUID).
+    status, body = await asyncio.to_thread(
+        _request_json,
+        "GET",
+        f"{MOLTBOOK_API_BASE}/submolts",
+    )
+    if status >= 400 or not isinstance(body, dict):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Could not resolve Moltbook submolt",
+                "status_code": status,
+                "response": body,
+            },
+        )
+
+    submolts = body.get("submolts")
+    if not isinstance(submolts, list):
+        raise HTTPException(
+            status_code=502,
+            detail="Moltbook /submolts response did not contain a submolts list",
+        )
+
+    configured_lower = configured.lower()
+    match = None
+    for item in submolts:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "")
+        item_name = str(item.get("name") or "")
+        item_display = str(item.get("display_name") or "")
+        if (
+            configured_lower == item_name.lower()
+            or configured_lower == item_display.lower()
+            or configured == item_id
+        ):
+            match = item
+            break
+
+    if match is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Configured Moltbook submolt was not found",
+                "configured_submolt": configured,
+            },
+        )
+
+    submolt_id = str(match.get("id") or "")
+    submolt_name = str(match.get("name") or "")
+    if not submolt_id or not submolt_name:
+        raise HTTPException(
+            status_code=502,
+            detail="Resolved Moltbook submolt is missing id or name",
+        )
+
+    try:
+        uuid.UUID(submolt_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Moltbook returned an invalid submolt UUID: {submolt_id}",
+        )
+
+    return {
+        "submolt": submolt_name,
+        "submolt_name": submolt_name,
+        "submolt_id": submolt_id,
+    }
 
 
 def _model_dict(obj: Any) -> dict[str, Any]:
@@ -237,12 +350,13 @@ async def _publish(title: str, content: str) -> dict[str, Any]:
             ),
         )
 
+    submolt = await _resolve_submolt()
+
     payload: dict[str, Any] = {
         "title": title,
         "content": content,
+        **submolt,
     }
-    if MOLTBOOK_SUBMOLT:
-        payload["submolt"] = MOLTBOOK_SUBMOLT
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -309,6 +423,7 @@ async def config() -> dict[str, Any]:
             else "agent_key" if key else None
         ),
         "submolt_configured": bool(MOLTBOOK_SUBMOLT),
+        "submolt_configured_value": MOLTBOOK_SUBMOLT or None,
     }
 
 
