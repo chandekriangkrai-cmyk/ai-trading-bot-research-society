@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -17,6 +17,20 @@ router = APIRouter(prefix="/research", tags=["One Click Research"])
 
 INPUT_ROOT = Path(os.getenv("RESEARCH_INPUT_ROOT", "research_inputs")).resolve()
 MAX_FILE_BYTES = int(os.getenv("RESEARCH_UPLOAD_MAX_MB", "100")) * 1024 * 1024
+
+# Swagger/OpenAPI can submit an unselected optional file input as an empty
+# string. Accept that representation and normalize it to None.
+OptionalUpload = Optional[Union[UploadFile, str]]
+
+
+def _normalize_upload(upload: OptionalUpload) -> Optional[UploadFile]:
+    if upload is None:
+        return None
+    if isinstance(upload, str):
+        if not upload.strip():
+            return None
+        raise HTTPException(400, "Invalid optional file upload.")
+    return upload
 
 
 async def _read_limited(upload: UploadFile, *, allow_ext: tuple[str, ...]) -> bytes:
@@ -42,33 +56,40 @@ async def _read_limited(upload: UploadFile, *, allow_ext: tuple[str, ...]) -> by
     return b"".join(chunks)
 
 
-async def _save_csv(upload: Optional[UploadFile], destination: Path) -> dict | None:
+async def _save_csv(upload: OptionalUpload, destination: Path) -> dict | None:
+    upload = _normalize_upload(upload)
     if upload is None:
         return None
+
     data = await _read_limited(upload, allow_ext=(".csv",))
     destination.parent.mkdir(parents=True, exist_ok=True)
     tmp = destination.with_suffix(".uploading")
     tmp.write_bytes(data)
     tmp.replace(destination)
-    return {"filename": upload.filename, "saved_as": destination.name, "bytes": len(data)}
+    return {
+        "filename": upload.filename,
+        "saved_as": destination.name,
+        "bytes": len(data),
+    }
 
 
 @router.post("/start")
 async def start_research(
     mission_id: str = Form(...),
     ea: UploadFile = File(...),
-    trades: Optional[UploadFile] = File(None),
-    market: Optional[UploadFile] = File(None),
-    deals: Optional[UploadFile] = File(None),
-    is_deals: Optional[UploadFile] = File(None),
-    is_market: Optional[UploadFile] = File(None),
-    oos_deals: Optional[UploadFile] = File(None),
-    oos_market: Optional[UploadFile] = File(None),
+    trades: OptionalUpload = File(None),
+    market: OptionalUpload = File(None),
+    deals: OptionalUpload = File(None),
+    is_deals: OptionalUpload = File(None),
+    is_market: OptionalUpload = File(None),
+    oos_deals: OptionalUpload = File(None),
+    oos_market: OptionalUpload = File(None),
 ) -> dict:
     """Single-action research intake.
 
-    Upload EA + any available MT5/market CSVs. The background orchestrator
-    creates/reuses the research chain and runs the available stages.
+    Upload EA + any available MT5/market CSVs. Empty optional Swagger file
+    fields are treated as not supplied. The background orchestrator creates
+    the research chain and runs available stages automatically.
     """
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", mission_id):
         raise HTTPException(400, "Invalid mission_id.")
@@ -101,8 +122,6 @@ async def start_research(
     finally:
         db.close()
 
-    # Create a deterministic intake folder keyed by the EA/mission upload.
-    # The orchestrator will discover the DB chain and continue from here.
     intake_key = f"mission-{mission_id}"
     folder = INPUT_ROOT / intake_key
     folder.mkdir(parents=True, exist_ok=True)
@@ -121,8 +140,6 @@ async def start_research(
         if result:
             saved[field] = result
 
-    # The existing orchestrator works on Experiment IDs. Ensure the chain now,
-    # then move the uploaded data folder to the resulting experiment ID.
     created = await research_auto_orchestrator.ensure_research_chain_for_mission(
         mission_id
     )
@@ -130,9 +147,8 @@ async def start_research(
     if not created:
         raise HTTPException(
             409,
-            "A research experiment already exists for this mission. "
-            "Use the existing experiment intake endpoint or create a new mission "
-            "for a new research run.",
+            "A research experiment already exists for this mission/EA. "
+            "Upload a new EA revision or create a new mission for a new run.",
         )
 
     experiment_id = created[-1]

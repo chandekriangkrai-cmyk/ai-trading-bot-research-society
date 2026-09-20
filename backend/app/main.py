@@ -108,11 +108,10 @@ app.include_router(
     research_input_upload.router,
     prefix="/api",
 )
-# Single-action intake: EA + available research CSVs -> automatic pipeline.
-app.include_router(
-    research_start.router,
-    prefix="/api",
-)
+
+
+# One-click research intake.
+app.include_router(research_start.router, prefix="/api")
 
 
 # =========================================================
