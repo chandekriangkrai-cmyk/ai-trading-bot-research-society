@@ -9,6 +9,7 @@ from app.api import (
     missions,
     tasks,
     ea_files,
+    research,
 )
 
 from app.config import settings
@@ -56,6 +57,7 @@ app.include_router(agents.router, prefix="/api")
 app.include_router(missions.router, prefix="/api")
 app.include_router(tasks.router, prefix="/api")
 app.include_router(ea_files.router, prefix="/api")
+app.include_router(research.router, prefix="/api")
 
 
 # =========================================================
