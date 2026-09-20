@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import csv
+import io
 from zoneinfo import ZoneInfo
 from typing import Any
 
@@ -40,10 +42,49 @@ def _atr14(high: list[float], low: list[float], close: list[float]) -> list[floa
 
 
 def build_context_bars(ohlc_csv: bytes) -> list[dict[str, Any]]:
-    bars = parse_ohlc_csv(ohlc_csv)
-    if not bars:
-        raise ValueError("OHLC CSV is empty")
+    # Parse the v3 OHLC format directly and normalize headers.
+    # This accepts the generated files used by the Society, including:
+    #   index,time,high,low,close
+    # and plain:
+    #   time,high,low,close
+    # The previous implementation delegated to parse_ohlc_csv(), which could
+    # raise KeyError("close") when the uploaded CSV had an extra index/BOM or
+    # slightly different header formatting.
+    text = ohlc_csv.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError("OHLC CSV is empty or has no header")
 
+    field_map = {
+        str(name).strip().lstrip("\ufeff").lower(): name
+        for name in reader.fieldnames
+        if name is not None
+    }
+    required = ["time", "high", "low", "close"]
+    missing = [name for name in required if name not in field_map]
+    if missing:
+        raise ValueError(
+            "OHLC CSV missing required columns: " + ", ".join(missing)
+        )
+
+    bars: list[dict[str, Any]] = []
+    for row in reader:
+        try:
+            raw_time = str(row[field_map["time"]]).strip()
+            dt = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            bars.append({
+                "time": dt,
+                "high": float(str(row[field_map["high"]]).strip()),
+                "low": float(str(row[field_map["low"]]).strip()),
+                "close": float(str(row[field_map["close"]]).strip()),
+            })
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid OHLC row: {row}") from exc
+
+    if not bars:
+        raise ValueError("OHLC CSV contains no data rows")
+
+    bars.sort(key=lambda x: x["time"])
     enriched = add_volatility_regimes(bars)
     closes = [float(b["close"]) for b in enriched]
     highs = [float(b["high"]) for b in enriched]
