@@ -46,7 +46,6 @@ def _load_metrics(result: ExperimentResult) -> dict[str, Any]:
 
 
 def _overall(data: dict[str, Any]) -> dict[str, Any]:
-    # Supports v8/v9/v10 result shapes.
     if isinstance(data.get("overall"), dict):
         return data["overall"]
     if isinstance(data.get("is_2024"), dict):
@@ -54,12 +53,49 @@ def _overall(data: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _split_two_year_metrics(data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Extract 2024/2025 from a combined generalization result.
+
+    Supports v9/v10-style shapes such as is_2024/oos_2025,
+    is/oos, and sections whose group values contain is/oos.
+    """
+    if isinstance(data.get("is_2024"), dict) and isinstance(data.get("oos_2025"), dict):
+        return data["is_2024"], data["oos_2025"]
+    if isinstance(data.get("2024"), dict) and isinstance(data.get("2025"), dict):
+        return data["2024"], data["2025"]
+    if isinstance(data.get("is"), dict) and isinstance(data.get("oos"), dict):
+        return data["is"], data["oos"]
+
+    # Some stored results put the split directly inside each section.
+    is_data: dict[str, Any] = {}
+    oos_data: dict[str, Any] = {}
+    for section in [
+        "overall", "by_entry_volatility", "by_entry_trend", "by_entry_session",
+        "entry_volatility_x_trend", "entry_volatility_x_session",
+        "entry_volatility_x_trend_x_session",
+    ]:
+        value = data.get(section)
+        if not isinstance(value, dict):
+            continue
+        if "is" in value and isinstance(value["is"], dict):
+            is_data[section] = value["is"]
+        if "oos" in value and isinstance(value["oos"], dict):
+            oos_data[section] = value["oos"]
+    if is_data or oos_data:
+        return is_data, oos_data
+
+    raise HTTPException(
+        status_code=422,
+        detail="The 2024/2025 experiment result does not contain a recognized IS/OOS split. "
+               "Expected is_2024/oos_2025, 2024/2025, is/oos, or section-level is/oos.",
+    )
+
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     value = data.get(name)
     return value if isinstance(value, dict) else {}
 
 
-def _group_rows(data_by_year: dict[str, dict[str, Any]], section: str) -> list[dict[str, Any]]:
+def _group_rows(data_by_year: dict[str, dict[str, Any]], section: str, min_trades: int) -> list[dict[str, Any]]:
     maps = {year: _section(data, section) for year, data in data_by_year.items()}
     keys = sorted(set().union(*(set(m.keys()) for m in maps.values())))
     rows: list[dict[str, Any]] = []
@@ -67,16 +103,7 @@ def _group_rows(data_by_year: dict[str, dict[str, Any]], section: str) -> list[d
         years: dict[str, dict[str, Any]] = {}
         for year, mapping in maps.items():
             value = mapping.get(key)
-            if isinstance(value, dict):
-                # v9 generalization sections may store {is:..., oos:...};
-                # v11 expects raw per-year sections, so unwrap when present.
-                if "is" in value or "oos" in value:
-                    candidate = value.get("oos") if year == "2025" else value.get("is")
-                    years[year] = candidate if isinstance(candidate, dict) else {}
-                else:
-                    years[year] = value
-            else:
-                years[year] = {}
+            years[year] = value if isinstance(value, dict) else {}
 
         def n(y: str) -> int:
             return int(years[y].get("trade_count", 0) or 0)
@@ -87,7 +114,7 @@ def _group_rows(data_by_year: dict[str, dict[str, Any]], section: str) -> list[d
         def pf(y: str):
             return years[y].get("profit_factor")
 
-        sample_ok = all(n(y) >= CURRENT_MIN_TRADES for y in data_by_year)
+        sample_ok = all(n(y) >= min_trades for y in data_by_year)
         nets = [net(y) for y in data_by_year]
         same_positive = all(x > 0 for x in nets)
         same_negative = all(x < 0 for x in nets)
@@ -112,26 +139,27 @@ def _group_rows(data_by_year: dict[str, dict[str, Any]], section: str) -> list[d
 @router.post("/{experiment_id}/robustness-gate-3year")
 def robustness_gate_3year(
     experiment_id: str,
-    baseline_2024_experiment_id: str = Query(...),
-    baseline_2025_experiment_id: str = Query(...),
+    baseline_2024_2025_experiment_id: str = Query(..., description="Experiment containing the combined 2024 IS and 2025 OOS result"),
     min_trades: int = Query(20, ge=1, le=1000),
 ):
-    global CURRENT_MIN_TRADES
-    CURRENT_MIN_TRADES = min_trades
 
     db: Session = SessionLocal()
     try:
+        combined_id = baseline_2024_2025_experiment_id
         ids = {
-            "2024": baseline_2024_experiment_id,
-            "2025": baseline_2025_experiment_id,
+            "2024_2025": combined_id,
             "2026": experiment_id,
         }
-        for year, eid in ids.items():
+        for label, eid in ids.items():
             if not db.query(Experiment).filter(Experiment.id == eid).first():
-                raise HTTPException(status_code=404, detail=f"{year} experiment not found: {eid}")
+                raise HTTPException(status_code=404, detail=f"{label} experiment not found: {eid}")
 
-        results = {year: _latest_result(db, eid) for year, eid in ids.items()}
-        data = {year: _load_metrics(result) for year, result in results.items()}
+        combined_result = _latest_result(db, combined_id)
+        result_2026 = _latest_result(db, experiment_id)
+        combined_data = _load_metrics(combined_result)
+        data_2024, data_2025 = _split_two_year_metrics(combined_data)
+        data = {"2024": data_2024, "2025": data_2025, "2026": _load_metrics(result_2026)}
+        results = {"2024": combined_result, "2025": combined_result, "2026": result_2026}
 
         overall_by_year = {year: _overall(data[year]) for year in data}
         overall = {
@@ -171,7 +199,7 @@ def robustness_gate_3year(
         sampled: list[dict[str, Any]] = []
 
         for section in sections:
-            rows = _group_rows(data, section)
+            rows = _group_rows(data, section, min_trades)
             section_results[section] = rows
             for row in rows:
                 item = {"section": section, **row}
@@ -224,6 +252,7 @@ def robustness_gate_3year(
             metrics=json.dumps(payload, ensure_ascii=False),
             evidence=json.dumps({
                 "source_experiment_ids": ids,
+                "source_experiment_2024_2025_combined": combined_id,
                 "source_result_ids": payload["source_result_ids"],
                 "min_trades": min_trades,
             }, ensure_ascii=False),
