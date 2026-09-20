@@ -29,7 +29,7 @@ from app.database import Base, engine
 # ลงทะเบียนโมเดล EAFile ให้ SQLAlchemy รู้จัก
 from app.ea_files import EAFile
 
-from app import research_auto_orchestrator
+from app import research_auto_orchestrator_auto as research_auto_orchestrator
 from app import research_input_upload
 
 
