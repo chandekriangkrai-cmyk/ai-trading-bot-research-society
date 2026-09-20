@@ -21,18 +21,12 @@ from app.api.research_runner_v7 import import_mt5_deals_context
 from app.api.research_runner_v8 import import_mt5_deals_entry_context
 from app.api.research_runner_v9 import walk_forward_entry_context
 from app.api.research_runner_v10 import robustness_gate
-from app.api.research_runner_v11 import regime_sizing_simulation
-
 
 INPUT_ROOT = Path(os.getenv("RESEARCH_INPUT_ROOT", "./research_inputs"))
 STATE_ROOT = Path(os.getenv("RESEARCH_AUTO_STATE_ROOT", "./research_auto_state"))
 INTERVAL_SECONDS = max(5, int(os.getenv("RESEARCH_AUTO_INTERVAL", "30")))
 MIN_TRADES = max(1, int(os.getenv("RESEARCH_AUTO_MIN_TRADES", "20")))
 INPUT_TIMEZONE = os.getenv("RESEARCH_INPUT_TIMEZONE", "UTC")
-POLICIES = os.getenv(
-    "RESEARCH_V11_POLICIES",
-    "flat,high_defensive,low_defensive,high_low_defensive",
-)
 
 STAGES = [
     "v1_import_trades",
@@ -44,7 +38,6 @@ STAGES = [
     "v8_entry_context",
     "v9_walk_forward",
     "v10_robustness",
-    "v11_sizing",
 ]
 
 _state: dict[str, Any] = {
@@ -91,9 +84,9 @@ def _save_state(data: dict[str, Any]) -> None:
 
 def _upload(path: Path) -> UploadFile:
     f = SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
-    with path.open("rb") as src:
+    with path.open("rb") as src_file:
         while True:
-            chunk = src.read(1024 * 1024)
+            chunk = src_file.read(1024 * 1024)
             if not chunk:
                 break
             f.write(chunk)
@@ -134,7 +127,6 @@ def _missing_for(stage: str, files: dict[str, Path | None]) -> list[str]:
         "v8_entry_context": ["deals", "market"],
         "v9_walk_forward": ["is_deals", "is_market", "oos_deals", "oos_market"],
         "v10_robustness": [],
-        "v11_sizing": ["deals", "market"],
     }
     return [x for x in required[stage] if files.get(x) is None]
 
@@ -143,76 +135,47 @@ async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | Non
     db = SessionLocal()
     try:
         if stage == "v1_import_trades":
-            return await import_trade_results(
-                experiment_id, _upload(files["trades"]), db
-            )
+            return await import_trade_results(experiment_id, _upload(files["trades"]), db)
 
         if stage == "v3_import_mt5_trades":
             market = _upload(files["market"]) if files["market"] else None
-            return await import_mt5_trade_results(
-                experiment_id, _upload(files["trades"]), market, db
-            )
+            return await import_mt5_trade_results(experiment_id, _upload(files["trades"]), market, db)
 
         if stage == "v4_major_fx":
             market = _upload(files["market"]) if files["market"] else None
-            return await import_major_fx_trade_results(
-                experiment_id, _upload(files["trades"]), market, db
-            )
+            return await import_major_fx_trade_results(experiment_id, _upload(files["trades"]), market, db)
 
         if stage == "v5_import_mt5_deals":
             market = _upload(files["market"]) if files["market"] else None
-            return await import_mt5_deals(
-                experiment_id, _upload(files["deals"]), market, db
-            )
+            return await import_mt5_deals(experiment_id, _upload(files["deals"]), market, db)
 
         if stage == "v6_is_oos":
-            # v6's implementation derives its 2025 H1/H2 split from the
-            # supplied deals file; it accepts the same deals/market inputs.
             market = _upload(files["market"]) if files["market"] else None
-            return await import_mt5_deals_is_oos(
-                experiment_id, _upload(files["deals"]), market, db
-            )
+            return await import_mt5_deals_is_oos(experiment_id, _upload(files["deals"]), market, db)
 
         if stage == "v7_context":
             return await import_mt5_deals_context(
-                experiment_id,
-                _upload(files["deals"]),
-                _upload(files["market"]),
-                INPUT_TIMEZONE,
-                db,
+                experiment_id, _upload(files["deals"]), _upload(files["market"]),
+                INPUT_TIMEZONE, db,
             )
 
         if stage == "v8_entry_context":
             return await import_mt5_deals_entry_context(
-                experiment_id,
-                _upload(files["deals"]),
-                _upload(files["market"]),
-                INPUT_TIMEZONE,
-                db,
+                experiment_id, _upload(files["deals"]), _upload(files["market"]),
+                INPUT_TIMEZONE, db,
             )
 
         if stage == "v9_walk_forward":
             return await walk_forward_entry_context(
                 experiment_id,
-                _upload(files["is_deals"]),
-                _upload(files["is_market"]),
-                _upload(files["oos_deals"]),
-                _upload(files["oos_market"]),
-                INPUT_TIMEZONE,
-                db,
+                _upload(files["is_deals"]), _upload(files["is_market"]),
+                _upload(files["oos_deals"]), _upload(files["oos_market"]),
+                INPUT_TIMEZONE, db,
             )
 
         if stage == "v10_robustness":
             return robustness_gate(experiment_id, MIN_TRADES)
 
-        if stage == "v11_sizing":
-            return await regime_sizing_simulation(
-                experiment_id,
-                _upload(files["deals"]),
-                _upload(files["market"]),
-                INPUT_TIMEZONE,
-                POLICIES,
-            )
         raise RuntimeError(f"Unknown stage: {stage}")
     finally:
         db.close()
@@ -229,15 +192,12 @@ def _experiment_ids() -> list[str]:
 async def _process_experiment(experiment_id: str) -> dict[str, Any]:
     state = _load_state(experiment_id)
     files = _inputs(experiment_id)
-
     state["last_seen_at"] = _now()
     state["input_folder"] = str(files["folder"])
 
     completed = list(state.get("completed_stages", []))
     results = list(state.get("results", []))
 
-    # A stage is only marked complete after its existing runner returns.
-    # This makes restarts resume from the first unfinished stage.
     for stage in STAGES:
         if stage in completed:
             continue
@@ -247,10 +207,7 @@ async def _process_experiment(experiment_id: str) -> dict[str, Any]:
             state["blocked"] = {
                 "stage": stage,
                 "missing_files": missing,
-                "message": (
-                    "Place the missing CSV files in the experiment input folder "
-                    "and the worker will continue automatically."
-                ),
+                "message": "Place the missing CSV files in the experiment input folder and the worker will continue automatically.",
                 "updated_at": _now(),
             }
             _save_state(state)
@@ -268,11 +225,7 @@ async def _process_experiment(experiment_id: str) -> dict[str, Any]:
         try:
             result = await _run_stage(experiment_id, stage, files)
             completed.append(stage)
-            results.append({
-                "stage": stage,
-                "completed_at": _now(),
-                "result": result,
-            })
+            results.append({"stage": stage, "completed_at": _now(), "result": result})
             state["completed_stages"] = completed
             state["results"] = results
             state["current_stage"] = None
@@ -309,12 +262,7 @@ async def run_cycle() -> dict[str, Any]:
         _state["last_error"] = None
         try:
             ids = _experiment_ids()
-            cycle = []
-
-
-
-            for experiment_id in ids:
-                cycle.append(await _process_experiment(experiment_id))
+            cycle = [await _process_experiment(experiment_id) for experiment_id in ids]
 
             _state["last_cycle"] = cycle
             _state["processed_experiments"] = len(cycle)
@@ -372,8 +320,8 @@ def status() -> dict[str, Any]:
         "stages": STAGES,
         "input_layout": {
             "<experiment_id>/trades.csv": "v1/v3/v4",
-            "<experiment_id>/deals.csv": "v5/v6/v7/v8/v11",
-            "<experiment_id>/market.csv": "v3/v4/v5/v6/v7/v8/v11",
+            "<experiment_id>/deals.csv": "v5/v6/v7/v8",
+            "<experiment_id>/market.csv": "v3/v4/v5/v6/v7/v8",
             "<experiment_id>/is_deals.csv": "v9 2024 IS",
             "<experiment_id>/is_market.csv": "v9 2024 IS market",
             "<experiment_id>/oos_deals.csv": "v9 2025 OOS",
