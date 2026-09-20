@@ -22,7 +22,6 @@ from app.api.research_runner_v8 import import_mt5_deals_entry_context
 from app.api.research_runner_v9 import walk_forward_entry_context
 from app.api.research_runner_v10 import robustness_gate
 from app.api.research_runner_v11 import regime_sizing_simulation
-from app.api.research_runner_v11_2 import robustness_gate_3year
 
 
 INPUT_ROOT = Path(os.getenv("RESEARCH_INPUT_ROOT", "./research_inputs"))
@@ -46,7 +45,6 @@ STAGES = [
     "v9_walk_forward",
     "v10_robustness",
     "v11_sizing",
-    "v11_2_three_year",
 ]
 
 _state: dict[str, Any] = {
@@ -137,22 +135,8 @@ def _missing_for(stage: str, files: dict[str, Path | None]) -> list[str]:
         "v9_walk_forward": ["is_deals", "is_market", "oos_deals", "oos_market"],
         "v10_robustness": [],
         "v11_sizing": ["deals", "market"],
-        "v11_2_three_year": [],
     }
     return [x for x in required[stage] if files.get(x) is None]
-
-
-async def _run_v11_2_auto(experiment_id: str) -> Any:
-    """Run the locked 2024/2025 + unseen 2026 gate for the current experiment."""
-    baseline_id = os.getenv(
-        "RESEARCH_BASELINE_2024_2025_EXPERIMENT_ID",
-        "1e2e17b9-534f-4346-aafe-f0266cd80afe",
-    )
-    return robustness_gate_3year(
-        experiment_id=experiment_id,
-        baseline_2024_2025_experiment_id=baseline_id,
-        min_trades=MIN_TRADES,
-    )
 
 
 async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | None]) -> Any:
@@ -229,10 +213,6 @@ async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | Non
                 INPUT_TIMEZONE,
                 POLICIES,
             )
-
-        if stage == "v11_2_three_year":
-            return await _run_v11_2_auto(experiment_id)
-
         raise RuntimeError(f"Unknown stage: {stage}")
     finally:
         db.close()
@@ -331,24 +311,10 @@ async def run_cycle() -> dict[str, Any]:
             ids = _experiment_ids()
             cycle = []
 
-            # Always attempt the locked three-year gate first. It needs no
-            # Swagger input and reads the existing 2024/2025 + 2026 results.
+
+
             for experiment_id in ids:
                 cycle.append(await _process_experiment(experiment_id))
-                try:
-                    cycle.append({
-                        "experiment_id": experiment_id,
-                        "stage": "v11_2_three_year",
-                        "status": "completed",
-                        "result": await _run_v11_2_auto(experiment_id),
-                    })
-                except Exception as exc:
-                    cycle.append({
-                        "experiment_id": experiment_id,
-                        "stage": "v11_2_three_year",
-                        "status": "error",
-                        "error": f"{type(exc).__name__}: {exc}",
-                    })
 
             _state["last_cycle"] = cycle
             _state["processed_experiments"] = len(cycle)

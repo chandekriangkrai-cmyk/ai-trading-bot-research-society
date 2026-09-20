@@ -20,7 +20,6 @@ from app.api import (
     research_runner_v9,
     research_runner_v10,
     research_runner_v11,
-    research_runner_v11_2,
 )
 
 from app.config import settings
@@ -29,11 +28,8 @@ from app.database import Base, engine
 # ลงทะเบียนโมเดล EAFile ให้ SQLAlchemy รู้จัก
 from app.ea_files import EAFile
 
-from app import research_auto_orchestrator_auto as research_auto_orchestrator
+from app import research_auto_orchestrator
 from app import research_input_upload
-from app import research_start
-
-from app.api import moltbook
 
 
 print("[startup] AI Trading Research Society booting", flush=True)
@@ -103,7 +99,6 @@ app.include_router(research_runner_v8.router, prefix="/api")
 app.include_router(research_runner_v9.router, prefix="/api")
 app.include_router(research_runner_v10.router, prefix="/api")
 app.include_router(research_runner_v11.router, prefix="/api")
-app.include_router(research_runner_v11_2.router, prefix="/api")
 
 # One-click CSV upload for the full research pipeline.
 app.include_router(
@@ -112,28 +107,9 @@ app.include_router(
 )
 
 
-# One-click research intake.
-app.include_router(research_start.router, prefix="/api")
-
-# Moltbook integration (no OpenAI dependency in this entrypoint).
-app.include_router(moltbook.router, prefix="/api")
-
-
 # =========================================================
 # FULL RESEARCH AUTO PIPELINE
 # =========================================================
-
-@app.get("/api/moltbook/config", tags=["Moltbook"])
-async def moltbook_config() -> dict[str, bool]:
-    """Report whether the Moltbook adapter and API key are configured.
-    Never return the API key itself.
-    """
-    import os
-    return {
-        "adapter_loaded": moltbook is not None,
-        "api_key_configured": bool(os.getenv("MOLTBOOK_API_KEY")),
-    }
-
 
 @app.get("/api/auto-run/status", tags=["System"])
 async def auto_run_status() -> dict:
