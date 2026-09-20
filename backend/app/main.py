@@ -19,7 +19,7 @@ from app.api import (
     research_runner_v8,
     research_runner_v9,
     research_runner_v10,
-    research_runner_v11,
+    research_runner_v11_hypothesis,
 )
 
 from app.config import settings
@@ -28,18 +28,11 @@ from app.database import Base, engine
 # ลงทะเบียนโมเดล EAFile ให้ SQLAlchemy รู้จัก
 from app.ea_files import EAFile
 
-from app import research_auto_orchestrator
-from app import research_input_upload
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
-    research_auto_orchestrator.start()
-    try:
-        yield
-    finally:
-        await research_auto_orchestrator.stop()
+    yield
 
 
 app = FastAPI(
@@ -84,27 +77,7 @@ app.include_router(research_runner_v7.router, prefix="/api")
 app.include_router(research_runner_v8.router, prefix="/api")
 app.include_router(research_runner_v9.router, prefix="/api")
 app.include_router(research_runner_v10.router, prefix="/api")
-app.include_router(research_runner_v11.router, prefix="/api")
-
-# One-click CSV upload for the full research pipeline.
-app.include_router(
-    research_input_upload.router,
-    prefix="/api",
-)
-
-
-# =========================================================
-# FULL RESEARCH AUTO PIPELINE
-# =========================================================
-
-@app.get("/api/auto-run/status", tags=["System"])
-async def auto_run_status() -> dict:
-    return research_auto_orchestrator.status()
-
-
-@app.post("/api/auto-run/run-now", tags=["System"])
-async def auto_run_now() -> dict:
-    return await research_auto_orchestrator.run_now()
+app.include_router(research_runner_v11_hypothesis.router, prefix="/api")
 
 
 # =========================================================
