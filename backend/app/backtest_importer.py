@@ -26,7 +26,7 @@ def _parse_time(value: str) -> datetime:
             return datetime.strptime(value, fmt)
         except ValueError:
             pass
-    raise ValueError(f"Unsupported trade datetime format: {value}")
+    raise ValueError(f"Unsupported datetime format: {value}")
 
 
 def _float(value: str) -> float:
@@ -39,12 +39,10 @@ def parse_mt5_trade_csv(raw: bytes) -> list[dict[str, Any]]:
     if not rows:
         raise ValueError("MT5 trade CSV is empty")
 
-    normalized_rows = []
-    for row in rows:
-        normalized_rows.append({
-            str(k).strip().lower(): v
-            for k, v in row.items()
-        })
+    normalized_rows = [
+        {str(k).strip().lower(): v for k, v in row.items()}
+        for row in rows
+    ]
 
     fields = set(normalized_rows[0].keys())
     profit_key = next(
@@ -58,8 +56,11 @@ def parse_mt5_trade_csv(raw: bytes) -> list[dict[str, Any]]:
         )
 
     time_key = next(
-        (k for k in ("time", "close time", "closetime", "date", "datetime")
-         if k in fields),
+        (
+            k
+            for k in ("time", "close time", "closetime", "date", "datetime")
+            if k in fields
+        ),
         None,
     )
 
@@ -86,19 +87,24 @@ def analyze_mt5_trades(
         bars = parse_ohlc_csv(ohlc_csv)
         regime_bars = add_volatility_regimes(bars)
 
-    normalized = []
+    # Convert normalized trades back into the CSV shape expected by v2.
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=["profit", "regime"])
+    writer.writeheader()
+
     for trade in trades:
         regime = "unknown"
         if regime_bars and trade["time"] is not None:
             regime = regime_for_time(regime_bars, trade["time"])
-        normalized.append(
-            {
-                "profit": trade["profit"],
-                "regime": regime,
-            }
-        )
 
-    result = analyze_trades(normalized)
+        writer.writerow({
+            "profit": trade["profit"],
+            "regime": regime,
+        })
+
+    result = analyze_trades(
+        output.getvalue().encode("utf-8")
+    )
 
     result["data_source"] = {
         "trade_rows": len(trades),
