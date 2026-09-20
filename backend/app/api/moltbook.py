@@ -12,7 +12,10 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
+import asyncio
+import json
+import urllib.error
+import urllib.request
 from fastapi import APIRouter, HTTPException
 
 from app.database import SessionLocal
@@ -150,35 +153,53 @@ async def _publish(title: str, content: str) -> dict[str, Any]:
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=False) as client:
-        response = await client.post(
-            f"{MOLTBOOK_API_BASE}/posts",
-            json=payload,
-            headers=headers,
-        )
+    body_bytes = json.dumps(payload).encode("utf-8")
 
-    if response.status_code in (301, 302, 307, 308):
+    def _request() -> tuple[int, dict[str, Any] | str, bool]:
+        request = urllib.request.Request(
+            f"{MOLTBOOK_API_BASE}/posts",
+            data=body_bytes,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=REQUEST_TIMEOUT,
+            ) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                try:
+                    parsed: dict[str, Any] | str = json.loads(raw)
+                except json.JSONDecodeError:
+                    parsed = {"raw": raw[:1000]}
+                return response.status, parsed, False
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = {"raw": raw[:1000]}
+            return exc.code, parsed, exc.code in (301, 302, 307, 308)
+
+    status_code, body, redirected = await asyncio.to_thread(_request)
+
+    if redirected:
         raise HTTPException(
             status_code=502,
             detail="Moltbook redirected the API request; check MOLTBOOK_API_BASE.",
         )
 
-    try:
-        body = response.json()
-    except ValueError:
-        body = {"raw": response.text[:1000]}
-
-    if response.status_code >= 400:
+    if status_code >= 400:
         raise HTTPException(
             status_code=502,
             detail={
                 "message": "Moltbook publish failed",
-                "status_code": response.status_code,
+                "status_code": status_code,
                 "response": body,
             },
         )
 
-    return body
+    return body if isinstance(body, dict) else {"response": body}
 
 
 @router.get("/config")
