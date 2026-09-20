@@ -169,6 +169,98 @@ def _experiment_exists_for_mission(db, mission_id: str) -> Experiment | None:
     )
 
 
+def ensure_research_chain_for_mission(mission_id: str) -> list[str]:
+    """Public one-click intake helper for a single mission."""
+    db = SessionLocal()
+    try:
+        mission = db.get(Mission, mission_id)
+        if not mission:
+            return []
+
+        ea = (
+            db.query(EAFile)
+            .filter(EAFile.mission_id == mission_id)
+            .order_by(EAFile.created_at.desc())
+            .first()
+        )
+        if not ea:
+            return []
+
+        # Reuse an experiment only when it already points at this exact EA.
+        existing = (
+            db.query(Experiment)
+            .filter(
+                Experiment.mission_id == mission_id,
+                Experiment.experiment_type == AUTO_EXPERIMENT_TYPE,
+                Experiment.ea_file_id == ea.id,
+            )
+            .order_by(Experiment.created_at.desc())
+            .first()
+        )
+        if existing:
+            return []
+
+        lead = ResearchLead(
+            source="system",
+            external_id=f"mission:{mission_id}:ea:{ea.id}:auto",
+            title=f"Auto research: {mission.title}",
+            author="research-orchestrator",
+            content=(
+                f"Automatic research lead generated from mission '{mission.title}'. "
+                f"EA: {ea.filename}."
+            ),
+            market=mission.market,
+            timeframe=mission.timeframe,
+        )
+        db.add(lead)
+        db.flush()
+
+        hypothesis = Hypothesis(
+            research_lead_id=lead.id,
+            mission_id=mission.id,
+            title=f"General research validation: {ea.filename}",
+            statement=(
+                f"Evaluate whether {ea.filename} shows reproducible performance "
+                f"on {mission.market} {mission.timeframe} across available periods "
+                "without changing the EA parameters during validation."
+            ),
+            assumptions=(
+                "Use supplied MT5 data; preserve accounting-aware realized P/L; "
+                "separate in-sample/out-of-sample evidence where available; "
+                "do not treat regime differences as causal edges without validation."
+            ),
+            status="proposed",
+        )
+        db.add(hypothesis)
+        db.flush()
+
+        experiment = Experiment(
+            hypothesis_id=hypothesis.id,
+            mission_id=mission.id,
+            ea_file_id=ea.id,
+            symbol=mission.market,
+            timeframe=mission.timeframe,
+            experiment_type=AUTO_EXPERIMENT_TYPE,
+            specification=(
+                "Automatic research pipeline: v1 baseline metrics; v3/v4 MT5 validation; "
+                "v5 accounting-aware deals; v6 period split; v7 close context; "
+                "v8 entry context; v9 walk-forward; v10 robustness; v11 sizing; "
+                "v11.2 three-year gate when compatible unseen-year evidence exists."
+            ),
+            baseline="Existing EA rules and parameters; no OOS parameter adjustment.",
+            status="planned",
+        )
+        db.add(experiment)
+        db.commit()
+        db.refresh(experiment)
+        return [str(experiment.id)]
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def _ensure_research_chain() -> list[str]:
     """Create the minimum Lead -> Hypothesis -> Experiment chain per mission.
 
