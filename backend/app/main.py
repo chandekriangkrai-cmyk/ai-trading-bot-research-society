@@ -33,14 +33,28 @@ from app import research_auto_orchestrator
 from app import research_input_upload
 
 
+print("[startup] AI Trading Research Society booting", flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print("[startup] creating database tables", flush=True)
     Base.metadata.create_all(bind=engine)
+
+    print("[startup] starting research auto orchestrator", flush=True)
     research_auto_orchestrator.start()
+    print(
+        f"[startup] research auto orchestrator status: "
+        f"{research_auto_orchestrator.status()}",
+        flush=True,
+    )
+
     try:
         yield
     finally:
+        print("[shutdown] stopping research auto orchestrator", flush=True)
         await research_auto_orchestrator.stop()
+        print("[shutdown] research auto orchestrator stopped", flush=True)
 
 
 app = FastAPI(
