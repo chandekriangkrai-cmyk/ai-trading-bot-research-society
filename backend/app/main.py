@@ -33,13 +33,7 @@ from app import research_auto_orchestrator_auto as research_auto_orchestrator
 from app import research_input_upload
 from app import research_start
 
-# Moltbook-only integration.
-# The adapter is optional so the research pipeline can still boot while
-# the Moltbook module is being deployed.
-try:
-    from app.api import moltbook
-except ImportError:
-    moltbook = None
+from app.api import moltbook
 
 
 print("[startup] AI Trading Research Society booting", flush=True)
@@ -122,8 +116,7 @@ app.include_router(
 app.include_router(research_start.router, prefix="/api")
 
 # Moltbook integration (no OpenAI dependency in this entrypoint).
-if moltbook is not None:
-    app.include_router(moltbook.router, prefix="/api")
+app.include_router(moltbook.router, prefix="/api")
 
 
 # =========================================================
