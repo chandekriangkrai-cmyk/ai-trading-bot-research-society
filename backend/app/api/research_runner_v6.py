@@ -15,6 +15,17 @@ from app.research_models import Experiment, ExperimentResult
 router = APIRouter(prefix="/research", tags=["Research Engine"])
 
 
+def _as_datetime(value: Any) -> datetime:
+    """Normalize reconstructed trade timestamps to datetime."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    raise ValueError(
+        f"Unsupported timestamp type: {type(value).__name__}"
+    )
+
+
 def _metrics(trades: list[dict[str, Any]]) -> dict[str, Any]:
     profits = [float(t["profit"]) for t in trades]
     trade_count = len(profits)
@@ -57,20 +68,24 @@ def _metrics(trades: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _split(trades: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def _split(trades: list[dict[str, Any]]) -> tuple[int | None, dict[str, list[dict[str, Any]]]]:
+    # Use the year represented by the supplied dataset.
+    years = [_as_datetime(t["time"]).year for t in trades]
+    target_year = max(set(years), key=years.count) if years else None
     is_trades = []
     oos_trades = []
 
     for t in trades:
-        dt = datetime.fromisoformat(t["time"])
-        if dt.year != 2025:
+        dt = _as_datetime(t["time"])
+        if target_year is None or dt.year != target_year:
             continue
         if dt.month <= 6:
             is_trades.append(t)
         else:
             oos_trades.append(t)
 
-    return {"is": is_trades, "oos": oos_trades}
+    return target_year, {"is": is_trades, "oos": oos_trades}
+
 
 
 @router.post("/experiments/{experiment_id}/import-mt5-deals-is-oos")
@@ -117,21 +132,21 @@ async def import_mt5_deals_is_oos(
         from app.market_data_engine import add_volatility_regimes, parse_ohlc_csv, regime_for_time
         bars = add_volatility_regimes(parse_ohlc_csv(market_bytes))
         for t in closed:
-            dt = datetime.fromisoformat(t["time"])
+            dt = _as_datetime(t["time"])
             t["regime"] = regime_for_time(bars, dt)
     else:
         for t in closed:
             t["regime"] = "unknown"
 
-    periods = _split(closed)
+    target_year, periods = _split(closed)
     period_analysis: dict[str, Any] = {}
 
     for period_name, period_trades in periods.items():
         period_analysis[period_name] = {
             "period": (
-                "2025-01-01 through 2025-06-30"
+                f"{target_year}-01-01 through {target_year}-06-30"
                 if period_name == "is"
-                else "2025-07-01 through 2025-12-31"
+                else f"{target_year}-07-01 through {target_year}-12-31"
             ),
             "overall": _metrics(period_trades),
             "by_regime": {
@@ -144,8 +159,8 @@ async def import_mt5_deals_is_oos(
         "experiment_scope": {
             "symbol": experiment.symbol,
             "timeframe": experiment.timeframe,
-            "in_sample": "2025-01-01 through 2025-06-30",
-            "out_of_sample": "2025-07-01 through 2025-12-31",
+            "in_sample": f"{target_year}-01-01 through {target_year}-06-30",
+            "out_of_sample": f"{target_year}-07-01 through {target_year}-12-31",
         },
         "periods": period_analysis,
         "accounting": analysis["accounting"],
@@ -153,7 +168,7 @@ async def import_mt5_deals_is_oos(
         "method": {
             "accounting": "entry profit + exit profit + entry commission + exit commission + entry swap + exit swap",
             "regime": "ATR(14) rolling percentile: bottom third=low, middle third=normal, top third=high",
-            "split": "closed-trade close timestamp: Jan-Jun IS, Jul-Dec OOS",
+            "split": "closed-trade close timestamp within the dataset year: Jan-Jun IS, Jul-Dec OOS",
         },
         "limitations": analysis.get("limitations", []) + [
             "This is a deterministic historical split, not a proof of future performance.",
@@ -165,7 +180,7 @@ async def import_mt5_deals_is_oos(
     result = ExperimentResult(
         id=str(uuid.uuid4()),
         experiment_id=experiment.id,
-        summary="Accounting-aware EURUSD M30 2025 H1/H2 IS/OOS analysis.",
+        summary="Accounting-aware EURUSD M30 dataset-year H1/H2 IS/OOS analysis.",
         metrics=json.dumps(result_analysis, ensure_ascii=False, default=str),
         evidence=json.dumps(
             {
@@ -174,8 +189,8 @@ async def import_mt5_deals_is_oos(
                 "source_type": "user_supplied_mt5_deals_csv",
                 "accounting_method": analysis["accounting"]["method"],
                 "matching_method": analysis["accounting"]["matching_method"],
-                "is_period": "2025-01-01 through 2025-06-30",
-                "oos_period": "2025-07-01 through 2025-12-31",
+                "is_period": f"{target_year}-01-01 through {target_year}-06-30",
+                "oos_period": f"{target_year}-07-01 through {target_year}-12-31",
             },
             ensure_ascii=False,
         ),
