@@ -259,47 +259,25 @@ def _extract_baseline_split(analysis: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _looks_like_2026(analysis: dict[str, Any]) -> bool:
-    """Return True only when the result explicitly represents calendar year 2026."""
-    scope = analysis.get("experiment_scope")
-    if isinstance(scope, dict):
-        text = " ".join(str(v) for v in scope.values())
-        if "2026" in text:
-            return True
-
-    for key in ("period", "year", "dataset_year", "target_year"):
-        value = analysis.get(key)
-        if str(value) == "2026":
-            return True
-
-    return any(key in analysis for key in ("2026", "oos_2026", "unseen_2026", "unseen_year"))
-
-
-def _combine_periods_2026(periods: dict[str, Any]) -> dict[str, Any] | None:
-    """Combine v6-style 2026 H1/H2 overall rows into one year row."""
-    rows = []
-    for value in periods.values():
-        if isinstance(value, dict):
-            row = _find_overall(value)
-            if row is not None:
-                rows.append(row)
-    if not rows:
-        return None
-
-    trade_count = sum(_as_int(r.get("trade_count")) for r in rows)
-    net_profit = sum(float(r.get("net_profit") or 0.0) for r in rows)
-    gross_profit = sum(float(r.get("gross_profit") or 0.0) for r in rows)
-    gross_loss = sum(float(r.get("gross_loss") or 0.0) for r in rows)
-    profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else None
-    return {
-        "trade_count": trade_count,
-        "net_profit": net_profit,
-        "profit_factor": profit_factor,
-    }
+def _contains_2026(value: Any) -> bool:
+    """Return True only when the result explicitly carries 2026 evidence."""
+    if isinstance(value, str):
+        return "2026" in value
+    if isinstance(value, dict):
+        return any(_contains_2026(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_contains_2026(v) for v in value)
+    return False
 
 
 def _extract_2026(analysis: dict[str, Any]) -> dict[str, Any]:
-    """Extract a genuine 2026 result; never mistake a 2024/2025 gate for 2026."""
+    """Extract a result that explicitly represents the 2026 unseen year.
+
+    Important: a generic top-level ``overall`` is NOT enough. Older v9/v10
+    results also have ``overall`` blocks, and accepting those caused the
+    2024 result (100 trades / -800.30) to be mislabeled as 2026.
+    """
+    # Explicit 2026 containers.
     for key in ("2026", "oos_2026", "unseen_2026", "unseen_year"):
         block = analysis.get(key)
         if isinstance(block, dict):
@@ -307,28 +285,42 @@ def _extract_2026(analysis: dict[str, Any]) -> dict[str, Any]:
             if overall is not None:
                 return {"mode": key, "overall": overall, "block": block}
 
-    # v6 stores the target year as experiment_scope + H1/H2 under `periods`.
-    if _looks_like_2026(analysis):
-        periods = analysis.get("periods")
-        if isinstance(periods, dict):
-            overall = _combine_periods_2026(periods)
-            if overall is not None:
-                return {"mode": "periods_2026", "overall": overall, "block": periods}
-
-        overall = _metric_row(analysis.get("overall"))
-        if overall is not None:
-            return {"mode": "top_level_overall_2026", "overall": overall, "block": analysis}
-
-        for wrapper_key in ("analysis", "result", "unseen_year_validation"):
-            wrapper = analysis.get(wrapper_key)
-            if isinstance(wrapper, dict):
-                overall = _metric_row(wrapper.get("overall"))
+    # v6/v11-style year split: periods.is / periods.oos, with the period
+    # labels themselves proving that this result belongs to 2026.
+    periods = analysis.get("periods")
+    if isinstance(periods, dict) and _contains_2026(periods):
+        for period_key in ("is", "oos"):
+            block = periods.get(period_key)
+            if isinstance(block, dict):
+                overall = _metric_row(block.get("overall"))
                 if overall is not None:
-                    return {"mode": wrapper_key, "overall": overall, "block": wrapper}
+                    return {
+                        "mode": f"periods.{period_key}",
+                        "overall": overall,
+                        "block": block,
+                    }
 
+    # A wrapper is accepted only if the wrapper itself explicitly identifies
+    # 2026. This prevents v10's generic ``analysis.overall`` from matching.
+    for wrapper_key in ("analysis", "result", "unseen_year_validation"):
+        wrapper = analysis.get(wrapper_key)
+        if isinstance(wrapper, dict) and _contains_2026(wrapper):
+            overall = _metric_row(wrapper.get("overall"))
+            if overall is not None:
+                return {
+                    "mode": wrapper_key,
+                    "overall": overall,
+                    "block": wrapper,
+                }
+
+    # Never accept an unqualified top-level overall as 2026.
     raise HTTPException(
         status_code=422,
-        detail="The unseen-year result is not explicitly identified as 2026 or lacks a recognizable 2026 metric block.",
+        detail=(
+            "The result does not explicitly identify 2026. Generic top-level "
+            "overall metrics are rejected to prevent v10/2024 results from "
+            "being mislabeled as the unseen year."
+        ),
     )
 
 
