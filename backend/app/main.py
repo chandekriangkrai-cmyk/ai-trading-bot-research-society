@@ -31,6 +31,7 @@ from app.ea_files import EAFile
 
 from app import research_auto_orchestrator_auto as research_auto_orchestrator
 from app import research_input_upload
+from app import research_start
 
 
 print("[startup] AI Trading Research Society booting", flush=True)
@@ -105,6 +106,11 @@ app.include_router(research_runner_v11_2.router, prefix="/api")
 # One-click CSV upload for the full research pipeline.
 app.include_router(
     research_input_upload.router,
+    prefix="/api",
+)
+# Single-action intake: EA + available research CSVs -> automatic pipeline.
+app.include_router(
+    research_start.router,
     prefix="/api",
 )
 
