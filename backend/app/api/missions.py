@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Mission, ResearchTask
+from app.research_models import Experiment, ExperimentResult, Hypothesis
 from app.ea_files import EAFile
 from app.schemas import MissionCreate, MissionResponse
 
@@ -85,32 +86,44 @@ def delete_mission(
         )
 
     try:
-        # -----------------------------------------
-        # 1. ลบ Research Tasks ของ Mission ก่อน
-        # -----------------------------------------
+        # 1. Delete experiment results first because they reference experiments.
+        experiment_ids = [
+            experiment_id
+            for experiment_id in db.scalars(
+                select(Experiment.id).where(
+                    Experiment.mission_id == mission_id
+                )
+            ).all()
+        ]
+
+        if experiment_ids:
+            db.query(ExperimentResult).filter(
+                ExperimentResult.experiment_id.in_(experiment_ids)
+            ).delete(synchronize_session=False)
+
+        # 2. Delete experiments belonging to this mission.
+        db.query(Experiment).filter(
+            Experiment.mission_id == mission_id
+        ).delete(synchronize_session=False)
+
+        # 3. Delete hypotheses belonging to this mission.
+        # Research leads are kept because they are independent research sources.
+        db.query(Hypothesis).filter(
+            Hypothesis.mission_id == mission_id
+        ).delete(synchronize_session=False)
+
+        # 4. Delete research tasks.
         db.query(ResearchTask).filter(
             ResearchTask.mission_id == mission_id
-        ).delete(
-            synchronize_session=False
-        )
+        ).delete(synchronize_session=False)
 
-        # -----------------------------------------
-        # 2. ลบ EA Files ของ Mission
-        # -----------------------------------------
+        # 5. Delete EA files after experiments, because experiments may reference them.
         db.query(EAFile).filter(
             EAFile.mission_id == mission_id
-        ).delete(
-            synchronize_session=False
-        )
+        ).delete(synchronize_session=False)
 
-        # -----------------------------------------
-        # 3. ลบ Mission
-        # -----------------------------------------
+        # 6. Delete the mission.
         db.delete(mission)
-
-        # -----------------------------------------
-        # 4. Commit ทุกอย่างพร้อมกัน
-        # -----------------------------------------
         db.commit()
 
     except Exception:
