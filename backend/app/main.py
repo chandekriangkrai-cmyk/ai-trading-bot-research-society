@@ -29,6 +29,7 @@ from app.database import Base, engine
 from app.ea_files import EAFile
 
 from app import research_auto_orchestrator
+from app import research_input_upload
 
 
 @asynccontextmanager
@@ -85,6 +86,11 @@ app.include_router(research_runner_v9.router, prefix="/api")
 app.include_router(research_runner_v10.router, prefix="/api")
 app.include_router(research_runner_v11.router, prefix="/api")
 
+# One-click CSV upload for the full research pipeline.
+app.include_router(
+    research_input_upload.router,
+    prefix="/api",
+)
 
 
 # =========================================================
