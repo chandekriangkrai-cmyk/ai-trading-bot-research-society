@@ -3,13 +3,13 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 
 from app.database import SessionLocal
 from app.research_models import Experiment
-from app import research_auto_orchestrator
+from app import research_auto_orchestrator_auto as research_auto_orchestrator
 
 
 router = APIRouter(
@@ -56,6 +56,22 @@ def _safe_experiment_id(value: str) -> str:
             detail="Invalid experiment_id.",
         )
     return value
+
+
+
+OptionalUpload = Optional[Union[UploadFile, str]]
+
+
+def _normalize_upload(upload: OptionalUpload) -> Optional[UploadFile]:
+    # Swagger/OpenAPI may submit an empty string for an untouched optional
+    # file input. Treat that as no upload.
+    if upload is None:
+        return None
+    if isinstance(upload, str):
+        if not upload.strip():
+            return None
+        raise HTTPException(status_code=400, detail="Invalid optional file upload.")
+    return upload
 
 
 async def _save_csv(
@@ -149,6 +165,14 @@ def _folder(experiment_id: str) -> Path:
 
 @router.get("/{experiment_id}")
 def input_status(experiment_id: str) -> dict:
+    trades = _normalize_upload(trades)
+    market = _normalize_upload(market)
+    deals = _normalize_upload(deals)
+    is_deals = _normalize_upload(is_deals)
+    is_market = _normalize_upload(is_market)
+    oos_deals = _normalize_upload(oos_deals)
+    oos_market = _normalize_upload(oos_market)
+
     experiment_id = _safe_experiment_id(experiment_id)
     _experiment_exists(experiment_id)
 
@@ -174,13 +198,13 @@ def input_status(experiment_id: str) -> dict:
 async def upload_research_csv(
     experiment_id: str,
     background_tasks: BackgroundTasks,
-    trades: Optional[UploadFile] = File(None),
-    market: Optional[UploadFile] = File(None),
-    deals: Optional[UploadFile] = File(None),
-    is_deals: Optional[UploadFile] = File(None),
-    is_market: Optional[UploadFile] = File(None),
-    oos_deals: Optional[UploadFile] = File(None),
-    oos_market: Optional[UploadFile] = File(None),
+    trades: OptionalUpload = File(None),
+    market: OptionalUpload = File(None),
+    deals: OptionalUpload = File(None),
+    is_deals: OptionalUpload = File(None),
+    is_market: OptionalUpload = File(None),
+    oos_deals: OptionalUpload = File(None),
+    oos_market: OptionalUpload = File(None),
 ) -> dict:
     experiment_id = _safe_experiment_id(experiment_id)
     _experiment_exists(experiment_id)
