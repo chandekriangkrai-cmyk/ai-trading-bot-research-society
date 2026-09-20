@@ -192,6 +192,18 @@ def analyze_mt5_deals(
     total_swap = sum(t["swap"] for t in closed)
     total_realized = sum(t["profit"] for t in closed)
 
+    result["closed_trades"] = [
+        {
+            "time": t["time"].isoformat(sep=" "),
+            "profit": t["profit"],
+            "raw_profit": t["raw_profit"],
+            "commission": t["commission"],
+            "swap": t["swap"],
+            "volume": t["volume"],
+        }
+        for t in closed
+    ]
+
     result["accounting"] = {
         "method": "closed trade realized P/L = entry profit + exit profit + entry commission + exit commission + entry swap + exit swap",
         "raw_profit": total_raw_profit,
