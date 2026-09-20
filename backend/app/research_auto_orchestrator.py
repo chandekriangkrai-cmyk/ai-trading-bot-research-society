@@ -21,7 +21,7 @@ from app.api.research_runner_v7 import import_mt5_deals_context
 from app.api.research_runner_v8 import import_mt5_deals_entry_context
 from app.api.research_runner_v9 import walk_forward_entry_context
 from app.api.research_runner_v10 import robustness_gate
-from app.api import research_runner_v11
+from app.api.research_runner_v11 import regime_sizing_simulation
 from app.api.research_runner_v11_2 import robustness_gate_3year
 
 
@@ -33,6 +33,10 @@ INPUT_TIMEZONE = os.getenv("RESEARCH_INPUT_TIMEZONE", "UTC")
 POLICIES = os.getenv(
     "RESEARCH_V11_POLICIES",
     "flat,high_defensive,low_defensive,high_low_defensive",
+)
+BASELINE_2024_2025_EXPERIMENT_ID = os.getenv(
+    "RESEARCH_BASELINE_2024_2025_EXPERIMENT_ID",
+    "1e2e17b9-534f-4346-aafe-f0266cd80afe",
 )
 
 STAGES = [
@@ -142,11 +146,11 @@ def _missing_for(stage: str, files: dict[str, Path | None]) -> list[str]:
     return [x for x in required[stage] if files.get(x) is None]
 
 
-async def _run_v11_2_auto() -> Any:
-    """Run the locked 2024/2025 + unseen 2026 gate without Swagger input."""
+async def _run_v11_2_auto(experiment_id: str) -> Any:
+    """Run the locked 2024/2025 + current experiment unseen-year gate."""
     return robustness_gate_3year(
-        experiment_id="05b7cff5-d91c-481c-acdb-8be353df4006",
-        baseline_2024_2025_experiment_id="1e2e17b9-534f-4346-aafe-f0266cd80afe",
+        experiment_id=experiment_id,
+        baseline_2024_2025_experiment_id=BASELINE_2024_2025_EXPERIMENT_ID,
         min_trades=MIN_TRADES,
     )
 
@@ -218,19 +222,7 @@ async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | Non
             return robustness_gate(experiment_id, MIN_TRADES)
 
         if stage == "v11_sizing":
-            # Keep the worker boot-safe when Render has an older v11 module.
-            # Once regime_sizing_simulation exists, this stage runs normally.
-            runner = getattr(research_runner_v11, "regime_sizing_simulation", None)
-            if runner is None:
-                return {
-                    "status": "skipped",
-                    "reason": (
-                        "research_runner_v11.regime_sizing_simulation is not "
-                        "available in the deployed module"
-                    ),
-                }
-
-            return await runner(
+            return await regime_sizing_simulation(
                 experiment_id,
                 _upload(files["deals"]),
                 _upload(files["market"]),
@@ -239,7 +231,7 @@ async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | Non
             )
 
         if stage == "v11_2_three_year":
-            return await _run_v11_2_auto()
+            return await _run_v11_2_auto(experiment_id)
 
         raise RuntimeError(f"Unknown stage: {stage}")
     finally:
@@ -338,21 +330,6 @@ async def run_cycle() -> dict[str, Any]:
         try:
             ids = _experiment_ids()
             cycle = []
-
-            # Always attempt the locked three-year gate first. It needs no
-            # Swagger input and reads the existing 2024/2025 + 2026 results.
-            try:
-                cycle.append({
-                    "stage": "v11_2_three_year",
-                    "status": "completed",
-                    "result": await _run_v11_2_auto(),
-                })
-            except Exception as exc:
-                cycle.append({
-                    "stage": "v11_2_three_year",
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
 
             for experiment_id in ids:
                 cycle.append(await _process_experiment(experiment_id))
