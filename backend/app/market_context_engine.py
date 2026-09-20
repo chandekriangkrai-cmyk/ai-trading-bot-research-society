@@ -6,7 +6,6 @@ import io
 from zoneinfo import ZoneInfo
 from typing import Any
 
-from app.market_data_engine import add_volatility_regimes, parse_ohlc_csv, regime_for_time
 
 
 def _ema(values: list[float], period: int) -> list[float | None]:
@@ -41,60 +40,77 @@ def _atr14(high: list[float], low: list[float], close: list[float]) -> list[floa
     return out
 
 
-def build_context_bars(ohlc_csv: bytes) -> list[dict[str, Any]]:
-    # Parse the v3 OHLC format directly and normalize headers.
-    # This accepts the generated files used by the Society, including:
-    #   index,time,high,low,close
-    # and plain:
-    #   time,high,low,close
-    # The previous implementation delegated to parse_ohlc_csv(), which could
-    # raise KeyError("close") when the uploaded CSV had an extra index/BOM or
-    # slightly different header formatting.
+def _parse_time(value: str) -> datetime:
+    value = value.strip()
+    for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            pass
+    raise ValueError(f"Invalid OHLC time: {value!r}")
+
+
+def _parse_ohlc_csv(ohlc_csv: bytes) -> list[dict[str, Any]]:
     text = ohlc_csv.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames:
-        raise ValueError("OHLC CSV is empty or has no header")
-
-    field_map = {
-        str(name).strip().lstrip("\ufeff").lower(): name
-        for name in reader.fieldnames
-        if name is not None
-    }
+        raise ValueError("OHLC CSV has no header")
+    headers = {str(h).strip().lower(): h for h in reader.fieldnames if h is not None}
     required = ["time", "high", "low", "close"]
-    missing = [name for name in required if name not in field_map]
+    missing = [x for x in required if x not in headers]
     if missing:
-        raise ValueError(
-            "OHLC CSV missing required columns: " + ", ".join(missing)
-        )
+        raise ValueError(f"OHLC CSV missing columns: {', '.join(missing)}")
 
     bars: list[dict[str, Any]] = []
-    for row in reader:
+    for raw in reader:
         try:
-            raw_time = str(row[field_map["time"]]).strip()
-            dt = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            t = _parse_time(str(raw[headers["time"]]))
             bars.append({
-                "time": dt,
-                "high": float(str(row[field_map["high"]]).strip()),
-                "low": float(str(row[field_map["low"]]).strip()),
-                "close": float(str(row[field_map["close"]]).strip()),
+                "time": t,
+                "high": float(str(raw[headers["high"]]).strip()),
+                "low": float(str(raw[headers["low"]]).strip()),
+                "close": float(str(raw[headers["close"]]).strip()),
             })
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid OHLC row: {row}") from exc
-
-    if not bars:
-        raise ValueError("OHLC CSV contains no data rows")
-
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError(f"Invalid OHLC row: {raw}") from exc
     bars.sort(key=lambda x: x["time"])
-    enriched = add_volatility_regimes(bars)
-    closes = [float(b["close"]) for b in enriched]
-    highs = [float(b["high"]) for b in enriched]
-    lows = [float(b["low"]) for b in enriched]
+    return bars
+
+
+def _regime_labels(atr: list[float | None]) -> list[str]:
+    valid = sorted(x for x in atr if x is not None)
+    if not valid:
+        return ["unknown"] * len(atr)
+    q1 = valid[(len(valid) - 1) // 3]
+    q2 = valid[((len(valid) - 1) * 2) // 3]
+    out = []
+    for x in atr:
+        if x is None:
+            out.append("unknown")
+        elif x <= q1:
+            out.append("low")
+        elif x <= q2:
+            out.append("normal")
+        else:
+            out.append("high")
+    return out
+
+
+def build_context_bars(ohlc_csv: bytes) -> list[dict[str, Any]]:
+    bars = _parse_ohlc_csv(ohlc_csv)
+    if not bars:
+        raise ValueError("OHLC CSV is empty")
+
+    closes = [float(b["close"]) for b in bars]
+    highs = [float(b["high"]) for b in bars]
+    lows = [float(b["low"]) for b in bars]
     ema20 = _ema(closes, 20)
     ema50 = _ema(closes, 50)
     atr = _atr14(highs, lows, closes)
+    regimes = _regime_labels(atr)
 
     result: list[dict[str, Any]] = []
-    for i, bar in enumerate(enriched):
+    for i, bar in enumerate(bars):
         c = closes[i]
         e20 = ema20[i]
         e50 = ema50[i]
@@ -108,24 +124,19 @@ def build_context_bars(ohlc_csv: bytes) -> list[dict[str, Any]]:
         else:
             trend = "range"
 
-        # Research proxy only: distance of the close from the prior 20-bar range,
-        # scaled by ATR. It is NOT the EA's internal breakout level.
         start = max(0, i - 20)
         prior_highs = highs[start:i]
         prior_lows = lows[start:i]
         if a and a > 0 and prior_highs and prior_lows:
             prior_high = max(prior_highs)
             prior_low = min(prior_lows)
-            breakout_distance_atr = max(
-                (c - prior_high) / a,
-                (prior_low - c) / a,
-                0.0,
-            )
+            breakout_distance_atr = max((c - prior_high) / a, (prior_low - c) / a, 0.0)
         else:
             breakout_distance_atr = None
 
         result.append({
             **bar,
+            "volatility_regime": regimes[i],
             "trend": trend,
             "ema20": e20,
             "ema50": e50,
@@ -133,7 +144,6 @@ def build_context_bars(ohlc_csv: bytes) -> list[dict[str, Any]]:
             "breakout_distance_atr": breakout_distance_atr,
         })
     return result
-
 
 def _to_utc(dt: datetime, input_timezone: str) -> datetime:
     tz = ZoneInfo(input_timezone)
@@ -177,7 +187,7 @@ def context_for_time(
             "atr14": None,
         }
     return {
-        "volatility_regime": regime_for_time(bars, dt),
+        "volatility_regime": chosen.get("volatility_regime", "unknown"),
         "trend": chosen.get("trend", "unknown"),
         "session": session_for_time(dt, input_timezone),
         "breakout_distance_atr": chosen.get("breakout_distance_atr"),
