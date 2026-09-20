@@ -141,6 +141,8 @@ def _pair_fifo(deals: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
             closed.append({
                 "time": deal["time"],
+                "entry_time": entry["time"],
+                "exit_time": deal["time"],
                 "profit": realized,
                 "raw_profit": entry["profit"] * entry_ratio + deal["profit"] * exit_ratio,
                 "commission": entry["commission"] * entry_ratio + deal["commission"] * exit_ratio,
@@ -191,18 +193,6 @@ def analyze_mt5_deals(
     total_commission = sum(t["commission"] for t in closed)
     total_swap = sum(t["swap"] for t in closed)
     total_realized = sum(t["profit"] for t in closed)
-
-    result["closed_trades"] = [
-        {
-            "time": t["time"].isoformat(sep=" "),
-            "profit": t["profit"],
-            "raw_profit": t["raw_profit"],
-            "commission": t["commission"],
-            "swap": t["swap"],
-            "volume": t["volume"],
-        }
-        for t in closed
-    ]
 
     result["accounting"] = {
         "method": "closed trade realized P/L = entry profit + exit profit + entry commission + exit commission + entry swap + exit swap",
