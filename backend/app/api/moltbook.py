@@ -73,43 +73,68 @@ def _json_object(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _metric_payload(db, result: ExperimentResult) -> dict[str, Any]:
-    """Resolve the usable research metrics, following source_result_id when needed."""
-    seen: set[str] = set()
+def _find_metric_node(node: Any) -> dict[str, Any]:
+    """Find the most useful overall metric block in historical result JSON."""
+    if not isinstance(node, dict):
+        return {}
+
+    aliases = {
+        "trade_count", "trades", "total_trades", "closed_trade_count",
+        "net_profit", "net_pnl", "profit", "total_profit",
+        "profit_factor", "pf", "expectancy",
+        "max_drawdown", "max_drawdown_absolute", "max_dd", "drawdown",
+    }
+    if any(k in node for k in aliases):
+        return node
+
+    # Prefer an explicitly named overall block.
+    overall = node.get("overall")
+    if isinstance(overall, dict):
+        found = _find_metric_node(overall)
+        if found:
+            return found
+
+    analysis = node.get("analysis")
+    if isinstance(analysis, dict):
+        found = _find_metric_node(analysis)
+        if found:
+            return found
+
+    for key in ("2026", "2025", "2024", "oos", "is", "unseen_2026"):
+        value = node.get(key)
+        if isinstance(value, dict):
+            found = _find_metric_node(value)
+            if found:
+                return found
+
+    for value in node.values():
+        if isinstance(value, dict):
+            found = _find_metric_node(value)
+            if found:
+                return found
+    return {}
+
+
+def _resolve_source_result(db: Any, result: ExperimentResult) -> tuple[ExperimentResult, dict[str, Any]]:
+    """Follow source_result_id links so gate results can expose source metrics."""
     current = result
+    seen: set[str] = set()
 
     for _ in range(4):
-        result_id = str(getattr(current, "id", ""))
-        if result_id in seen:
-            break
-        seen.add(result_id)
+        raw = _json_object(getattr(current, "metrics", None))
+        metric_node = _find_metric_node(raw)
+        if metric_node:
+            return current, metric_node
 
-        metrics = _json_object(getattr(current, "metrics", None))
-        analysis = metrics.get("analysis")
-        if not isinstance(analysis, dict):
-            analysis = {}
-
-        overall = metrics.get("overall")
-        if not isinstance(overall, dict):
-            overall = analysis.get("overall")
-
-        if isinstance(overall, dict):
-            payload = dict(metrics)
-            payload["_overall"] = overall
-            payload["_result_id"] = result_id
-            payload["_conclusion"] = (
-                getattr(current, "conclusion", None)
-                or (metrics.get("summary", {}).get("conclusion")
-                    if isinstance(metrics.get("summary"), dict) else None)
-                or (analysis.get("summary", {}).get("conclusion")
-                    if isinstance(analysis.get("summary"), dict) else None)
-            )
-            return payload
-
-        source_id = metrics.get("source_result_id")
+        source_id = raw.get("source_result_id")
         if not source_id:
+            analysis = raw.get("analysis")
+            if isinstance(analysis, dict):
+                source_id = analysis.get("source_result_id")
+        if not source_id or str(source_id) in seen:
             break
 
+        seen.add(str(source_id))
         source = db.query(ExperimentResult).filter(
             ExperimentResult.id == str(source_id)
         ).first()
@@ -117,12 +142,21 @@ def _metric_payload(db, result: ExperimentResult) -> dict[str, Any]:
             break
         current = source
 
-    return {}
+    return result, {}
 
 
-def _build_post(db, experiment: Experiment, result: ExperimentResult) -> tuple[str, str]:
+def _build_post(
+    experiment: Experiment,
+    result: ExperimentResult,
+    db: Any | None = None,
+) -> tuple[str, str]:
     exp = _model_dict(experiment)
     res = _model_dict(result)
+
+    source_result = result
+    metric_node: dict[str, Any] = {}
+    if db is not None:
+        source_result, metric_node = _resolve_source_result(db, result)
 
     experiment_id = _pick(exp, "id", "experiment_id")
     status = _pick(exp, "status") or _pick(res, "status") or "completed"
@@ -132,17 +166,32 @@ def _build_post(db, experiment: Experiment, result: ExperimentResult) -> tuple[s
         or "EURUSD M30 Research"
     )
 
-    metric_payload = _metric_payload(db, result)
-    overall = metric_payload.get("_overall", {})
-    if not isinstance(overall, dict):
-        overall = {}
+    net = _pick(metric_node, "net_profit", "net_pnl", "profit", "total_profit")
+    pf = _pick(metric_node, "profit_factor", "pf")
+    expectancy = _pick(metric_node, "expectancy")
+    max_dd = _pick(metric_node, "max_drawdown", "max_drawdown_absolute", "max_dd", "drawdown")
+    trades = _pick(metric_node, "trade_count", "trades", "total_trades", "closed_trade_count")
 
-    net = _pick(overall, "net_profit", "net_pnl", "profit", "total_profit")
-    pf = _pick(overall, "profit_factor", "pf")
-    expectancy = _pick(overall, "expectancy")
-    max_dd = _pick(overall, "max_drawdown", "max_drawdown_absolute", "max_dd", "drawdown")
-    trades = _pick(overall, "trades", "trade_count", "total_trades", "closed_trade_count")
-    conclusion = metric_payload.get("_conclusion") or _pick(res, "conclusion")
+    # If the latest result is a three-year gate, expose its explicit yearly
+    # metrics rather than pretending there is one single-year total.
+    gate_metrics = _json_object(getattr(result, "metrics", None))
+    gate_overall = gate_metrics.get("overall") if isinstance(gate_metrics.get("overall"), dict) else {}
+    if gate_overall.get("2024_trade_count") is not None:
+        trades = (
+            f"2024={gate_overall.get('2024_trade_count')}, "
+            f"2025={gate_overall.get('2025_trade_count')}, "
+            f"2026={gate_overall.get('2026_trade_count')}"
+        )
+        net = (
+            f"2024={_fmt_number(gate_overall.get('2024_net_profit'))}, "
+            f"2025={_fmt_number(gate_overall.get('2025_net_profit'))}, "
+            f"2026={_fmt_number(gate_overall.get('2026_net_profit'))}"
+        )
+        pf = (
+            f"2024={_fmt_number(gate_overall.get('2024_profit_factor'))}, "
+            f"2025={_fmt_number(gate_overall.get('2025_profit_factor'))}, "
+            f"2026={_fmt_number(gate_overall.get('2026_profit_factor'))}"
+        )
 
     title = f"Research Update: {strategy}"
 
@@ -163,14 +212,14 @@ def _build_post(db, experiment: Experiment, result: ExperimentResult) -> tuple[s
         f"Generated: {datetime.now(timezone.utc).isoformat()}",
     ]
 
-    # Include a compact list of additional result fields when the model uses
-    # a different schema. This makes the adapter useful across v1-v11 results
-    # without requiring schema changes.
+    if source_result.id != result.id:
+        lines.extend(["", f"Source result: {source_result.id}"])
+
     known = {
         "id", "experiment_id", "status", "net_profit", "net_pnl", "profit",
         "total_profit", "profit_factor", "pf", "expectancy", "max_drawdown",
-        "max_dd", "drawdown", "trades", "trade_count", "total_trades",
-        "created_at", "updated_at",
+        "max_drawdown_absolute", "max_dd", "drawdown", "trades", "trade_count",
+        "total_trades", "closed_trade_count", "created_at", "updated_at",
     }
     extras = []
     for key, value in res.items():
@@ -310,7 +359,7 @@ async def publish_research(experiment_id: str) -> dict[str, Any]:
                 detail="No research result found for this experiment",
             )
 
-        title, content = _build_post(db, experiment, result)
+        title, content = _build_post(experiment, result, db)
         published = await _publish(title, content)
 
         return {
@@ -348,7 +397,7 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
                 detail="No research result found for this experiment",
             )
 
-        title, content = _build_post(db, experiment, result)
+        title, content = _build_post(experiment, result, db)
         return {
             "status": "preview",
             "experiment_id": experiment_id,
