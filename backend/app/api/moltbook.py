@@ -61,6 +61,19 @@ def _fmt_number(value: Any, digits: int = 4) -> str:
         return str(value)
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    """Decode a JSON object stored in an ExperimentResult Text column."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _build_post(experiment: Experiment, result: ExperimentResult) -> tuple[str, str]:
     exp = _model_dict(experiment)
     res = _model_dict(result)
@@ -73,43 +86,41 @@ def _build_post(experiment: Experiment, result: ExperimentResult) -> tuple[str, 
         or "EURUSD M30 Research"
     )
 
-    # ResearchResult may store the actual v10/v11 evidence inside JSON
-    # fields such as metrics/evidence rather than as top-level columns.
-    # Prefer explicit top-level metrics, then safely inspect nested JSON.
-    nested_metrics = res.get("metrics")
-    nested_evidence = res.get("evidence")
-    nested = nested_metrics if isinstance(nested_metrics, dict) else {}
-    evidence = nested_evidence if isinstance(nested_evidence, dict) else {}
-
-    net = _pick(
-        res, "net_profit", "net_pnl", "profit", "total_profit"
-    )
+    net = _pick(res, "net_profit", "net_pnl", "profit", "total_profit")
     pf = _pick(res, "profit_factor", "pf")
     expectancy = _pick(res, "expectancy")
     max_dd = _pick(res, "max_drawdown", "max_dd", "drawdown")
     trades = _pick(res, "trades", "trade_count", "total_trades")
 
-    # Common nested aliases used by research stages.
+    # ExperimentResult.metrics is a JSON Text column.
+    nested = _json_object(res.get("metrics"))
+    evidence = _json_object(res.get("evidence"))
+    overall = nested.get("overall")
+    overall = overall if isinstance(overall, dict) else nested
+
     net = net if net is not None else _pick(
-        nested, "net_profit", "net_pnl", "profit", "total_profit"
+        overall, "net_profit", "net_pnl", "profit", "total_profit"
     )
-    pf = pf if pf is not None else _pick(nested, "profit_factor", "pf")
+    pf = pf if pf is not None else _pick(overall, "profit_factor", "pf")
     expectancy = expectancy if expectancy is not None else _pick(
-        nested, "expectancy"
+        overall, "expectancy"
     )
     max_dd = max_dd if max_dd is not None else _pick(
-        nested, "max_drawdown", "max_dd", "drawdown"
+        overall, "max_drawdown_absolute", "max_drawdown", "max_dd", "drawdown"
     )
     trades = trades if trades is not None else _pick(
-        nested, "trades", "trade_count", "total_trades"
+        overall, "trade_count", "trades", "total_trades"
     )
 
-    # v10/v11-style results can expose the research conclusion separately.
-    conclusion = _pick(res, "conclusion", "summary")
+    summary = nested.get("summary")
+    summary = summary if isinstance(summary, dict) else {}
+    conclusion = _pick(res, "conclusion")
     if conclusion is None:
-        conclusion = _pick(nested, "conclusion", "summary")
+        conclusion = _pick(summary, "conclusion")
     if conclusion is None:
-        conclusion = _pick(evidence, "conclusion", "summary")
+        conclusion = _pick(nested, "conclusion")
+    if conclusion is None:
+        conclusion = _pick(evidence, "conclusion")
 
     title = f"Research Update: {strategy}"
 
@@ -125,16 +136,10 @@ def _build_post(experiment: Experiment, result: ExperimentResult) -> tuple[str, 
         f"- Profit Factor: {_fmt_number(pf)}",
         f"- Expectancy: {_fmt_number(expectancy)}",
         f"- Max Drawdown: {_fmt_number(max_dd)}",
-    ]
-
-    if conclusion is not None:
-        lines.extend(["", f"Research conclusion: {conclusion}"])
-
-    lines.extend([
         "",
         "This is a research/backtest result, not a live-trading signal or financial advice.",
         f"Generated: {datetime.now(timezone.utc).isoformat()}",
-    ])
+    ]
 
     # Include a compact list of additional result fields when the model uses
     # a different schema. This makes the adapter useful across v1-v11 results
@@ -143,7 +148,6 @@ def _build_post(experiment: Experiment, result: ExperimentResult) -> tuple[str, 
         "id", "experiment_id", "status", "net_profit", "net_pnl", "profit",
         "total_profit", "profit_factor", "pf", "expectancy", "max_drawdown",
         "max_dd", "drawdown", "trades", "trade_count", "total_trades",
-        "conclusion", "summary", "metrics", "evidence", "limitations",
         "created_at", "updated_at",
     }
     extras = []
