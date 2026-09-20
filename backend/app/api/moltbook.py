@@ -414,8 +414,9 @@ async def _publish(title: str, content: str) -> dict[str, Any]:
 
 @router.get("/config")
 async def config() -> dict[str, Any]:
+    """Show Moltbook config plus the exact resolved submolt object."""
     key = os.getenv("MOLTBOOK_API_KEY", "")
-    return {
+    result: dict[str, Any] = {
         "api_base": MOLTBOOK_API_BASE,
         "api_key_configured": bool(key),
         "api_key_type": (
@@ -424,7 +425,23 @@ async def config() -> dict[str, Any]:
         ),
         "submolt_configured": bool(MOLTBOOK_SUBMOLT),
         "submolt_configured_value": MOLTBOOK_SUBMOLT or None,
+        "submolt_resolved": False,
+        "resolved_submolt": None,
     }
+
+    if not MOLTBOOK_SUBMOLT:
+        result["resolve_error"] = "MOLTBOOK_SUBMOLT is not configured"
+        return result
+
+    try:
+        resolved = await _resolve_submolt()
+    except HTTPException as exc:
+        result["resolve_error"] = exc.detail
+        return result
+
+    result["submolt_resolved"] = True
+    result["resolved_submolt"] = resolved
+    return result
 
 
 @router.post("/research/{experiment_id}/publish")
