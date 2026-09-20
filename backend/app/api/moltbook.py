@@ -19,7 +19,7 @@ import urllib.request
 from fastapi import APIRouter, HTTPException
 
 from app.database import SessionLocal
-from app.models import Experiment, ExperimentResult
+from app.research_models import Experiment, ExperimentResult
 
 
 router = APIRouter(prefix="/moltbook", tags=["Moltbook"])
@@ -35,7 +35,9 @@ REQUEST_TIMEOUT = float(os.getenv("MOLTBOOK_TIMEOUT_SECONDS", "20"))
 def _model_dict(obj: Any) -> dict[str, Any]:
     """Serialize SQLAlchemy model columns without exposing secrets."""
     result: dict[str, Any] = {}
-    for column in getattr(obj, "__table__", {}).columns:
+    table = getattr(obj, "__table__", None)
+    columns = getattr(table, "columns", []) if table is not None else []
+    for column in columns:
         value = getattr(obj, column.name, None)
         if isinstance(value, datetime):
             value = value.isoformat()
