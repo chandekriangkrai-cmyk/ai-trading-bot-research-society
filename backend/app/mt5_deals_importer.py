@@ -141,6 +141,8 @@ def _pair_fifo(deals: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
             closed.append({
                 "time": deal["time"],
+                "entry_time": entry["time"],
+                "exit_time": deal["time"],
                 "profit": realized,
                 "raw_profit": entry["profit"] * entry_ratio + deal["profit"] * exit_ratio,
                 "commission": entry["commission"] * entry_ratio + deal["commission"] * exit_ratio,
