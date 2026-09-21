@@ -518,7 +518,9 @@ def _number_from_words(words: list[str], i: int):
     # First, join 2-4 obfuscated chunks into a single number word.
     first = None
     first_end = i
-    for n in range(1, min(4, len(words) - i) + 1):
+    # Moltbook may split an obfuscated number word into many short chunks,
+    # e.g. "tW eN tY" -> "twenty" or "tH rEe" -> "three".
+    for n in range(1, min(8, len(words) - i) + 1):
         parts = words[i:i+n]
         if any(re.fullmatch(r"\d+(?:\.\d+)?", x) for x in parts):
             continue
@@ -527,13 +529,12 @@ def _number_from_words(words: list[str], i: int):
             first = _NUMBER_WORDS[joined]
             first_end = i + n
             break
-        # Only use fuzzy matching for a single chunk; otherwise ordinary prose
-        # can accidentally form a number.
         if n == 1:
             fuzzy = _fuzzy_number_word(parts[0])
             if fuzzy is not None:
                 first = fuzzy
                 first_end = i + 1
+
 
     if first is None:
         return None, i
