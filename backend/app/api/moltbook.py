@@ -104,10 +104,41 @@ def _result_stage_rank(result: ExperimentResult) -> int:
     evidence = _json_object(getattr(result, "evidence", None))
     hay = text + " " + json.dumps(metrics, ensure_ascii=False) + " " + json.dumps(evidence, ensure_ascii=False)
 
+    # Stage detection must also inspect nested metric blocks. v11 stores
+    # sizing_context inside experiment_scope, so a flat key check can otherwise
+    # miss v11 and fall back to v10.
+    def _all_keys(node: Any) -> set[str]:
+        keys: set[str] = set()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                keys.add(str(key).lower())
+                keys.update(_all_keys(value))
+        elif isinstance(node, list):
+            for value in node:
+                keys.update(_all_keys(value))
+        return keys
+
+    metric_keys = _all_keys(metrics)
+    evidence_keys = _all_keys(evidence)
+
     # Explicit three-year gate / v11.2 gets the highest rank.
     if any(x in hay for x in ("v11.2", "three-year", "three_year", "2024_trade_count", "unseen_2026")):
         return 112
-    if any(x in hay for x in ("v11_sizing", "sizing policies", "sizing_context", "high_defensive", "low_defensive", "baseline_flat")):
+
+    # v11 sizing. Check this before v10 because v11 research context may also
+    # mention robustness / NOT_ESTABLISHED from the preceding stage.
+    v11_keys = {
+        "sizing_context", "baseline_flat", "policies", "comparison",
+        "sizing_policies", "entry-time volatility regime",
+    }
+    if (
+        v11_keys.intersection(metric_keys)
+        or v11_keys.intersection(evidence_keys)
+        or "sizing policies simulated" in hay
+        or "v11_sizing" in hay
+        or "high_defensive" in hay
+        or "low_defensive" in hay
+    ):
         return 11
     if any(x in hay for x in ("v10", "robustness", "robust positive groups", "not_established")):
         return 10
