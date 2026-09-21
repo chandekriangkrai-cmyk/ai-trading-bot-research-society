@@ -1,35 +1,68 @@
 # AI Trading Bot Research Society — Unified Research Engine
 
-## New flow
+## Input model
+The research engine accepts: 
 
-1. Upload **one EA `.mq5`** and **one MT5 backtest input** (`.csv`, `.html`, `.htm`, `.xml`, or `.zip`).
-2. `POST /api/research/{experiment_id}/run` normalizes the supplied evidence once.
-3. The engine reconstructs completed trades when possible and uses market OHLC only when it is actually present in the backtest input.
-4. Pre-entry context uses only candles available at/before the entry timestamp. No look-ahead.
-5. Findings pass an evidence gate. Small samples remain `INSUFFICIENT_EVIDENCE`; no invented patterns.
-6. `GET /api/research/{experiment_id}` returns the traceable result.
-7. Moltbook is a separate publication layer: preview → publish/manual verification.
+1. `EA.mq5` — strategy source.
+2. MT5 trades/deals — required to reconstruct completed trades.
+3. OHLC bars — primary market-context source for pre-entry research.
+4. Tick data — optional high-resolution supporting source for pre-entry tick context and tick-level MFE/MAE.
 
-## Important data limitation
+Bars and ticks may be supplied as separate files or together with trades/deals inside one ZIP. The upload endpoint classifies CSV/HTML/XML contents by schema; filenames are not the source of truth.
 
-A normal MT5 HTML performance report may contain trade/deal records but not raw OHLC candles. In that case the engine **does not invent price-action findings**. The result explicitly reports `MARKET_OHLC_NOT_AVAILABLE_FROM_BACKTEST_INPUT`.
+### Recommended first research package
+For a 2.5-year M30 study:
 
-For price-action/regime research, the backtest upload must contain usable OHLC data (for example inside the supplied ZIP/CSV bundle) alongside the trade/deal data.
+```text
+EA.mq5
+backtest.zip
+  ├── deals.csv
+  ├── EURUSD_M30.csv
+  └── EURUSD_ticks.csv
+```
 
-## Public endpoints
+The exact filenames do not matter if the columns are recognizable.
 
-- `POST /api/research/data/upload`
-  - `experiment_id` optional
-  - `symbol` optional
-  - `timeframe` optional
-  - `ea_file` required `.mq5`
-  - `backtest_file` required CSV/HTML/XML/ZIP
-- `POST /api/research/{experiment_id}/run`
-- `GET /api/research/{experiment_id}`
-- `GET /api/moltbook/research/{experiment_id}/preview`
-- `POST /api/moltbook/research/{experiment_id}/publish-manual-verify`
-- `POST /api/moltbook/post/{post_id}/verify`
+### Core columns
+Trades/deals: entry/exit time, position/deal/ticket identifier, entry/exit price, side, profit.
 
-## What is intentionally not public anymore
+Bars: `Time, Open, High, Low, Close` (volume optional).
 
-The old v1/v3/v4/v5/v6/v7/v8/v9/v10/v11/v11.2 stage-by-stage pipeline is no longer mounted in `main.py`. Its implementation files are not required by the new public flow.
+Ticks: `Time` plus any usable `Bid, Ask, Last/Price, Volume` fields.
+
+## Research flow
+
+```text
+EA + Trades/Deals + OHLC Bars + optional Ticks
+              ↓
+        Normalize once
+              ↓
+        Market context
+              ↓
+     Evidence-gated analysis
+              ↓
+       Research Result
+              ↓
+           Moltbook
+```
+
+### Anti-look-ahead rules
+- Pre-entry bar context uses only bars whose full close time is at or before the entry timestamp.
+- Pre-entry tick context uses only ticks strictly before entry.
+- Post-entry MFE/MAE is separated from pre-entry evidence.
+- The engine reports insufficient evidence instead of inventing findings.
+
+## API
+
+- `POST /api/research/data/upload` — EA + required backtest/deals bundle, optional bars and ticks.
+- `POST /api/research/{experiment_id}/run` — run the complete research pipeline once.
+- `GET /api/research/{experiment_id}` — inspect the result.
+- Moltbook endpoints remain separate from research computation.
+
+### Upload fields
+`ea_file` required; `backtest_file` required; `bars_file` optional; `ticks_file` optional.
+
+`backtest_file` itself may be a ZIP containing deals, bars, and ticks.
+
+## Evidence policy
+No causality is claimed from observational backtest data. Findings are only published when they pass the minimum-sample/effect-size evidence gate. Otherwise the result is marked as insufficient evidence.
