@@ -44,15 +44,18 @@ def load_result(eid):
         e=db.query(Experiment).filter(Experiment.id==eid).first()
         if not e: raise HTTPException(404,"Experiment not found")
         rows=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).order_by(ExperimentResult.created_at.desc()).all()
-        r=next((x for x in rows if _is_unified(x)),rows[0] if rows else None)
-        if not r: raise HTTPException(404,"No research result found for this experiment")
+        # Only the current V3 schema is publishable. Never fall back to an older
+        # V1/V2 result, because that can resurrect the legacy holding-duration schema.
+        r=next((x for x in rows if _is_unified(x)),None)
+        if not r:
+            raise HTTPException(409,"No current ea_backtest_research_v3 result found for this experiment. Run research again before preview/publish.")
         return e,r
     finally: db.close()
 
 def _is_unified(r):
     try:
         engine = json.loads(r.metrics or "{}").get("engine")
-        return engine in {"unified_research_v1", "unified_research_v2", "ea_backtest_research_v1", "ea_backtest_research_v2", "ea_backtest_research_v3"}
+        return engine == "ea_backtest_research_v3"
     except Exception:
         return False
 
