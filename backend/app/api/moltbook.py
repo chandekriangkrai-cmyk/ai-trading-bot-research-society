@@ -262,6 +262,12 @@ def _build_post(
         else None
     ) or metrics.get("conclusion") or _pick(res, "conclusion") or "NOT_ESTABLISHED"
 
+    is_v11_sizing = (
+        "baseline_flat" in metrics
+        or "position-sizing simulation" in str(getattr(result, "summary", "") or "").lower()
+        or "sizing policies simulated" in str(getattr(result, "conclusion", "") or "").lower()
+    )
+
     lines = [
         "AI Trading Bot Research Society — Research Update",
         "",
@@ -271,10 +277,38 @@ def _build_post(
         "",
         "Research pipeline:",
         "v1 → v3 → v4 → v5 → v6 → v7 → v8 → v9 → v10 → v11",
-        "",
-        "Robustness conclusion:",
-        str(conclusion),
     ]
+
+    if is_v11_sizing:
+        lines.extend([
+            "",
+            "v11 sizing simulation:",
+            str(conclusion),
+        ])
+        baseline = metrics.get("baseline_flat")
+        if isinstance(baseline, dict):
+            overall = baseline.get("overall") if isinstance(baseline.get("overall"), dict) else baseline
+            if isinstance(overall, dict):
+                lines.extend(["", "v11 baseline (flat):"])
+                lines.extend(_metric_text(overall)[:5])
+
+        comparison = metrics.get("comparison")
+        if isinstance(comparison, dict):
+            lines.extend(["", "v11 policy comparisons:"])
+            for name, row in comparison.items():
+                if not isinstance(row, dict):
+                    continue
+                lines.append(
+                    f"- {name}: delta net profit={row.get('delta_net_profit_vs_flat')}, "
+                    f"delta max drawdown={row.get('delta_max_drawdown_vs_flat')}, "
+                    f"profit factor={row.get('profit_factor')}"
+                )
+    else:
+        lines.extend([
+            "",
+            "Robustness conclusion:",
+            str(conclusion),
+        ])
 
     # If the selected result references an earlier result, use that source for walk-forward metrics.
     source_id = metrics.get("source_result_id")
@@ -699,13 +733,45 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
         )
         all_results = query.all()
 
-        # Select the newest ExperimentResult for Moltbook.
-        # The research runner creates results in stage order, so the newest
-        # result represents the latest completed stage (v11/v11.2 when present).
-        # Do not prefer v10 here: v10 is an intermediate robustness result.
+        # Select the latest research STAGE, not merely the newest timestamp.
+        # v11 ExperimentResult can have a missing/identical created_at on older
+        # database schemas, so timestamp-only ordering can incorrectly return v10.
+        def _result_stage_rank(row: ExperimentResult) -> int:
+            metrics = _json_dict(getattr(row, "metrics", None))
+            summary = str(getattr(row, "summary", "") or "").lower()
+            conclusion = str(getattr(row, "conclusion", "") or "").lower()
+            method = metrics.get("method")
+            method_text = json.dumps(method, ensure_ascii=False).lower() if isinstance(method, (dict, list)) else str(method or "").lower()
+
+            # v11 sizing signature: baseline_flat + policies + comparison +
+            # entry-time volatility/sizing method.
+            if (
+                "baseline_flat" in metrics
+                or ("policies" in metrics and "comparison" in metrics and "sizing_context" in json.dumps(metrics.get("experiment_scope", {})).lower())
+                or "position-sizing simulation" in summary
+                or "sizing policies simulated" in conclusion
+                or "realized trade p/l" in method_text
+            ):
+                return 11
+
+            # v11.2 / three-year robustness, if present.
+            if (
+                "v11.2" in method_text
+                or "three-year" in method_text
+                or "three_year" in json.dumps(metrics, ensure_ascii=False).lower()
+            ):
+                return 112
+
+            if _is_v10_result(row):
+                return 10
+            return 0
+
         result = max(
             all_results,
-            key=lambda row: getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+            key=lambda row: (
+                _result_stage_rank(row),
+                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+            ),
         ) if all_results else None
 
         if result is None:
@@ -749,13 +815,45 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
         )
         all_results = query.all()
 
-        # Select the newest ExperimentResult for Moltbook.
-        # The research runner creates results in stage order, so the newest
-        # result represents the latest completed stage (v11/v11.2 when present).
-        # Do not prefer v10 here: v10 is an intermediate robustness result.
+        # Select the latest research STAGE, not merely the newest timestamp.
+        # v11 ExperimentResult can have a missing/identical created_at on older
+        # database schemas, so timestamp-only ordering can incorrectly return v10.
+        def _result_stage_rank(row: ExperimentResult) -> int:
+            metrics = _json_dict(getattr(row, "metrics", None))
+            summary = str(getattr(row, "summary", "") or "").lower()
+            conclusion = str(getattr(row, "conclusion", "") or "").lower()
+            method = metrics.get("method")
+            method_text = json.dumps(method, ensure_ascii=False).lower() if isinstance(method, (dict, list)) else str(method or "").lower()
+
+            # v11 sizing signature: baseline_flat + policies + comparison +
+            # entry-time volatility/sizing method.
+            if (
+                "baseline_flat" in metrics
+                or ("policies" in metrics and "comparison" in metrics and "sizing_context" in json.dumps(metrics.get("experiment_scope", {})).lower())
+                or "position-sizing simulation" in summary
+                or "sizing policies simulated" in conclusion
+                or "realized trade p/l" in method_text
+            ):
+                return 11
+
+            # v11.2 / three-year robustness, if present.
+            if (
+                "v11.2" in method_text
+                or "three-year" in method_text
+                or "three_year" in json.dumps(metrics, ensure_ascii=False).lower()
+            ):
+                return 112
+
+            if _is_v10_result(row):
+                return 10
+            return 0
+
         result = max(
             all_results,
-            key=lambda row: getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+            key=lambda row: (
+                _result_stage_rank(row),
+                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+            ),
         ) if all_results else None
 
         if result is None:
