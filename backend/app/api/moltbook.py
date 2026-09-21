@@ -375,14 +375,13 @@ def _append_strategy_context(lines: list[str], context: dict[str, Any], metrics:
     # Turn the actual evidence state into questions for peer agents. These are
     # research questions only; they do not authorize strategy changes.
     questions = [
-        "Which observed market regimes or entry contexts should be tested next against the existing EA rules?",
-        "What additional unseen-period test would best challenge the current robustness conclusion?",
-        "Which possible explanation for the observed losses can be tested without changing parameters first?",
+        "What candle and price-action patterns appear before winning and losing trades?",
+        "Which market conditions appear to support or weaken the EA's existing entry rules?",
+        "How do volatility, candle range, momentum, and consecutive bullish or bearish candles differ between winning and losing trades?",
+        "Are there identifiable price-action or market-regime conditions where the EA repeatedly fails?",
     ]
-    if "NOT_ESTABLISHED" in json.dumps(metrics, ensure_ascii=False).upper():
-        questions.insert(0, "What evidence would be sufficient to move this EA from NOT_ESTABLISHED to a testable robustness hypothesis?")
     lines.extend(["", "Questions for peer research agents:"])
-    lines.extend([f"- {q}" for q in questions[:4]])
+    lines.extend([f"- {q}" for q in questions])
 
 def _build_post(
     experiment: Experiment,
@@ -424,9 +423,6 @@ def _build_post(
         f"Strategy: {strategy}",
         f"Status: {status}",
         "",
-        "Research pipeline:",
-        "v1 → v3 → v4 → v5 → v6 → v7 → v8 → v9 → v10 → v11"
-        + (" → v11.2" if _result_stage_rank(result) >= 112 else ""),
     ]
 
     if is_v11_sizing:
@@ -752,7 +748,7 @@ async def _verify_post(verification: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _publish(title: str, content: str) -> dict[str, Any]:
+async def _publish(title: str, content: str, auto_verify: bool = True) -> dict[str, Any]:
     api_key = os.getenv("MOLTBOOK_API_KEY")
     if not api_key:
         raise HTTPException(
@@ -834,7 +830,17 @@ async def _publish(title: str, content: str) -> dict[str, Any]:
     post = published.get("post") if isinstance(published, dict) else None
     verification = post.get("verification") if isinstance(post, dict) else None
     if isinstance(verification, dict):
-        published["verification"] = await _verify_post(verification)
+        if auto_verify:
+            published["verification"] = await _verify_post(verification)
+        else:
+            published["verification"] = {
+                "attempted": False,
+                "verified": False,
+                "manual_required": True,
+                "verification_code": verification.get("verification_code"),
+                "challenge_text": verification.get("challenge_text"),
+                "message": "Read challenge_text and submit the answer with POST /moltbook/post/{post_id}/verify.",
+            }
     elif published.get("already_existed"):
         published["verification"] = {
             "attempted": False,
@@ -929,6 +935,98 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
     finally:
         db.close()
 
+
+
+@router.post("/research/{experiment_id}/publish-manual-verify")
+async def publish_research_manual_verify(experiment_id: str, republish: bool = False) -> dict[str, Any]:
+    """Publish a research post but do not solve Moltbook verification automatically.
+
+    Returns the verification question/challenge so the user can read it and submit
+    the answer manually through POST /moltbook/post/{post_id}/verify.
+    """
+    db = SessionLocal()
+    try:
+        experiment = db.query(Experiment).filter(
+            Experiment.id == experiment_id
+        ).first()
+        if experiment is None:
+            raise HTTPException(status_code=404, detail="Experiment not found")
+
+        all_results = db.query(ExperimentResult).filter(
+            ExperimentResult.experiment_id == experiment_id
+        ).all()
+        result = max(
+            all_results,
+            key=lambda row: (
+                _result_stage_rank(row),
+                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+            ),
+        ) if all_results else None
+        if result is None:
+            raise HTTPException(status_code=404, detail="No research result found for this experiment")
+
+        title, content = _build_post(experiment, result, all_results, db)
+        if republish:
+            run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            title = f"{title} — Research Run {run_id}"
+            content = f"{content}\nResearch Run: {run_id}"
+
+        published = await _publish(title, content, auto_verify=False)
+        verification = published.get("verification", {}) if isinstance(published, dict) else {}
+
+        post = published.get("post") if isinstance(published, dict) else None
+        post_id = post.get("id") if isinstance(post, dict) else published.get("id")
+
+        return {
+            "status": "published_waiting_for_manual_verify",
+            "experiment_id": experiment_id,
+            "post_id": post_id,
+            "title": title,
+            "verification_question": verification.get("challenge_text"),
+            "verification_code": verification.get("verification_code"),
+            "next_step": "POST /moltbook/post/{post_id}/verify with verification_code and answer.",
+            "moltbook": published,
+        }
+    finally:
+        db.close()
+
+
+@router.post("/post/{post_id}/verify")
+async def moltbook_verify_manual(
+    post_id: str,
+    verification_code: str,
+    answer: str,
+) -> dict[str, Any]:
+    """Submit a manually read Moltbook verification answer."""
+    post_id = str(post_id or "").strip()
+    verification_code = str(verification_code or "").strip()
+    answer = str(answer or "").strip()
+    if not post_id or not verification_code or not answer:
+        raise HTTPException(
+            status_code=400,
+            detail="post_id, verification_code and answer are required",
+        )
+
+    api_key = os.getenv("MOLTBOOK_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="MOLTBOOK_API_KEY is not configured")
+
+    status, body = await asyncio.to_thread(
+        _request_json,
+        "POST",
+        f"{MOLTBOOK_API_BASE}/verify",
+        {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        {"verification_code": verification_code, "answer": answer},
+    )
+
+    return {
+        "status": "verified" if status < 400 and isinstance(body, dict) and body.get("success", True) is True else "verification_failed",
+        "post_id": post_id,
+        "verification_code": verification_code,
+        "answer": answer,
+        "http_status": status,
+        "response": body,
+    }
 
 
 @router.get("/post/{post_id}")
