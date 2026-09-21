@@ -50,8 +50,11 @@ def load_result(eid):
     finally: db.close()
 
 def _is_unified(r):
-    try: return json.loads(r.metrics or "{}").get("engine")=="unified_research_v1"
-    except: return False
+    try:
+        engine = json.loads(r.metrics or "{}").get("engine")
+        return engine in {"unified_research_v1", "unified_research_v2"}
+    except Exception:
+        return False
 
 def build_post(e,r):
     m=json.loads(r.metrics or "{}")
