@@ -1,10 +1,10 @@
 """
 Moltbook publisher for AI Trading Bot Research Society.
 
-Research flow:
-EA/Mission -> Experiment evidence -> strategy-aware Moltbook research brief -> peer-agent feedback intake.
+MVP flow:
+Research Experiment -> latest ExperimentResult -> Moltbook post.
 
-No order/execution permissions. Moltbook feedback is research input only; it never changes EA parameters automatically.
+No OpenAI dependency and no order/execution permissions.
 """
 from __future__ import annotations
 
@@ -21,9 +21,7 @@ import uuid
 from fastapi import APIRouter, HTTPException
 
 from app.database import SessionLocal
-from app.models import Mission
-from app.ea_files import EAFile
-from app.research_models import Experiment, ExperimentResult, Hypothesis, ResearchLead
+from app.research_models import Experiment, ExperimentResult
 
 
 router = APIRouter(prefix="/moltbook", tags=["Moltbook"])
@@ -240,114 +238,14 @@ def _metric_text(row: dict[str, Any]) -> list[str]:
     ]
 
 
-
-def _strategy_context(db, experiment: Experiment) -> dict[str, Any]:
-    """Load the actual mission/EA/hypothesis attached to this experiment.
-
-    This is intentionally evidence-only: the Moltbook post must describe the
-    EA from database records, not invent trading rules from aggregate metrics.
-    """
-    mission = None
-    if getattr(experiment, "mission_id", None):
-        mission = db.get(Mission, str(experiment.mission_id))
-
-    ea = None
-    if getattr(experiment, "ea_file_id", None):
-        ea = db.get(EAFile, str(experiment.ea_file_id))
-    if ea is None and mission is not None:
-        ea = (
-            db.query(EAFile)
-            .filter(EAFile.mission_id == mission.id)
-            .order_by(EAFile.created_at.desc())
-            .first()
-        )
-
-    hypothesis = None
-    if getattr(experiment, "hypothesis_id", None):
-        hypothesis = db.get(Hypothesis, str(experiment.hypothesis_id))
-
-    return {"mission": mission, "ea": ea, "hypothesis": hypothesis}
-
-
-def _compact_ea_inputs(source_code: str | None, limit: int = 8) -> list[str]:
-    """Extract only explicit MQL5 input declarations; never infer rules."""
-    if not source_code:
-        return []
-    rows: list[str] = []
-    pattern = re.compile(r"^\s*input\s+(.+?);\s*(?://.*)?$", re.IGNORECASE)
-    for raw in source_code.splitlines():
-        line = raw.strip()
-        match = pattern.match(line)
-        if not match:
-            continue
-        value = re.sub(r"\s+", " ", match.group(1)).strip()
-        if len(value) > 180:
-            value = value[:177] + "..."
-        rows.append(value)
-        if len(rows) >= limit:
-            break
-    return rows
-
-
-def _append_strategy_context(lines: list[str], context: dict[str, Any], metrics: dict[str, Any]) -> None:
-    mission = context.get("mission")
-    ea = context.get("ea")
-    hypothesis = context.get("hypothesis")
-
-    lines.extend(["", "EA under research:"])
-    if ea is not None:
-        lines.append(f"- EA file: {getattr(ea, 'filename', 'n/a')}")
-    else:
-        lines.append("- EA file: not attached to this experiment")
-
-    market = getattr(mission, "market", None) if mission is not None else None
-    timeframe = getattr(mission, "timeframe", None) if mission is not None else None
-    if market or timeframe:
-        lines.append(f"- Market / timeframe: {market or 'n/a'} {timeframe or ''}".strip())
-
-    specification = getattr(context.get("experiment"), "specification", None)
-    if not specification:
-        specification = getattr(context.get("experiment"), "baseline", None)
-    if specification:
-        text = re.sub(r"\s+", " ", str(specification)).strip()
-        if len(text) > 320:
-            text = text[:317] + "..."
-        lines.append(f"- Research scope: {text}")
-
-    if hypothesis is not None and getattr(hypothesis, "statement", None):
-        text = re.sub(r"\s+", " ", str(hypothesis.statement)).strip()
-        if len(text) > 320:
-            text = text[:317] + "..."
-        lines.append(f"- Hypothesis: {text}")
-
-    inputs = _compact_ea_inputs(getattr(ea, "source_code", None) if ea is not None else None)
-    if inputs:
-        lines.append("- Declared EA inputs (from source code):")
-        lines.extend([f"  - {item}" for item in inputs])
-
-    # Turn the actual evidence state into questions for peer agents. These are
-    # research questions only; they do not authorize strategy changes.
-    questions = [
-        "Which observed market regimes or entry contexts should be tested next against the existing EA rules?",
-        "What additional unseen-period test would best challenge the current robustness conclusion?",
-        "Which possible explanation for the observed losses can be tested without changing parameters first?",
-    ]
-    if "NOT_ESTABLISHED" in json.dumps(metrics, ensure_ascii=False).upper():
-        questions.insert(0, "What evidence would be sufficient to move this EA from NOT_ESTABLISHED to a testable robustness hypothesis?")
-    lines.extend(["", "Questions for peer research agents:"])
-    lines.extend([f"- {q}" for q in questions[:4]])
-
 def _build_post(
     experiment: Experiment,
     result: ExperimentResult,
     related_results: list[ExperimentResult] | None = None,
-    db=None,
 ) -> tuple[str, str]:
     exp = _model_dict(experiment)
     res = _model_dict(result)
     metrics = _json_dict(res.get("metrics"))
-    context = _strategy_context(db, experiment) if db is not None else {"mission": None, "ea": None, "hypothesis": None}
-    context["experiment"] = experiment
 
     experiment_id = _pick(exp, "id", "experiment_id")
     status = _pick(exp, "status") or _pick(res, "status") or "completed"
@@ -453,8 +351,6 @@ def _build_post(
             if row and not ((year == "2024" and isinstance(overall_is, dict)) or (year == "2025" and isinstance(overall_oos, dict))):
                 lines.extend(["", f"{year} reference:"] + _metric_text(row))
 
-    _append_strategy_context(lines, context, metrics)
-
     limitations = metrics.get("limitations")
     if isinstance(limitations, list) and limitations:
         lines.extend(["", "Research limitations:"])
@@ -481,6 +377,9 @@ _NUMBER_WORDS = {
 }
 
 def _collapse_repeated_letters(word: str) -> str:
+    # Keep the collapsed form as a fallback for obfuscated repeated letters.
+    # Number words are also allowed to contain real doubled letters (e.g.
+    # ``three``), so callers should try the raw lowercase form first.
     return re.sub(r"(.)\1+", r"\1", word.lower())
 
 def _edit_distance(a: str, b: str) -> int:
@@ -496,7 +395,10 @@ def _challenge_text_words(text: str) -> list[str]:
     return re.findall(r"[A-Za-z]+|\d+(?:\.\d+)?", str(text or "").lower())
 
 def _fuzzy_number_word(word: str):
-    clean = _collapse_repeated_letters(word)
+    raw = str(word or "").lower()
+    if raw in _NUMBER_WORDS:
+        return _NUMBER_WORDS[raw]
+    clean = _collapse_repeated_letters(raw)
     if clean in _NUMBER_WORDS:
         return _NUMBER_WORDS[clean]
     candidates = [
@@ -509,24 +411,31 @@ def _fuzzy_number_word(word: str):
     distance = _edit_distance(clean, name)
     return value if distance <= max(1, len(name) // 4) else None
 
+
 def _number_from_words(words: list[str], i: int):
     if i >= len(words):
         return None, i
     if re.fullmatch(r"\d+(?:\.\d+)?", words[i]):
         return float(words[i]), i + 1
 
-    # First, join 2-4 obfuscated chunks into a single number word.
+    # Moltbook can split one number word across many obfuscated chunks, e.g.
+    # ``tW eN tY`` -> twenty and ``tH rEe`` -> three. Try the raw lowercase
+    # join first so legitimate doubled letters such as the ``ee`` in three are
+    # not destroyed by the repeated-letter cleanup.
     first = None
     first_end = i
-    # Moltbook may split an obfuscated number word into many short chunks,
-    # e.g. "tW eN tY" -> "twenty" or "tH rEe" -> "three".
     for n in range(1, min(8, len(words) - i) + 1):
         parts = words[i:i+n]
         if any(re.fullmatch(r"\d+(?:\.\d+)?", x) for x in parts):
             continue
-        joined = "".join(_collapse_repeated_letters(x) for x in parts)
-        if joined in _NUMBER_WORDS:
-            first = _NUMBER_WORDS[joined]
+        joined_raw = "".join(str(x).lower() for x in parts)
+        joined_clean = "".join(_collapse_repeated_letters(x) for x in parts)
+        if joined_raw in _NUMBER_WORDS:
+            first = _NUMBER_WORDS[joined_raw]
+            first_end = i + n
+            break
+        if joined_clean in _NUMBER_WORDS:
+            first = _NUMBER_WORDS[joined_clean]
             first_end = i + n
             break
         if n == 1:
@@ -535,15 +444,16 @@ def _number_from_words(words: list[str], i: int):
                 first = fuzzy
                 first_end = i + 1
 
-
     if first is None:
         return None, i
 
-    # English compound numbers: "twenty five" = 25.
+    # English compound numbers: ``twenty three``. The second number may also
+    # be split into multiple obfuscated chunks, so parse it with the same
+    # routine instead of inspecting only one token.
     if first in {20,30,40,50,60,70,80,90} and first_end < len(words):
-        second = _fuzzy_number_word(words[first_end])
+        second, second_end = _number_from_words(words, first_end)
         if second is not None and 0 < second < 10:
-            return float(first + second), first_end + 1
+            return float(first + second), second_end
 
     return float(first), first_end
 
@@ -838,34 +748,43 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
         )
         all_results = query.all()
 
-        # Select the latest research STAGE, not merely the newest timestamp.
-        # v11 ExperimentResult can have a missing/identical created_at on older
-        # database schemas, so timestamp-only ordering can incorrectly return v10.
+        # Select the latest research stage. v11/v11.2 are identified by their
+        # actual result schema; fall back to v10 for older experiments.
         def _result_stage_rank(row: ExperimentResult) -> int:
             metrics = _json_dict(getattr(row, "metrics", None))
             summary = str(getattr(row, "summary", "") or "").lower()
             conclusion = str(getattr(row, "conclusion", "") or "").lower()
             method = metrics.get("method")
-            method_text = json.dumps(method, ensure_ascii=False).lower() if isinstance(method, (dict, list)) else str(method or "").lower()
+            method_text = (
+                json.dumps(method, ensure_ascii=False).lower()
+                if isinstance(method, (dict, list))
+                else str(method or "").lower()
+            )
+            metrics_text = json.dumps(metrics, ensure_ascii=False).lower()
 
-            # v11 sizing signature: baseline_flat + policies + comparison +
-            # entry-time volatility/sizing method.
+            # v11.2 / three-year robustness must take precedence over v11.
+            if (
+                "v11.2" in method_text
+                or "three-year" in method_text
+                or "three_year" in metrics_text
+            ):
+                return 112
+
+            # v11 sizing signature from research_runner_v11.py.
             if (
                 "baseline_flat" in metrics
-                or ("policies" in metrics and "comparison" in metrics and "sizing_context" in json.dumps(metrics.get("experiment_scope", {})).lower())
+                or (
+                    "policies" in metrics
+                    and "comparison" in metrics
+                    and "sizing_context" in json.dumps(
+                        metrics.get("experiment_scope", {}), ensure_ascii=False
+                    ).lower()
+                )
                 or "position-sizing simulation" in summary
                 or "sizing policies simulated" in conclusion
                 or "realized trade p/l" in method_text
             ):
                 return 11
-
-            # v11.2 / three-year robustness, if present.
-            if (
-                "v11.2" in method_text
-                or "three-year" in method_text
-                or "three_year" in json.dumps(metrics, ensure_ascii=False).lower()
-            ):
-                return 112
 
             if _is_v10_result(row):
                 return 10
@@ -875,7 +794,8 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
             all_results,
             key=lambda row: (
                 _result_stage_rank(row),
-                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+                getattr(row, "created_at", None)
+                or datetime.min.replace(tzinfo=timezone.utc),
             ),
         ) if all_results else None
 
@@ -885,7 +805,7 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
                 detail="No research result found for this experiment",
             )
 
-        title, content = _build_post(experiment, result, all_results, db)
+        title, content = _build_post(experiment, result, all_results)
         if republish:
             # Moltbook deduplicates identical content. Add a unique run marker
             # only when explicitly requested, so normal publishing stays idempotent.
@@ -900,58 +820,6 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
             "title": title,
             "moltbook": published,
         }
-    finally:
-        db.close()
-
-
-
-@router.get("/inbox")
-async def moltbook_inbox(limit: int = 50) -> dict[str, Any]:
-    """Read the agent home feed so Moltbook feedback can become research input.
-
-    This endpoint does not modify the EA, create orders, or change parameters.
-    It only retrieves the current Moltbook home payload for later filtering.
-    """
-    api_key = os.getenv("MOLTBOOK_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=503, detail="MOLTBOOK_API_KEY is not configured")
-    limit = max(1, min(int(limit), 100))
-    status, body = await asyncio.to_thread(
-        _request_json,
-        "GET",
-        f"{MOLTBOOK_API_BASE}/home?limit={limit}",
-        {"Authorization": f"Bearer {api_key}"},
-    )
-    if status >= 400:
-        raise HTTPException(
-            status_code=502,
-            detail={"message": "Moltbook home fetch failed", "status_code": status, "response": body},
-        )
-    return {"status": "ok", "items": body}
-
-
-@router.get("/research/{experiment_id}/research-brief")
-async def research_brief(experiment_id: str) -> dict[str, Any]:
-    """Preview the strategy-aware research brief without publishing it."""
-    db = SessionLocal()
-    try:
-        experiment = db.query(Experiment).filter(Experiment.id == experiment_id).first()
-        if experiment is None:
-            raise HTTPException(status_code=404, detail="Experiment not found")
-        all_results = db.query(ExperimentResult).filter(ExperimentResult.experiment_id == experiment_id).all()
-        def rank(row: ExperimentResult) -> tuple[int, Any]:
-            metrics = _json_dict(getattr(row, "metrics", None))
-            summary = str(getattr(row, "summary", "") or "").lower()
-            conclusion = str(getattr(row, "conclusion", "") or "").lower()
-            method = metrics.get("method")
-            method_text = json.dumps(method, ensure_ascii=False).lower() if isinstance(method, (dict, list)) else str(method or "").lower()
-            stage = 11 if ("baseline_flat" in metrics or "position-sizing simulation" in summary or "sizing policies simulated" in conclusion or "realized trade p/l" in method_text) else (112 if "three-year" in json.dumps(metrics, ensure_ascii=False).lower() or "v11.2" in method_text else (10 if _is_v10_result(row) else 0))
-            return stage, getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc)
-        result = max(all_results, key=rank) if all_results else None
-        if result is None:
-            raise HTTPException(status_code=404, detail="No research result found for this experiment")
-        title, content = _build_post(experiment, result, all_results, db)
-        return {"status": "research_brief", "experiment_id": experiment_id, "title": title, "content": content}
     finally:
         db.close()
 
@@ -972,34 +840,43 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
         )
         all_results = query.all()
 
-        # Select the latest research STAGE, not merely the newest timestamp.
-        # v11 ExperimentResult can have a missing/identical created_at on older
-        # database schemas, so timestamp-only ordering can incorrectly return v10.
+        # Select the latest research stage. v11/v11.2 are identified by their
+        # actual result schema; fall back to v10 for older experiments.
         def _result_stage_rank(row: ExperimentResult) -> int:
             metrics = _json_dict(getattr(row, "metrics", None))
             summary = str(getattr(row, "summary", "") or "").lower()
             conclusion = str(getattr(row, "conclusion", "") or "").lower()
             method = metrics.get("method")
-            method_text = json.dumps(method, ensure_ascii=False).lower() if isinstance(method, (dict, list)) else str(method or "").lower()
+            method_text = (
+                json.dumps(method, ensure_ascii=False).lower()
+                if isinstance(method, (dict, list))
+                else str(method or "").lower()
+            )
+            metrics_text = json.dumps(metrics, ensure_ascii=False).lower()
 
-            # v11 sizing signature: baseline_flat + policies + comparison +
-            # entry-time volatility/sizing method.
+            # v11.2 / three-year robustness must take precedence over v11.
+            if (
+                "v11.2" in method_text
+                or "three-year" in method_text
+                or "three_year" in metrics_text
+            ):
+                return 112
+
+            # v11 sizing signature from research_runner_v11.py.
             if (
                 "baseline_flat" in metrics
-                or ("policies" in metrics and "comparison" in metrics and "sizing_context" in json.dumps(metrics.get("experiment_scope", {})).lower())
+                or (
+                    "policies" in metrics
+                    and "comparison" in metrics
+                    and "sizing_context" in json.dumps(
+                        metrics.get("experiment_scope", {}), ensure_ascii=False
+                    ).lower()
+                )
                 or "position-sizing simulation" in summary
                 or "sizing policies simulated" in conclusion
                 or "realized trade p/l" in method_text
             ):
                 return 11
-
-            # v11.2 / three-year robustness, if present.
-            if (
-                "v11.2" in method_text
-                or "three-year" in method_text
-                or "three_year" in json.dumps(metrics, ensure_ascii=False).lower()
-            ):
-                return 112
 
             if _is_v10_result(row):
                 return 10
@@ -1009,7 +886,8 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
             all_results,
             key=lambda row: (
                 _result_stage_rank(row),
-                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+                getattr(row, "created_at", None)
+                or datetime.min.replace(tzinfo=timezone.utc),
             ),
         ) if all_results else None
 
@@ -1019,7 +897,7 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
                 detail="No research result found for this experiment",
             )
 
-        title, content = _build_post(experiment, result, all_results, db)
+        title, content = _build_post(experiment, result, all_results)
         return {
             "status": "preview",
             "experiment_id": experiment_id,
