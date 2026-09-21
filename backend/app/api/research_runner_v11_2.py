@@ -1,667 +1,276 @@
 from __future__ import annotations
 
+import io
 import json
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+import pandas as pd
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.research_models import Experiment, ExperimentResult
-
 
 router = APIRouter(
     prefix="/research/experiments",
     tags=["Research Engine v11.2 Robustness 3-Year"],
 )
 
+MIN_TRADES_DEFAULT = 20
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
-def _load_metrics(result: ExperimentResult) -> dict[str, Any]:
-    raw = result.metrics or "{}"
+def _read_csv(upload: UploadFile, label: str) -> pd.DataFrame:
+    raw = upload.file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail=f"Empty CSV upload: {label}")
     try:
-        data = json.loads(raw)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"ExperimentResult {result.id} contains invalid JSON metrics",
-        ) from exc
-
-    if not isinstance(data, dict):
-        raise HTTPException(
-            status_code=422,
-            detail=f"ExperimentResult {result.id} metrics must be a JSON object",
-        )
-    return data
+        df = pd.read_csv(io.BytesIO(raw))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unable to parse {label}: {exc}") from exc
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
 
 
-def _as_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+def _require(df: pd.DataFrame, cols: set[str], label: str) -> None:
+    missing = sorted(cols - set(df.columns))
+    if missing:
+        raise HTTPException(status_code=400, detail=f"{label} missing columns: {', '.join(missing)}")
 
 
-def _as_int(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
+def _parse_time(s: pd.Series, tz: str) -> pd.Series:
+    x = pd.to_datetime(s, errors="coerce")
+    if x.isna().all():
+        raise HTTPException(status_code=400, detail="No valid timestamps found")
+    if x.dt.tz is None:
+        x = x.dt.tz_localize(tz, ambiguous="NaT", nonexistent="NaT")
+    return x.dt.tz_convert("UTC")
 
 
-def _metric_row(node: Any) -> dict[str, Any] | None:
-    if not isinstance(node, dict):
-        return None
+def _pair_trades(deals: pd.DataFrame, tz: str) -> pd.DataFrame:
+    _require(deals, {"time", "deal", "symbol", "type", "direction", "volume", "price", "commission", "swap", "profit"}, "deals")
+    d = deals.copy()
+    d["time"] = _parse_time(d["time"], tz)
+    for c in ("volume", "price", "commission", "swap", "profit"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["direction"] = d["direction"].astype(str).str.lower().str.strip()
+    d["symbol"] = d["symbol"].astype(str).str.strip()
+    d["type"] = d["type"].astype(str).str.lower().str.strip()
+    d = d.dropna(subset=["time", "symbol", "volume"]).sort_values(["time", "deal"], kind="stable")
 
-    # Accept the metric naming used by the research engine.
-    trade_count = node.get("trade_count")
-    net_profit = node.get("net_profit")
-    profit_factor = node.get("profit_factor")
+    opens: dict[tuple[str, str], deque[dict[str, Any]]] = defaultdict(deque)
+    rows: list[dict[str, Any]] = []
+    for _, r in d.iterrows():
+        direction = str(r["direction"])
+        symbol = str(r["symbol"])
+        volume = float(r["volume"] or 0)
+        if volume <= 0:
+            continue
+        if direction == "in":
+            opens[(symbol, str(r["type"]))].append({
+                "entry_time": r["time"],
+                "entry_type": str(r["type"]),
+                "entry_volume": volume,
+                "entry_commission": float(r["commission"] or 0),
+                "entry_swap": float(r["swap"] or 0),
+            })
+            continue
+        if direction != "out":
+            continue
+        opposite = "sell" if str(r["type"]) == "buy" else "buy"
+        key = (symbol, opposite)
+        remaining = volume
+        exit_commission = float(r["commission"] or 0)
+        exit_swap = float(r["swap"] or 0)
+        exit_profit = float(r["profit"] or 0)
+        while remaining > 1e-12 and opens[key]:
+            o = opens[key][0]
+            matched = min(remaining, float(o["entry_volume"]))
+            frac_exit = matched / volume
+            frac_entry = matched / float(o["entry_volume"])
+            pnl = (
+                exit_profit * frac_exit
+                + float(o["entry_commission"]) * frac_entry
+                + float(o["entry_swap"]) * frac_entry
+                + exit_commission * frac_exit
+                + exit_swap * frac_exit
+            )
+            rows.append({"entry_time": o["entry_time"], "exit_time": r["time"], "symbol": symbol, "type": o["entry_type"], "volume": matched, "profit": pnl})
+            o["entry_volume"] -= matched
+            remaining -= matched
+            if o["entry_volume"] <= 1e-12:
+                opens[key].popleft()
+    out = pd.DataFrame(rows)
+    if out.empty:
+        raise HTTPException(status_code=400, detail="No completed trades reconstructed from deals")
+    return out.sort_values("entry_time").reset_index(drop=True)
 
-    if trade_count is None and net_profit is None and profit_factor is None:
-        return None
 
+def _market(market: pd.DataFrame, tz: str, low_cut: float | None = None, high_cut: float | None = None) -> tuple[pd.DataFrame, float, float]:
+    _require(market, {"time", "high", "low", "close"}, "market")
+    m = market.copy()
+    m["time"] = _parse_time(m["time"], tz)
+    for c in ("high", "low", "close"):
+        m[c] = pd.to_numeric(m[c], errors="coerce")
+    m = m.dropna(subset=["time", "high", "low", "close"]).sort_values("time").drop_duplicates("time", keep="last")
+    prev = m["close"].shift(1)
+    tr = pd.concat([(m["high"] - m["low"]), (m["high"] - prev).abs(), (m["low"] - prev).abs()], axis=1).max(axis=1)
+    m["atr_pct"] = tr.rolling(14, min_periods=14).mean() / m["close"].abs()
+    valid = m["atr_pct"].dropna()
+    if valid.empty:
+        raise HTTPException(status_code=400, detail="Unable to calculate ATR(14)/close")
+    lc = float(low_cut if low_cut is not None else valid.quantile(1 / 3))
+    hc = float(high_cut if high_cut is not None else valid.quantile(2 / 3))
+    m["regime"] = m["atr_pct"].map(lambda x: "unknown" if pd.isna(x) else ("low" if x <= lc else ("high" if x >= hc else "normal")))
+    return m[["time", "regime"]], lc, hc
+
+
+def _attach(trades: pd.DataFrame, regimes: pd.DataFrame) -> pd.DataFrame:
+    return pd.merge_asof(trades.sort_values("entry_time"), regimes.sort_values("time"), left_on="entry_time", right_on="time", direction="backward").assign(regime=lambda x: x["regime"].fillna("unknown"))
+
+
+def _summary(values: list[float]) -> dict[str, Any]:
+    s = pd.Series(values, dtype=float)
+    if s.empty:
+        return {"trade_count": 0, "net_profit": 0.0, "profit_factor": None, "win_rate": None, "average_trade": None, "max_drawdown": 0.0}
+    gp = float(s[s > 0].sum())
+    gl = float(-s[s < 0].sum())
+    eq = s.cumsum()
+    dd = eq - eq.cummax()
     return {
-        "trade_count": _as_int(trade_count),
-        "net_profit": _as_float(net_profit),
-        "profit_factor": _as_float(profit_factor),
+        "trade_count": int(len(s)),
+        "net_profit": float(s.sum()),
+        "profit_factor": float(gp / gl) if gl > 0 else None,
+        "win_rate": float((s > 0).mean()),
+        "average_trade": float(s.mean()),
+        "max_drawdown": float(dd.min()),
     }
 
 
-def _find_year_block(
-    analysis: dict[str, Any],
-    candidates: list[str],
-) -> dict[str, Any] | None:
-    """Find a year block without requiring one exact v9 JSON shape."""
-    for key in candidates:
-        value = analysis.get(key)
-        if isinstance(value, dict):
-            return value
-
-    # Some result versions wrap the analysis one level deeper.
-    for key, value in analysis.items():
-        if not isinstance(value, dict):
-            continue
-        if key in {"analysis", "result", "walk_forward", "generalization"}:
-            for candidate in candidates:
-                nested = value.get(candidate)
-                if isinstance(nested, dict):
-                    return nested
-
-    return None
+def _year_metrics(trades: pd.DataFrame) -> dict[str, Any]:
+    overall = _summary(trades["profit"].tolist())
+    groups = {}
+    for regime in ("low", "normal", "high", "unknown"):
+        vals = trades.loc[trades["regime"] == regime, "profit"].tolist()
+        if vals:
+            groups[regime] = _summary(vals)
+    return {"overall": overall, "by_entry_volatility": groups}
 
 
-def _find_overall(block: dict[str, Any]) -> dict[str, Any] | None:
-    for key in ("overall", "metrics", "summary"):
-        row = _metric_row(block.get(key))
-        if row is not None:
-            return row
-    return _metric_row(block)
-
-
-def _collect_group_pairs(
-    node: Any,
-    prefix: str = "",
-) -> dict[str, dict[str, dict[str, Any]]]:
-    """
-    Collect rows in either of these shapes:
-
-      group: {"is": {...}, "oos": {...}}
-      group: {"2024": {...}, "2025": {...}}
-
-    It also walks nested segmentation sections.
-    """
-    found: dict[str, dict[str, dict[str, Any]]] = {}
-
-    if not isinstance(node, dict):
-        return found
-
-    for key, value in node.items():
-        if not isinstance(value, dict):
-            continue
-
-        name = f"{prefix}|{key}" if prefix else key
-
-        is_row = _metric_row(value.get("is"))
-        oos_row = _metric_row(value.get("oos"))
-        y24_row = _metric_row(value.get("2024"))
-        y25_row = _metric_row(value.get("2025"))
-
-        if is_row is not None and oos_row is not None:
-            found[name] = {"2024": is_row, "2025": oos_row}
-            continue
-
-        if y24_row is not None and y25_row is not None:
-            found[name] = {"2024": y24_row, "2025": y25_row}
-            continue
-
-        found.update(_collect_group_pairs(value, name))
-
-    return found
-
-
-def _collect_single_year_groups(
-    node: Any,
-    year: str,
-    prefix: str = "",
-) -> dict[str, dict[str, Any]]:
-    """Collect segmentation rows for one already-isolated year."""
-    found: dict[str, dict[str, Any]] = {}
-
-    if not isinstance(node, dict):
-        return found
-
-    for key, value in node.items():
-        if not isinstance(value, dict):
-            continue
-
-        name = f"{prefix}|{key}" if prefix else key
-        row = _metric_row(value)
-
-        if row is not None and key not in {
-            "overall",
-            "accounting",
-            "experiment_scope",
-            "method",
-            "limitations",
-        }:
-            found[name] = row
-            continue
-
-        found.update(_collect_single_year_groups(value, year, name))
-
-    return found
-
-
-def _normalise_group_name(name: str) -> str:
-    return (
-        name.replace("2024|", "")
-        .replace("2025|", "")
-        .replace("is|", "")
-        .replace("oos|", "")
-        .strip("|")
-    )
-
-
-def _extract_baseline_split(analysis: dict[str, Any]) -> dict[str, Any]:
-    """
-    v11.2 accepts several historical result layouts.
-
-    Preferred:
-      is_2024 / oos_2025
-
-    Also accepted:
-      2024 / 2025
-      is / oos
-      generalization sections containing paired is/oos groups
-      year-keyed segmentation blocks
-    """
-    is_block = _find_year_block(analysis, ["is_2024", "2024", "is"])
-    oos_block = _find_year_block(analysis, ["oos_2025", "2025", "oos"])
-
-    if is_block is not None and oos_block is not None:
-        is_overall = _find_overall(is_block)
-        oos_overall = _find_overall(oos_block)
-        if is_overall is not None and oos_overall is not None:
-            return {
-                "mode": "explicit_year_blocks",
-                "is": is_overall,
-                "oos": oos_overall,
-                "is_block": is_block,
-                "oos_block": oos_block,
-            }
-
-    # Walk-forward v9 style:
-    generalization = analysis.get("generalization")
-    if isinstance(generalization, dict):
-        pairs = _collect_group_pairs(generalization)
-        if pairs:
-            return {
-                "mode": "generalization_pairs",
-                "is": _metric_row(analysis.get("is_2024", {}).get("overall"))
-                if isinstance(analysis.get("is_2024"), dict)
-                else None,
-                "oos": _metric_row(analysis.get("oos_2025", {}).get("overall"))
-                if isinstance(analysis.get("oos_2025"), dict)
-                else None,
-                "pairs": pairs,
-            }
-
-    # A result can store by_entry_year as:
-    # {"2024": {...}, "2025": {...}}
-    by_year = analysis.get("by_entry_year")
-    if isinstance(by_year, dict):
-        y24 = by_year.get("2024")
-        y25 = by_year.get("2025")
-        if isinstance(y24, dict) and isinstance(y25, dict):
-            return {
-                "mode": "by_entry_year",
-                "is": _metric_row(y24),
-                "oos": _metric_row(y25),
-                "is_block": y24,
-                "oos_block": y25,
-            }
-
-    raise HTTPException(
-        status_code=422,
-        detail=(
-            "The 2024/2025 baseline result does not contain a recognized "
-            "IS/OOS year split. v11.2 accepts is_2024/oos_2025, "
-            "2024/2025, is/oos, generalization pairs, or by_entry_year."
-        ),
-    )
-
-
-def _extract_2026(analysis: dict[str, Any]) -> dict[str, Any]:
-    """Extract the unseen-year result without assuming a single result shape."""
-    for key in ("2026", "oos_2026", "unseen_2026", "unseen_year"):
-        block = analysis.get(key)
-        if isinstance(block, dict):
-            overall = _find_overall(block)
-            if overall is not None:
-                return {"mode": key, "overall": overall, "block": block}
-
-    overall = _metric_row(analysis.get("overall"))
-    if overall is not None:
-        return {"mode": "top_level_overall", "overall": overall, "block": analysis}
-
-    # A few result versions store the current-year result under a generic
-    # baseline/result wrapper.
-    for wrapper_key in ("analysis", "result", "unseen_year_validation"):
-        wrapper = analysis.get(wrapper_key)
-        if isinstance(wrapper, dict):
-            overall = _metric_row(wrapper.get("overall"))
-            if overall is not None:
-                return {
-                    "mode": wrapper_key,
-                    "overall": overall,
-                    "block": wrapper,
-                }
-
-    raise HTTPException(
-        status_code=422,
-        detail="The unseen-year result does not contain a recognizable overall metric block.",
-    )
-
-
-def _extract_2026_groups(analysis: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    groups: dict[str, dict[str, Any]] = {}
-
-    for section_key in (
-        "by_entry_volatility",
-        "by_entry_trend",
-        "by_entry_session",
-        "by_trend",
-        "by_volatility",
-        "segmentation",
-    ):
-        section = analysis.get(section_key)
-        if isinstance(section, dict):
-            for name, row in _collect_single_year_groups(section, "2026").items():
-                groups[f"{section_key}|{name}"] = row
-
-    return groups
-
-
-def _build_baseline_group_map(split: dict[str, Any]) -> dict[str, dict[str, dict[str, Any]]]:
-    pairs = split.get("pairs")
-    if isinstance(pairs, dict):
-        return pairs
-
-    is_block = split.get("is_block")
-    oos_block = split.get("oos_block")
-
-    if isinstance(is_block, dict) and isinstance(oos_block, dict):
-        is_groups = _collect_single_year_groups(is_block, "2024")
-        oos_groups = _collect_single_year_groups(oos_block, "2025")
-
-        common = set(is_groups) & set(oos_groups)
-        return {
-            _normalise_group_name(name): {
-                "2024": is_groups[name],
-                "2025": oos_groups[name],
-            }
-            for name in common
-        }
-
-    return {}
-
-
-def _gate_row(
-    group: str,
-    baseline: dict[str, dict[str, Any]],
-    unseen: dict[str, Any] | None,
-    min_trades: int,
-) -> dict[str, Any]:
-    y24 = baseline.get("2024", {})
-    y25 = baseline.get("2025", {})
-
-    n24 = _as_int(y24.get("trade_count"))
-    n25 = _as_int(y25.get("trade_count"))
-    p24 = _as_float(y24.get("net_profit"))
-    p25 = _as_float(y25.get("net_profit"))
-    pf24 = _as_float(y24.get("profit_factor"))
-    pf25 = _as_float(y25.get("profit_factor"))
-
-    sample_sufficient = n24 >= min_trades and n25 >= min_trades
-    same_sign = (
-        p24 is not None
-        and p25 is not None
-        and ((p24 > 0 and p25 > 0) or (p24 < 0 and p25 < 0))
-    )
-    pf_gt_1_both = (
-        pf24 is not None
-        and pf25 is not None
-        and pf24 > 1
-        and pf25 > 1
-    )
-
-    unseen_row = unseen or {}
-    n26 = _as_int(unseen_row.get("trade_count"))
-    p26 = _as_float(unseen_row.get("net_profit"))
-    pf26 = _as_float(unseen_row.get("profit_factor"))
-
+def _gate(baseline: dict[str, Any], unseen: dict[str, Any], min_trades: int) -> dict[str, Any]:
+    y24, y25, y26 = baseline["2024"]["overall"], baseline["2025"]["overall"], unseen["overall"]
+    positive = all((x.get("net_profit") is not None and x["net_profit"] > 0 and x.get("profit_factor") is not None and x["profit_factor"] > 1) for x in (y24, y25, y26))
+    sufficient = all(int(x.get("trade_count") or 0) >= min_trades for x in (y24, y25, y26))
     return {
-        "group": group,
-        "2024_trade_count": n24,
-        "2025_trade_count": n25,
-        "2026_trade_count": n26,
-        "2024_net_profit": p24,
-        "2025_net_profit": p25,
-        "2026_net_profit": p26,
-        "2024_profit_factor": pf24,
-        "2025_profit_factor": pf25,
-        "2026_profit_factor": pf26,
-        "min_trades_required_each_baseline_period": min_trades,
-        "baseline_sample_sufficient": sample_sufficient,
-        "baseline_same_sign": same_sign,
-        "baseline_pf_gt_1_both": pf_gt_1_both,
-        "unseen_year_available": unseen is not None,
-        "unseen_year_positive": p26 is not None and p26 > 0,
-        "unseen_year_pf_gt_1": pf26 is not None and pf26 > 1,
-        "positive_2024_2025_and_2026": (
-            sample_sufficient
-            and p24 is not None and p25 is not None and p26 is not None
-            and p24 > 0 and p25 > 0 and p26 > 0
-            and pf24 is not None and pf25 is not None and pf26 is not None
-            and pf24 > 1 and pf25 > 1 and pf26 > 1
-        ),
+        "2024_trade_count": y24["trade_count"], "2025_trade_count": y25["trade_count"], "2026_trade_count": y26["trade_count"],
+        "2024_net_profit": y24["net_profit"], "2025_net_profit": y25["net_profit"], "2026_net_profit": y26["net_profit"],
+        "2024_profit_factor": y24["profit_factor"], "2025_profit_factor": y25["profit_factor"], "2026_profit_factor": y26["profit_factor"],
+        "min_trades_required_each_year": min_trades, "sample_sufficient_all_years": sufficient,
+        "positive_net_profit_and_pf_gt_1_all_years": positive,
+        "robust_positive_3year": sufficient and positive,
     }
 
 
-# ---------------------------------------------------------------------------
-# v11.2 endpoint
-# ---------------------------------------------------------------------------
+def _group_gate(years: dict[str, dict[str, Any]], min_trades: int) -> list[dict[str, Any]]:
+    names = set(years["2024"]["by_entry_volatility"]) | set(years["2025"]["by_entry_volatility"]) | set(years["2026"]["by_entry_volatility"])
+    rows = []
+    for g in sorted(names):
+        r = {str(y): years[str(y)]["by_entry_volatility"].get(g) for y in (2024, 2025, 2026)}
+        available = [r[str(y)] for y in (2024, 2025, 2026)]
+        sufficient = all(x is not None and x["trade_count"] >= min_trades for x in available)
+        positive = sufficient and all(x["net_profit"] > 0 and x.get("profit_factor") is not None and x["profit_factor"] > 1 for x in available)
+        rows.append({"group": g, "2024": r["2024"], "2025": r["2025"], "2026": r["2026"], "sample_sufficient_all_years": sufficient, "robust_positive_3year": positive})
+    return rows
 
-@router.post("/{experiment_id}/robustness-gate-3year")
-def robustness_gate_3year(
+
+def _run_gate(experiment_id: str, is_deals: pd.DataFrame, is_market: pd.DataFrame, oos_deals: pd.DataFrame, oos_market: pd.DataFrame, unseen_deals: pd.DataFrame, unseen_market: pd.DataFrame, tz: str, min_trades: int) -> dict[str, Any]:
+    t24, t25, t26 = _pair_trades(is_deals, tz), _pair_trades(oos_deals, tz), _pair_trades(unseen_deals, tz)
+    # Thresholds are learned only from 2024+2025 baseline market data, then frozen for 2026.
+    base_market = pd.concat([is_market, oos_market], ignore_index=True)
+    base_regimes, low_cut, high_cut = _market(base_market, tz)
+    r24, _, _ = _market(is_market, tz, low_cut, high_cut)
+    r25, _, _ = _market(oos_market, tz, low_cut, high_cut)
+    r26, _, _ = _market(unseen_market, tz, low_cut, high_cut)
+    y24, y25, y26 = _attach(t24, r24), _attach(t25, r25), _attach(t26, r26)
+    years = {"2024": _year_metrics(y24), "2025": _year_metrics(y25), "2026": _year_metrics(y26)}
+    overall_gate = _gate(years, years["2026"], min_trades) if False else {
+        "2024": years["2024"]["overall"], "2025": years["2025"]["overall"], "2026": years["2026"]["overall"],
+    }
+    yg = _gate({"2024": years["2024"], "2025": years["2025"]}, years["2026"], min_trades)
+    groups = _group_gate(years, min_trades)
+    robust_groups = [x for x in groups if x["robust_positive_3year"]]
+    conclusion = "SUPPORTED_FOR_FURTHER_RESEARCH" if robust_groups else "NOT_ESTABLISHED"
+    return {
+        "experiment_id": experiment_id,
+        "method": "v11.2 three-year robustness gate from supplied MT5 deals and OHLC; 2024 IS, 2025 OOS, 2026 unseen",
+        "periods": {"is": "2024", "oos": "2025", "unseen": "2026"},
+        "min_trades": min_trades,
+        "overall": yg,
+        "year_results": years,
+        "groups": groups,
+        "summary": {"group_count": len(groups), "robust_positive_groups": len(robust_groups), "conclusion": conclusion},
+        "thresholds": {"atr_measure": "ATR(14)/close", "low_cut": low_cut, "high_cut": high_cut, "threshold_source": "2024+2025 baseline only"},
+        "limitations": [
+            "This gate reconstructs realized MT5 trades; it does not rerun the MQL5 EA.",
+            "2026 is treated as unseen validation evidence and may be a partial year.",
+            "ATR regime thresholds are frozen from 2024+2025 baseline market data; 2026 is not used to set thresholds.",
+            "Minimum trade count is a screening rule, not a statistical significance test.",
+            "Missing or unmatched deals are excluded from completed-trade reconstruction.",
+            "No parameters or sizing policy are optimized or selected by this gate.",
+        ],
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+async def robustness_gate_3year_from_inputs(
     experiment_id: str,
-    baseline_2024_2025_experiment_id: str = Query(
-        ...,
-        description="Experiment containing the locked 2024 IS / 2025 OOS baseline result.",
-    ),
-    min_trades: int = Query(20, ge=1, le=1000),
-):
+    is_deals_file: UploadFile,
+    is_market_file: UploadFile,
+    oos_deals_file: UploadFile,
+    oos_market_file: UploadFile,
+    unseen_deals_file: UploadFile,
+    unseen_market_file: UploadFile,
+    input_timezone: str = "UTC",
+    min_trades: int = MIN_TRADES_DEFAULT,
+) -> dict[str, Any]:
     db: Session = SessionLocal()
-
     try:
-        experiment = (
-            db.query(Experiment)
-            .filter(Experiment.id == experiment_id)
-            .first()
-        )
-        if not experiment:
+        exp = db.query(Experiment).filter(Experiment.id == experiment_id).first()
+        if not exp:
             raise HTTPException(status_code=404, detail="Experiment not found")
-
-        baseline_experiment = (
-            db.query(Experiment)
-            .filter(Experiment.id == baseline_2024_2025_experiment_id)
-            .first()
+        analysis = _run_gate(
+            experiment_id,
+            _read_csv(is_deals_file, "is_deals"), _read_csv(is_market_file, "is_market"),
+            _read_csv(oos_deals_file, "oos_deals"), _read_csv(oos_market_file, "oos_market"),
+            _read_csv(unseen_deals_file, "deals"), _read_csv(unseen_market_file, "market"),
+            input_timezone, min_trades,
         )
-        if not baseline_experiment:
-            raise HTTPException(
-                status_code=404,
-                detail="Baseline 2024/2025 experiment not found",
-            )
-
-        current_results = (
-            db.query(ExperimentResult)
-            .filter(ExperimentResult.experiment_id == experiment_id)
-            .order_by(ExperimentResult.created_at.desc())
-            .all()
-        )
-        if not current_results:
-            raise HTTPException(
-                status_code=404,
-                detail="No ExperimentResult found for the unseen-year experiment",
-            )
-
-        baseline_results = (
-            db.query(ExperimentResult)
-            .filter(
-                ExperimentResult.experiment_id
-                == baseline_2024_2025_experiment_id
-            )
-            .order_by(ExperimentResult.created_at.desc())
-            .all()
-        )
-        if not baseline_results:
-            raise HTTPException(
-                status_code=404,
-                detail="No ExperimentResult found for the baseline 2024/2025 experiment",
-            )
-
-        # Try newest first, then older results until a valid year split is found.
-        baseline_split: dict[str, Any] | None = None
-        baseline_source: ExperimentResult | None = None
-        baseline_errors: list[str] = []
-
-        for candidate in baseline_results:
-            try:
-                candidate_analysis = _load_metrics(candidate)
-                baseline_split = _extract_baseline_split(candidate_analysis)
-                baseline_source = candidate
-                break
-            except HTTPException as exc:
-                baseline_errors.append(str(exc.detail))
-
-        if baseline_split is None or baseline_source is None:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": (
-                        "No usable 2024/2025 IS/OOS split was found in the "
-                        "baseline experiment results."
-                    ),
-                    "baseline_experiment_id": baseline_2024_2025_experiment_id,
-                    "checked_results": len(baseline_results),
-                    "errors": baseline_errors[-5:],
-                },
-            )
-
-        # Try newest current result first; it should be the 2026 validation.
-        unseen: dict[str, Any] | None = None
-        current_source: ExperimentResult | None = None
-        current_analysis: dict[str, Any] | None = None
-        current_errors: list[str] = []
-
-        for candidate in current_results:
-            try:
-                candidate_analysis = _load_metrics(candidate)
-                unseen = _extract_2026(candidate_analysis)
-                current_source = candidate
-                current_analysis = candidate_analysis
-                break
-            except HTTPException as exc:
-                current_errors.append(str(exc.detail))
-
-        if unseen is None or current_source is None or current_analysis is None:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": "No usable unseen-year result was found.",
-                    "experiment_id": experiment_id,
-                    "checked_results": len(current_results),
-                    "errors": current_errors[-5:],
-                },
-            )
-
-        baseline_groups = _build_baseline_group_map(baseline_split)
-        unseen_groups = _extract_2026_groups(current_analysis)
-
-        # Match by exact/simplified group name.  We do not fabricate missing
-        # 2026 cells; absent cells remain unavailable.
-        unseen_by_name = {
-            _normalise_group_name(name): row
-            for name, row in unseen_groups.items()
-        }
-
-        group_rows: list[dict[str, Any]] = []
-        for group, baseline_pair in sorted(baseline_groups.items()):
-            group_rows.append(
-                _gate_row(
-                    group,
-                    baseline_pair,
-                    unseen_by_name.get(_normalise_group_name(group)),
-                    min_trades,
-                )
-            )
-
-        baseline_overall = {
-            "2024": baseline_split.get("is"),
-            "2025": baseline_split.get("oos"),
-        }
-        current_overall = unseen["overall"]
-
-        overall_2024 = baseline_overall["2024"] or {}
-        overall_2025 = baseline_overall["2025"] or {}
-
-        p24 = _as_float(overall_2024.get("net_profit"))
-        p25 = _as_float(overall_2025.get("net_profit"))
-        p26 = _as_float(current_overall.get("net_profit"))
-
-        pf24 = _as_float(overall_2024.get("profit_factor"))
-        pf25 = _as_float(overall_2025.get("profit_factor"))
-        pf26 = _as_float(current_overall.get("profit_factor"))
-
-        overall_gate = {
-            "2024_trade_count": _as_int(overall_2024.get("trade_count")),
-            "2025_trade_count": _as_int(overall_2025.get("trade_count")),
-            "2026_trade_count": _as_int(current_overall.get("trade_count")),
-            "2024_net_profit": p24,
-            "2025_net_profit": p25,
-            "2026_net_profit": p26,
-            "2024_profit_factor": pf24,
-            "2025_profit_factor": pf25,
-            "2026_profit_factor": pf26,
-            "baseline_2024_2025_same_sign": (
-                p24 is not None
-                and p25 is not None
-                and ((p24 > 0 and p25 > 0) or (p24 < 0 and p25 < 0))
-            ),
-            "pf_gt_1_all_three": (
-                pf24 is not None
-                and pf25 is not None
-                and pf26 is not None
-                and pf24 > 1
-                and pf25 > 1
-                and pf26 > 1
-            ),
-        }
-
-        baseline_positive = (
-            p24 is not None and p25 is not None
-            and p24 > 0 and p25 > 0
-            and pf24 is not None and pf25 is not None
-            and pf24 > 1 and pf25 > 1
-        )
-        unseen_positive = (
-            p26 is not None and p26 > 0
-            and pf26 is not None and pf26 > 1
-        )
-
-        robust_positive_groups = [
-            row for row in group_rows
-            if row["positive_2024_2025_and_2026"]
-        ]
-
-        conclusion = (
-            "SUPPORTED_FOR_FURTHER_RESEARCH"
-            if robust_positive_groups
-            else "NOT_ESTABLISHED"
-        )
-
-        analysis = {
-            "experiment_id": experiment_id,
-            "baseline_2024_2025_experiment_id": baseline_2024_2025_experiment_id,
-            "source_result_id": current_source.id,
-            "baseline_source_result_id": baseline_source.id,
-            "method": "v11.2 three-year robustness gate with flexible result-shape parsing",
-            "min_trades": min_trades,
-            "periods": {
-                "is": "2024",
-                "oos": "2025",
-                "unseen": "2026",
-            },
-            "overall": overall_gate,
-            "summary": {
-                "baseline_positive_2024_2025": baseline_positive,
-                "unseen_2026_positive": unseen_positive,
-                "group_count": len(group_rows),
-                "robust_positive_groups": len(robust_positive_groups),
-                "conclusion": conclusion,
-            },
-            "groups": group_rows,
-            "limitations": [
-                "This gate does not rerun the MQL5 EA or create new trades.",
-                "2026 is treated as an unseen validation period; the supplied 2026 dataset may be partial-year.",
-                "Minimum trade count is a screening rule, not a statistical significance test.",
-                "A missing 2026 segmentation cell is not treated as positive evidence.",
-                "The engine does not optimize parameters or select a winning trading rule.",
-            ],
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-        }
-
         result = ExperimentResult(
-            id=str(uuid.uuid4()),
-            experiment_id=experiment.id,
+            id=str(uuid.uuid4()), experiment_id=exp.id,
             summary="Three-year robustness gate: 2024 IS, 2025 OOS, 2026 unseen validation.",
             metrics=json.dumps(analysis, ensure_ascii=False, default=str),
-            evidence=json.dumps(
-                {
-                    "source_result_id": current_source.id,
-                    "baseline_source_result_id": baseline_source.id,
-                    "min_trades": min_trades,
-                    "method": analysis["method"],
-                },
-                ensure_ascii=False,
-            ),
-            limitations=json.dumps(
-                analysis["limitations"],
-                ensure_ascii=False,
-            ),
-            conclusion=conclusion,
+            evidence=json.dumps({"source_files": ["is_deals.csv", "is_market.csv", "oos_deals.csv", "oos_market.csv", "deals.csv", "market.csv"], "method": analysis["method"]}, ensure_ascii=False),
+            limitations=json.dumps(analysis["limitations"], ensure_ascii=False),
+            conclusion=analysis["summary"]["conclusion"],
         )
-
-        db.add(result)
-        experiment.status = "completed"
-        experiment.completed_at = datetime.utcnow()
-        db.commit()
-        db.refresh(result)
-
-        return {
-            "experiment_id": experiment.id,
-            "result_id": result.id,
-            "status": experiment.status,
-            "analysis": analysis,
-        }
-
+        db.add(result); exp.status = "completed"; exp.completed_at = datetime.utcnow(); db.commit(); db.refresh(result)
+        return {"experiment_id": exp.id, "result_id": result.id, "status": "completed", "analysis": analysis}
     finally:
         db.close()
+
+
+@router.post("/{experiment_id}/robustness-gate-3year-from-inputs")
+async def robustness_gate_3year_from_inputs_endpoint(
+    experiment_id: str,
+    is_deals: UploadFile = File(...),
+    is_market: UploadFile = File(...),
+    oos_deals: UploadFile = File(...),
+    oos_market: UploadFile = File(...),
+    deals: UploadFile = File(...),
+    market: UploadFile = File(...),
+    input_timezone: str = Query("UTC"),
+    min_trades: int = Query(MIN_TRADES_DEFAULT, ge=1, le=1000),
+):
+    return await robustness_gate_3year_from_inputs(experiment_id, is_deals, is_market, oos_deals, oos_market, deals, market, input_timezone, min_trades)
