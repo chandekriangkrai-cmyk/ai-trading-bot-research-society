@@ -1,47 +1,68 @@
-# Fx Moly — Unified EA + Backtest Research + Moltbook
+# Fx Moly — EA + Backtest Research + Moltbook (v8)
 
-This build keeps the existing Moltbook workflow and narrows research inputs to exactly what the supplied files contain:
+This version preserves the working Moltbook workflow and focuses research strictly on:
 
 - EA `.mq5`
-- MT5 Backtest export/report
+- MT5 Backtest export/report (`CSV/HTML/XML/ZIP`)
 
-No M30 bars, all ticks, or external market data are required or used.
+No OHLC bars, all-tick data, or external market data are required or used.
 
-## Research philosophy
+## Research design
 
 The engine separates:
 
-1. **OBSERVED_PATTERN** — directly supported by the supplied EA/backtest evidence.
-2. **HYPOTHESIS** — a reasoned inference when evidence is incomplete but there is a defensible basis in the EA/backtest. It includes missing evidence and alternative explanations.
-3. **INSUFFICIENT_EVIDENCE** — the available data is too thin even for a useful comparison.
+1. **OBSERVED_PATTERN** — directly supported by supplied EA/backtest evidence.
+2. **HYPOTHESIS** — grounded inference when evidence is incomplete, with missing evidence and alternatives.
+3. **INSUFFICIENT_EVIDENCE** — not enough data to make a useful comparison.
 
-A hypothesis is never silently promoted to a finding.
+It does not silently promote a hypothesis into a finding and does not invent unavailable market context.
 
-If a question requires information absent from the inputs, the engine does not fabricate it. It may create a clearly labelled hypothesis only when the supplied EA/backtest provide a rational basis for that inference. Otherwise the question is omitted from the result.
+## What is analyzed
 
-## What is intentionally studied
-
-- EA source structure: entry/exit/risk/indicator logic that is actually present in `.mq5`.
-- Realized trade behavior in the backtest.
+- EA source structure: entry, exit, risk, indicator and parameter logic actually present in `.mq5`.
+- Realized trade behavior reconstructed from the supplied backtest.
 - BUY vs SELL differences.
-- Time-period changes.
-- Entry hour and weekday patterns when sample sizes support them.
+- Backtest-period changes.
+- Entry-hour / weekday behavior when sample sizes support it.
 - Win/loss sequences and transitions.
-- Holding duration differences between wins and losses.
-- Profit concentration / tail dependence.
-- Observable alignment between EA-declared behavior and backtest fields.
-- Evidence-backed hypotheses about why an observed pattern might exist, with alternatives and missing evidence.
+- Holding-duration differences.
+- Profit concentration among winning trades.
+- EA/backtest structural alignment where the backtest exposes supporting fields.
+- Grounded hypotheses about EA-internal explanations, clearly separated from findings.
 
-## What is not claimed
+## $10,000 account configuration
 
-- No market-regime or price-action conclusion without price/market data.
-- No causal claim from correlation alone.
-- No claim that an internal EA branch caused a specific trade unless the backtest exposes that evidence.
-- No look-ahead market features.
-- No filler sections for unavailable data.
+`RESEARCH_INITIAL_CAPITAL=10000` is an internal research/account configuration.
+
+The engine reports both dollar values and normalized percentages where meaningful, for example:
+
+- `net_profit`
+- `net_profit_pct_initial_capital`
+- `max_drawdown_absolute`
+- `max_drawdown_pct_initial_capital`
+
+These are descriptive backtest measurements, not future-return predictions or trading recommendations.
+
+Public Moltbook research output may show the `$10,000` initial-capital configuration when useful. It contains no private funding-provider or challenge context.
 
 ## Moltbook
 
-Moltbook remains the communication/discussion layer. It receives both validated observations and explicitly labelled hypotheses, and can discuss, challenge, and generate research questions. Moltbook discussion is not treated as ground truth.
+Moltbook remains the communication and discussion layer.
 
-Existing preview, publish, manual verification, and verification endpoints remain available.
+It can publish evidence-backed observations and explicitly labelled hypotheses. Human discussion can challenge them and generate follow-up research questions. Discussion is **not** treated as ground truth and never silently changes stored research evidence.
+
+Existing endpoints remain:
+
+- `GET /api/moltbook/research/{experiment_id}/preview`
+- `POST /api/moltbook/research/{experiment_id}/publish-manual-verify`
+- `POST /api/moltbook/post/{post_id}/verify`
+
+Submolt names such as `ai` are resolved to the Moltbook submolt object before publishing.
+
+## API
+
+- `POST /api/research/data/upload`
+- `POST /api/research/{experiment_id}/run`
+- `GET /api/research/{experiment_id}`
+
+Upload exactly two research inputs: the EA `.mq5` and the MT5 backtest export/report.
