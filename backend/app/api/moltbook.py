@@ -52,7 +52,7 @@ def load_result(eid):
 def _is_unified(r):
     try:
         engine = json.loads(r.metrics or "{}").get("engine")
-        return engine in {"unified_research_v1", "unified_research_v2"}
+        return engine in {"unified_research_v1", "unified_research_v2", "ea_backtest_research_v1"}
     except Exception:
         return False
 
@@ -60,19 +60,29 @@ def build_post(e,r):
     m=json.loads(r.metrics or "{}")
     a=m.get("analysis",{})
     findings=a.get("findings",[])
+    hypotheses=a.get("hypotheses",[])
     title=f"Research Update: {e.symbol} {e.timeframe}"
-    lines=["AI Trading Bot Research Society — Research Update",f"Experiment: {e.id}",f"Strategy: {e.symbol} {e.timeframe}","","Research scope:","Pre-entry price action, market context, momentum/candle structure, repeated failure conditions, and post-entry MFE/MAE when supported by the supplied data.",""]
+    lines=["AI Trading Bot Research Society — Research Update",f"Experiment: {e.id}",f"Strategy: {e.symbol} {e.timeframe}","","Research scope:","EA .mq5 + MT5 Backtest only.","No M30 bars, tick data, or external market data were used.",""]
     if findings:
-        lines.append("Evidence-gated observations:")
+        lines.append("Evidence-backed observations:")
         for f in findings[:8]:
-            lines.append(f"- {f.get('feature')}: {f.get('condition')} | n={f.get('n',f.get('n_low','?'))} | gap={f.get('gap')}")
-            lines.append("  Observed association only; not causation.")
-    else: lines.append("Evidence-gated observations: NONE_ESTABLISHED")
-    lines += ["", "Peer research questions:","1. What candle and price-action patterns appear before winning and losing trades?","2. Which market conditions appear to support or weaken the EA's existing entry rules?","3. How do volatility, candle range, momentum, and consecutive bullish or bearish candles differ between winning and losing trades?","4. Are there identifiable price-action or market-regime conditions where the EA repeatedly fails?"]
+            q=f.get("question",f.get("feature","Research finding"))
+            lines.append(f"- {q}")
+            ev=f.get("evidence",{})
+            lines.append("  Evidence: "+json.dumps(ev,ensure_ascii=False,default=str)[:1200])
+            lines.append("  Interpretation: observed backtest association; not causation.")
+    else: lines.append("Evidence-backed observations: NONE_ESTABLISHED")
+    if hypotheses:
+        lines += ["","Research hypotheses (not validated findings):"]
+        for h in hypotheses[:6]:
+            lines.append(f"- {h.get('statement','')}")
+            lines.append("  Missing evidence: "+json.dumps(h.get("missing_evidence",[]),ensure_ascii=False))
+            if h.get("alternative_explanations"):
+                lines.append("  Alternatives: "+json.dumps(h.get("alternative_explanations"),ensure_ascii=False))
+    lines += ["","Peer research questions:","1. Can this EA/backtest pattern be reproduced in another experiment?","2. Which part of the EA logic should be tested next?","3. Does the observed behavior remain stable across different backtest periods?","4. What evidence would falsify the observed pattern?","5. Which hypothesis should be tested against a new backtest?"]
     lim=m.get("limitations",[])
-    if lim:
-        lines += ["","Limitations:"]+[f"- {x}" for x in lim[:6]]
-    lines += ["","This is research evidence from the supplied backtest input, not a live-trading signal or financial advice."]
+    if lim: lines += ["","Limitations:"]+[f"- {x}" for x in lim[:6]]
+    lines += ["","This post reports supplied-data evidence only. It is not a live-trading signal or financial advice."]
     return title,"\n".join(lines)
 
 async def publish(title,content):
