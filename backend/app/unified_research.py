@@ -158,14 +158,33 @@ def parse_html_tables(raw: bytes) -> list[dict[str, Any]]:
 
 
 def parse_csv(raw: bytes) -> list[dict[str, Any]]:
+    """Parse normal CSV or an MT5 Strategy Tester report exported as CSV.
+
+    MT5 reports can contain many metadata rows before the actual Deals table.
+    We deliberately locate the Deals header instead of assuming row 1 is data.
+    """
     text = raw.decode("utf-8-sig", "replace")
+    lines = text.splitlines()
+
+    # Prefer the actual MT5 Deals table when present.
+    header_idx = None
+    for i, line in enumerate(lines):
+        cols = [c.strip().strip('"') for c in line.split(",")]
+        norm_cols = {norm(c) for c in cols if c}
+        if {"time", "deal", "direction", "price", "profit"}.issubset(norm_cols):
+            header_idx = i
+            break
+
+    if header_idx is not None:
+        reader = csv.DictReader(io.StringIO("\n".join(lines[header_idx:])))
+        return [dict(r) for r in reader if any(str(v or "").strip() for v in r.values())]
+
     sample = text[:8192]
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
     except Exception:
         dialect = csv.excel
     return [dict(r) for r in csv.DictReader(io.StringIO(text), dialect=dialect)]
-
 
 def parse_xml(raw: bytes) -> list[dict[str, Any]]:
     import xml.etree.ElementTree as ET
@@ -267,44 +286,103 @@ def parse_ea(source: str) -> dict[str, Any]:
 
 
 def build_trades(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    trades = []
+    """Reconstruct completed trades from MT5 deals.
+
+    MT5 Strategy Tester CSV exports often contain IN and OUT deal rows without a
+    Position ID. In that case we pair FIFO by direction/volume: a BUY IN is
+    closed by the next SELL OUT and vice versa. This is appropriate for the
+    supplied single-symbol tester report and is explicitly recorded in lineage.
+    """
+    # Direct completed-trade tables are accepted only when the exact open/close
+    # fields are present. Do not use fuzzy matching here because MT5 deal rows
+    # contain a field named Time, which must NOT be mistaken for Open Time.
+    direct = []
     for i, r in enumerate(rows, 1):
         keys = {norm(k) for k in r.keys()}
-        has_open = any(k in keys for k in ("opentime", "entrytime"))
-        has_close = any(k in keys for k in ("closetime", "exittime"))
-        if not (has_open and has_close):
+        if not ({"opentime", "closetime"} & keys or {"entrytime", "exittime"} <= keys):
             continue
-        ot = parse_dt(pick(r, "Open Time", "Entry Time", "EntryTime", "OpenTime"))
-        ct = parse_dt(pick(r, "Close Time", "Exit Time", "ExitTime", "CloseTime"))
-        profit = num(pick(r, "Profit", "Net Profit", "P&L", "PnL"))
-        entry = num(pick(r, "Entry Price", "Open Price", "EntryPrice", "OpenPrice"))
-        exitp = num(pick(r, "Exit Price", "Close Price", "ExitPrice", "ClosePrice"))
-        side = str(pick(r, "Type", "Direction", "Side", "Order Type") or "").lower()
+        ot = parse_dt(r.get("Open Time") or r.get("Entry Time") or r.get("OpenTime") or r.get("EntryTime"))
+        ct = parse_dt(r.get("Close Time") or r.get("Exit Time") or r.get("CloseTime") or r.get("ExitTime"))
+        profit = num(r.get("Profit") or r.get("Net Profit") or r.get("P&L") or r.get("PnL"))
+        entry = num(r.get("Entry Price") or r.get("Open Price") or r.get("EntryPrice") or r.get("OpenPrice"))
+        exitp = num(r.get("Exit Price") or r.get("Close Price") or r.get("ExitPrice") or r.get("ClosePrice"))
+        side = str(r.get("Type") or r.get("Direction") or r.get("Side") or r.get("Order Type") or "").lower()
         if ot and ct and profit is not None:
-            trades.append({"trade_id": str(pick(r, "Position ID", "PositionID", "Deal", "Ticket") or i), "entry_time": ot.isoformat(), "exit_time": ct.isoformat(), "entry_price": entry, "exit_price": exitp, "profit": profit, "side": side})
-    if trades:
-        return trades
+            direct.append({"trade_id": str(r.get("Position ID") or r.get("PositionID") or r.get("Ticket") or r.get("Deal") or i),
+                           "entry_time": ot.isoformat(), "exit_time": ct.isoformat(), "entry_price": entry,
+                           "exit_price": exitp, "profit": profit, "side": side,
+                           "entry_deal": None, "exit_deal": None, "reconstruction": "direct"})
+    if direct:
+        return sorted(direct, key=lambda x: x["entry_time"])
 
-    groups = defaultdict(list)
+    # MT5 deal table: use rows with explicit IN/OUT direction.
+    events = []
     for i, r in enumerate(rows, 1):
         t = parse_dt(pick(r, "Time", "Date", "Timestamp"))
         if not t:
             continue
-        pos = str(pick(r, "Position ID", "PositionID", "Position", "Ticket") or "")
-        entry = str(pick(r, "Entry", "Deal Entry", "Entry Type") or "").lower()
-        side = str(pick(r, "Type", "Direction", "Side") or "").lower()
-        groups[pos or f"row{i}"].append((t, r, entry, side))
-    for j, (pos, items) in enumerate(groups.items(), 1):
-        items.sort(key=lambda x: x[0])
-        ins = [x for x in items if any(k in x[2] for k in ("in", "entry", "open"))]
-        outs = [x for x in items if any(k in x[2] for k in ("out", "exit", "close"))]
-        if not ins or not outs:
+        direction = str(pick(r, "Direction", "Deal Direction", "Entry") or "").lower()
+        typ = str(pick(r, "Type", "Order Type", "Side") or "").lower()
+        if direction not in ("in", "out"):
+            # Some exports call the field Entry.
+            direction = "in" if "entry" in direction or "open" in direction else "out" if "exit" in direction or "close" in direction else direction
+        if direction not in ("in", "out"):
             continue
-        a, b = ins[0], outs[-1]
-        profit = sum(num(pick(x[1], "Profit", "P&L", "PnL")) or 0 for x in items)
-        trades.append({"trade_id": pos or str(j), "entry_time": a[0].isoformat(), "exit_time": b[0].isoformat(), "entry_price": num(pick(a[1], "Price", "Entry Price")), "exit_price": num(pick(b[1], "Price", "Exit Price")), "profit": profit, "side": a[3]})
-    return trades
+        price = num(pick(r, "Price", "Entry Price", "Open Price"))
+        volume = num(pick(r, "Volume", "Lots"))
+        deal = str(pick(r, "Deal", "Ticket", "ID") or i)
+        profit = num(pick(r, "Profit", "P&L", "PnL")) or 0.0
+        commission = num(pick(r, "Commission")) or 0.0
+        swap = num(pick(r, "Swap")) or 0.0
+        # Type is buy/sell; Direction says whether the deal opened/closed it.
+        side = "buy" if "buy" in typ else "sell" if "sell" in typ else typ
+        events.append({"time": t, "direction": direction, "side": side, "price": price,
+                       "volume": volume, "deal": deal, "profit": profit,
+                       "commission": commission, "swap": swap})
+    events.sort(key=lambda x: x["time"])
 
+    # Separate FIFO books for long and short positions.
+    books = {"buy": [], "sell": []}
+    trades = []
+    for ev in events:
+        if ev["direction"] == "in":
+            if ev["side"] in books:
+                books[ev["side"]].append(ev)
+            continue
+
+        # A SELL OUT closes a BUY IN; BUY OUT closes a SELL IN.
+        open_side = "buy" if ev["side"] == "sell" else "sell" if ev["side"] == "buy" else None
+        if open_side is None or not books[open_side]:
+            continue
+
+        remaining = ev["volume"] if ev["volume"] is not None else None
+        op = books[open_side][0]
+        # Most tester exports here are one-in/one-out. If partial closes exist,
+        # consume volume FIFO and keep the remainder in the book.
+        matched_volume = remaining if remaining is not None and op["volume"] is not None else op["volume"]
+        if matched_volume is None:
+            matched_volume = 0.0
+        trade_profit = ev["profit"] + ev["commission"] + ev["swap"] + op["commission"] + op["swap"]
+        trade_id = f'{op["deal"]}->{ev["deal"]}'
+        trades.append({
+            "trade_id": trade_id,
+            "entry_time": op["time"].isoformat(),
+            "exit_time": ev["time"].isoformat(),
+            "entry_price": op["price"],
+            "exit_price": ev["price"],
+            "profit": trade_profit,
+            "side": open_side,
+            "entry_deal": op["deal"],
+            "exit_deal": ev["deal"],
+            "volume": matched_volume,
+            "reconstruction": "fifo_mt5_in_out"
+        })
+        if remaining is not None and op["volume"] is not None and op["volume"] > remaining + 1e-12:
+            op["volume"] -= remaining
+        else:
+            books[open_side].pop(0)
+
+    return trades
 
 def build_market(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
@@ -327,6 +405,87 @@ def build_ticks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             out.append({"time": t, "bid": bid, "ask": ask, "last": last, "price": price, "volume": volume})
     return sorted(out, key=lambda x: x["time"])
 
+
+
+def stream_tick_contexts(trades: list[dict[str, Any]], tick_path: Path, filename: str) -> dict[str, dict[str, Any]]:
+    """One-pass streaming tick analysis; never materializes the tick file.
+
+    Computes only pre-entry context and post-entry MFE/MAE for supplied trades.
+    This keeps a 600+ MB MT5 tick CSV from expanding into multi-GB Python objects.
+    """
+    if not trades or not tick_path.is_file():
+        return {}
+    ordered = sorted(enumerate(trades), key=lambda z: z[1]["entry_time"])
+    windows = []
+    for idx, t in ordered:
+        et = datetime.fromisoformat(t["entry_time"])
+        xt = datetime.fromisoformat(t["exit_time"])
+        windows.append({
+            "idx": idx, "pre_start": et - timedelta(minutes=TICK_PRE_WINDOW_MINUTES),
+            "entry": et, "exit": xt, "pre_prices": [], "spreads": [],
+            "pre_first": None, "pre_last": None, "pre_min": None, "pre_max": None,
+            "post_mfe": None, "post_mae": None, "pre_count": 0
+        })
+
+    # Header detection and delimiter detection without reading the whole file.
+    with tick_path.open("rb") as fb:
+        raw_sample = fb.read(16384)
+        sample = raw_sample.decode("utf-8-sig", "replace")
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except Exception:
+            dialect = csv.excel
+
+    active = []
+    next_start = 0
+    finished = {}
+    with tick_path.open("r", encoding="utf-8-sig", errors="replace", newline="") as f:
+        reader = csv.DictReader(f, dialect=dialect)
+        for row in reader:
+            t = parse_dt(pick(row, "Time", "Date", "Datetime", "Timestamp"))
+            if not t:
+                continue
+            bid = num(pick(row, "Bid")); ask = num(pick(row, "Ask")); last = num(pick(row, "Last", "Price"))
+            price = ((bid + ask) / 2) if bid is not None and ask is not None else (last if last is not None else bid if bid is not None else ask)
+            if price is None:
+                continue
+
+            while next_start < len(windows) and windows[next_start]["pre_start"] <= t:
+                active.append(windows[next_start]); next_start += 1
+
+            # Remove windows that ended before this tick.
+            active = [w for w in active if w["exit"] >= t]
+            for w in active:
+                if t < w["pre_start"]:
+                    continue
+                side_sign = -1 if ("sell" in str(trades[w["idx"]].get("side","")).lower() or "short" in str(trades[w["idx"]].get("side","")).lower()) else 1
+                if w["pre_start"] <= t < w["entry"]:
+                    w["pre_count"] += 1
+                    if w["pre_first"] is None: w["pre_first"] = price
+                    w["pre_last"] = price
+                    w["pre_min"] = price if w["pre_min"] is None else min(w["pre_min"], price)
+                    w["pre_max"] = price if w["pre_max"] is None else max(w["pre_max"], price)
+                    if bid is not None and ask is not None: w["spreads"].append(ask-bid)
+                elif w["entry"] <= t <= w["exit"] and trades[w["idx"]].get("entry_price") is not None:
+                    move = (price - trades[w["idx"]]["entry_price"]) * side_sign
+                    w["post_mfe"] = move if w["post_mfe"] is None else max(w["post_mfe"], move)
+                    w["post_mae"] = move if w["post_mae"] is None else min(w["post_mae"], move)
+
+    for w in windows:
+        if w["pre_count"]:
+            pre = {
+                "pre_window_minutes": TICK_PRE_WINDOW_MINUTES,
+                "tick_count": w["pre_count"],
+                "price_change": w["pre_last"] - w["pre_first"],
+                "price_change_abs": abs(w["pre_last"] - w["pre_first"]),
+                "range": w["pre_max"] - w["pre_min"],
+                "spread_median": statistics.median(w["spreads"]) if w["spreads"] else None,
+                "spread_max": max(w["spreads"]) if w["spreads"] else None,
+            }
+        else:
+            pre = None
+        finished[w["idx"]] = {"tick_context": pre, "mfe_tick": w["post_mfe"], "mae_tick": w["post_mae"]}
+    return finished
 
 def timeframe_seconds(tf: str, candles: list[dict[str, Any]]) -> int:
     s = str(tf or "").upper().strip()
@@ -441,6 +600,12 @@ def enrich_trade(t, candles, atrs, timeframe, ticks=None, tick_times=None):
         "range_atr": (rng/atrs[idx] if atrs[idx] else None),
         "momentum_3_atr": momentum_3,
         "volatility_regime": regime,
+        "wick_imbalance": ((upper-lower)/rng) if rng else None,
+        "candle_close_location": ((c["close"]-c["low"])/rng) if rng else None,
+        "trade_side_alignment": (
+            "aligned" if ((side_sign > 0 and direction == "bullish") or (side_sign < 0 and direction == "bearish"))
+            else "opposed" if direction != "doji" else "neutral"
+        ),
         "mfe_bar": mfe_bar,
         "mae_bar": mae_bar,
         "mfe_tick": mfe_tick,
@@ -449,50 +614,163 @@ def enrich_trade(t, candles, atrs, timeframe, ticks=None, tick_times=None):
     }
 
 
-def analyze(trades, contexts, ea, tick_available=False, bar_available=False):
-    n = len(trades); wins = [t for t in trades if (t.get("profit") or 0) > 0]; losses = [t for t in trades if (t.get("profit") or 0) < 0]
-    findings = []; insufficient = []
-    reference = {"trade_count": n, "positive_trade_count": len(wins), "negative_trade_count": len(losses)}
-    if not contexts:
-        return {"reference": reference, "findings": [], "insufficient_evidence": ["MARKET_OHLC_NOT_AVAILABLE_FROM_INPUT_DATA"], "mfe_mae": None, "tick_analysis": None}
-    pairs = [c for c in contexts if c]
-    for feature, label, fmt in [("direction", "prior closed candle direction", lambda x:x), ("streak", "consecutive prior candle streak", lambda x:("3+" if x >= 3 else str(x))), ("volatility_regime", "prior-candle volatility regime", lambda x:x)]:
-        buckets = defaultdict(list)
-        for c in pairs: buckets[fmt(c[feature])].append(c)
-        for bucket, items in buckets.items():
-            pos = sum(1 for c in items if c["trade"]["profit"] > 0); total = len(items)
-            if total < MIN_GROUP_N:
-                insufficient.append({"feature": label, "bucket": bucket, "n": total, "reason": "below_minimum_sample"}); continue
-            other = [c for c in pairs if c not in items]
-            if len(other) < MIN_GROUP_N:
-                insufficient.append({"feature": label, "bucket": bucket, "n": total, "reason": "comparison_group_too_small"}); continue
-            r1 = pos/total; r2 = sum(1 for c in other if c["trade"]["profit"] > 0)/len(other)
-            if abs(r1-r2) >= PATTERN_GAP:
-                findings.append({"status":"OBSERVED_PATTERN","feature":label,"condition":bucket,"n":total,"reference_outcome_rate":round(r1,4),"comparison_n":len(other),"comparison_outcome_rate":round(r2,4),"gap":round(r1-r2,4),"evidence":{"trade_ids":[c["trade"]["trade_id"] for c in items[:50]],"context_candle_times":[c["context_candle_time"] for c in items[:50]]},"interpretation":"Observed association in supplied backtest data; not evidence of causation."})
-    mom = [c for c in pairs if c.get("momentum_3_atr") is not None]
-    if len(mom) >= 2*MIN_GROUP_N:
-        for condition, items in (("negative_momentum", [c for c in mom if c["momentum_3_atr"] < -.5]), ("neutral_momentum", [c for c in mom if -.5 <= c["momentum_3_atr"] <= .5]), ("positive_momentum", [c for c in mom if c["momentum_3_atr"] > .5])):
-            if len(items) < MIN_GROUP_N: continue
-            other = [c for c in mom if c not in items]
-            if len(other) < MIN_GROUP_N: continue
-            r1 = sum(c["trade"]["profit"] > 0 for c in items)/len(items); r2 = sum(c["trade"]["profit"] > 0 for c in other)/len(other)
-            if abs(r1-r2) >= PATTERN_GAP:
-                findings.append({"status":"OBSERVED_PATTERN","feature":"3-candle momentum in ATR units","condition":condition,"n":len(items),"reference_outcome_rate":round(r1,4),"comparison_n":len(other),"comparison_outcome_rate":round(r2,4),"gap":round(r1-r2,4),"evidence":{"trade_ids":[c["trade"]["trade_id"] for c in items[:50]]},"interpretation":"Observed association in supplied backtest data; not evidence of causation."})
-    for feature, label in [("range_atr", "prior closed candle range / ATR14"), ("body_pct_range", "prior closed candle body / range")]:
-        vals = [c for c in pairs if c.get(feature) is not None]
-        if len(vals) < 2*MIN_GROUP_N:
-            insufficient.append({"feature": label, "n": len(vals), "reason": "insufficient_total_sample"}); continue
-        vals_sorted = sorted(vals, key=lambda c: c[feature]); med = vals_sorted[len(vals_sorted)//2][feature]
-        low = [c for c in vals if c[feature] <= med]; high = [c for c in vals if c[feature] > med]
-        if len(low) < MIN_GROUP_N or len(high) < MIN_GROUP_N: continue
-        rl = sum(c["trade"]["profit"] > 0 for c in low)/len(low); rh = sum(c["trade"]["profit"] > 0 for c in high)/len(high)
-        if abs(rl-rh) >= PATTERN_GAP:
-            findings.append({"status":"OBSERVED_PATTERN","feature":label,"condition":f"<=median({med:.4g}) vs >median","n_low":len(low),"n_high":len(high),"outcome_rate_low":round(rl,4),"outcome_rate_high":round(rh,4),"gap":round(rl-rh,4),"evidence":{"low_trade_ids":[c["trade"]["trade_id"] for c in low[:50]],"high_trade_ids":[c["trade"]["trade_id"] for c in high[:50]]},"interpretation":"Observed association in supplied backtest data; not evidence of causation."})
-    bar_mfe = [c["mfe_bar"] for c in pairs if c.get("mfe_bar") is not None]; bar_mae = [c["mae_bar"] for c in pairs if c.get("mae_bar") is not None]
-    tick_mfe = [c["mfe_tick"] for c in pairs if c.get("mfe_tick") is not None]; tick_mae = [c["mae_tick"] for c in pairs if c.get("mae_tick") is not None]
-    tick_ctx = [c for c in pairs if c.get("tick_context")]
-    return {"reference":reference,"findings":findings,"insufficient_evidence":insufficient,"mfe_mae":{"bar_sample":len(bar_mfe),"bar_mfe_median":statistics.median(bar_mfe) if bar_mfe else None,"bar_mae_median":statistics.median(bar_mae) if bar_mae else None,"tick_sample":len(tick_mfe),"tick_mfe_median":statistics.median(tick_mfe) if tick_mfe else None,"tick_mae_median":statistics.median(tick_mae) if tick_mae else None},"tick_analysis":{"available":tick_available,"pre_entry_context_sample":len(tick_ctx),"pre_entry_tick_count_median":statistics.median([c["tick_context"]["tick_count"] for c in tick_ctx]) if tick_ctx else None}}
 
+def _normal_cdf(z: float) -> float:
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _two_prop_test(a: int, n1: int, b: int, n2: int) -> dict[str, float | None]:
+    if min(n1, n2) <= 0:
+        return {"p_value": None, "z": None, "gap": None}
+    p1, p2 = a/n1, b/n2
+    pooled = (a+b)/(n1+n2)
+    se = math.sqrt(max(pooled*(1-pooled)*(1/n1+1/n2), 1e-15))
+    z = (p1-p2)/se
+    p = 2*(1-_normal_cdf(abs(z)))
+    return {"p_value": p, "z": z, "gap": p1-p2}
+
+
+def _wilson(rate: float, n: int) -> tuple[float, float]:
+    if n <= 0: return (None, None)
+    z = 1.959963984540054
+    den = 1 + z*z/n
+    center = (rate + z*z/(2*n))/den
+    half = z*math.sqrt(rate*(1-rate)/n + z*z/(4*n*n))/den
+    return (max(0.0, center-half), min(1.0, center+half))
+
+
+def analyze(trades, contexts, ea, tick_available=False, bar_available=False):
+    """Evidence-first research.
+
+    A finding is promoted only when sample size, effect size and a statistical
+    comparison all clear the gate. Multiple tests are Bonferroni-adjusted.
+    The engine never calls association causation and never treats post-entry
+    behavior as pre-entry evidence.
+    """
+    n = len(trades)
+    wins = [t for t in trades if (t.get("profit") or 0) > 0]
+    losses = [t for t in trades if (t.get("profit") or 0) < 0]
+    pairs = [c for c in contexts if c]
+    reference = {
+        "trade_count": n,
+        "positive_trade_count": len(wins),
+        "negative_trade_count": len(losses),
+        "context_trade_count": len(pairs),
+        "baseline_positive_rate": round(len(wins)/n, 6) if n else None
+    }
+    if not pairs:
+        return {"reference": reference, "findings": [], "insufficient_evidence":[
+            {"status":"INSUFFICIENT_EVIDENCE","reason":"MARKET_OHLC_NOT_AVAILABLE_FROM_INPUT_DATA"}],
+            "mfe_mae": None, "tick_analysis": {"available": tick_available}}
+
+    # Pre-registered feature families. Avoid testing dozens of arbitrary thresholds.
+    feature_specs = [
+        ("direction", "prior closed candle direction"),
+        ("volatility_regime", "prior-candle volatility regime"),
+        ("trade_side_alignment", "trade-side alignment with prior candle"),
+        ("streak_bucket", "consecutive prior candle streak"),
+        ("momentum_bucket", "3-candle momentum in ATR units"),
+        ("range_atr_bucket", "prior candle range / ATR14"),
+        ("body_pct_bucket", "prior candle body / range"),
+        ("wick_imbalance_bucket", "prior candle upper-vs-lower wick imbalance"),
+        ("close_location_bucket", "prior candle close location"),
+    ]
+    prepared = []
+    for c in pairs:
+        c["streak_bucket"] = "3+" if c.get("streak",0) >= 3 else str(c.get("streak",0))
+        m = c.get("momentum_3_atr")
+        c["momentum_bucket"] = "negative" if m is not None and m < -0.5 else "neutral" if m is not None and m <= 0.5 else "positive" if m is not None else None
+        r = c.get("range_atr")
+        c["range_atr_bucket"] = "small(<0.75)" if r is not None and r < .75 else "large(>1.5)" if r is not None and r > 1.5 else "normal" if r is not None else None
+        b = c.get("body_pct_range")
+        c["body_pct_bucket"] = "weak(<0.35)" if b is not None and b < .35 else "strong(>0.65)" if b is not None and b > .65 else "mid" if b is not None else None
+        w = c.get("wick_imbalance")
+        c["wick_imbalance_bucket"] = "upper" if w is not None and w > .25 else "lower" if w is not None and w < -.25 else "balanced" if w is not None else None
+        cl = c.get("candle_close_location")
+        c["close_location_bucket"] = "lower(<0.35)" if cl is not None and cl < .35 else "upper(>0.65)" if cl is not None and cl > .65 else "middle" if cl is not None else None
+        prepared.append(c)
+
+    candidates = []
+    for feature, label in feature_specs:
+        buckets = defaultdict(list)
+        for c in prepared:
+            v = c.get(feature)
+            if v is not None: buckets[v].append(c)
+        for bucket, items in buckets.items():
+            other = [c for c in prepared if c.get(feature) is not None and c.get(feature) != bucket]
+            if len(items) < MIN_GROUP_N or len(other) < MIN_GROUP_N:
+                continue
+            a = sum(c["trade"]["profit"] > 0 for c in items)
+            b = sum(c["trade"]["profit"] > 0 for c in other)
+            test = _two_prop_test(a, len(items), b, len(other))
+            rate = a/len(items); ref = b/len(other)
+            candidates.append({
+                "feature": label, "condition": bucket, "n": len(items), "comparison_n": len(other),
+                "outcome_rate": rate, "comparison_outcome_rate": ref, "gap": rate-ref,
+                "p_value_raw": test["p_value"], "z": test["z"],
+                "trade_ids": [c["trade"]["trade_id"] for c in items[:100]],
+                "context_candle_times": [c["context_candle_time"] for c in items[:100]]
+            })
+
+    # Bonferroni gate: effect >= configured gap AND adjusted p < .05.
+    mtests = max(1, len(candidates))
+    findings = []
+    for c in sorted(candidates, key=lambda x: (x["p_value_raw"] if x["p_value_raw"] is not None else 1, -abs(x["gap"]))):
+        p_adj = min(1.0, (c["p_value_raw"] or 1.0) * mtests)
+        ci_lo, ci_hi = _wilson(c["outcome_rate"], c["n"])
+        if abs(c["gap"]) >= PATTERN_GAP and p_adj < 0.05:
+            findings.append({
+                "status":"VALIDATED_PATTERN",
+                "feature":c["feature"], "condition":c["condition"],
+                "n":c["n"], "comparison_n":c["comparison_n"],
+                "outcome_rate":round(c["outcome_rate"],4),
+                "comparison_outcome_rate":round(c["comparison_outcome_rate"],4),
+                "gap":round(c["gap"],4),
+                "p_value_raw":round(c["p_value_raw"],8),
+                "p_value_bonferroni":round(p_adj,8),
+                "wilson_95ci": [round(ci_lo,4), round(ci_hi,4)],
+                "evidence":{"trade_ids":c["trade_ids"],"context_candle_times":c["context_candle_times"]},
+                "interpretation":"Statistically supported association under the pre-registered evidence gate; it is not proof of causation and may not generalize outside this sample."
+            })
+        elif abs(c["gap"]) >= PATTERN_GAP:
+            # Keep near-misses auditable, but do not publish them as findings.
+            pass
+
+    # Add explicit insufficiency when no candidate clears the gate.
+    insufficient = []
+    if not findings:
+        insufficient.append({
+            "status":"INSUFFICIENT_EVIDENCE",
+            "reason":"No pre-entry feature passed both effect-size and multiple-testing statistical gates.",
+            "tests_considered":mtests,
+            "minimum_group_n":MIN_GROUP_N,
+            "minimum_absolute_rate_gap":PATTERN_GAP
+        })
+
+    bar_mfe = [c["mfe_bar"] for c in pairs if c.get("mfe_bar") is not None]
+    bar_mae = [c["mae_bar"] for c in pairs if c.get("mae_bar") is not None]
+    tick_mfe = [c["mfe_tick"] for c in pairs if c.get("mfe_tick") is not None]
+    tick_mae = [c["mae_tick"] for c in pairs if c.get("mae_tick") is not None]
+    tick_ctx = [c for c in pairs if c.get("tick_context")]
+
+    return {
+        "reference":reference,
+        "findings":findings,
+        "insufficient_evidence":insufficient,
+        "mfe_mae":{
+            "bar_sample":len(bar_mfe),
+            "bar_mfe_median":statistics.median(bar_mfe) if bar_mfe else None,
+            "bar_mae_median":statistics.median(bar_mae) if bar_mae else None,
+            "tick_sample":len(tick_mfe),
+            "tick_mfe_median":statistics.median(tick_mfe) if tick_mfe else None,
+            "tick_mae_median":statistics.median(tick_mae) if tick_mae else None
+        },
+        "tick_analysis":{
+            "available":tick_available,
+            "pre_entry_context_sample":len(tick_ctx),
+            "pre_entry_tick_count_median":statistics.median([c["tick_context"]["tick_count"] for c in tick_ctx]) if tick_ctx else None
+        }
+    }
 
 def make_experiment(db: Session, experiment_id: str, symbol: str, timeframe: str, ea_name: str) -> Experiment:
     e = db.query(Experiment).filter(Experiment.id == experiment_id).first()
@@ -574,46 +852,148 @@ def get_research(experiment_id: str):
 
 @router.post("/{experiment_id}/run")
 def run_research(experiment_id: str):
-    eid = safe_id(experiment_id); folder = ROOT/eid
+    eid = safe_id(experiment_id)
+    folder = ROOT / eid
     if not (folder/"ea.mq5").is_file() or not (folder/"backtest").is_file():
         raise HTTPException(409, "Upload EA and backtest first")
+
     db = SessionLocal()
     try:
         e = db.query(Experiment).filter(Experiment.id == eid).first()
-        if not e: raise HTTPException(404, "Experiment not found")
+        if not e:
+            raise HTTPException(404, "Experiment not found")
+
         ea = (folder/"ea.mq5").read_text("utf-8", errors="replace")
         manifest = json.loads((folder/"manifest.json").read_text("utf-8")) if (folder/"manifest.json").is_file() else {}
         bt_name = manifest.get("backtest_filename", "backtest.csv")
-        deal_rows, ohlc_rows, tick_rows, inv_bt = extract_files((folder/"backtest").read_bytes(), bt_name)
-        inventory = inv_bt
-        if (folder/"bars").is_file():
-            d, b, t, inv = extract_files((folder/"bars").read_bytes(), manifest.get("bars_filename", "bars.csv")); ohlc_rows.extend(b); tick_rows.extend(t); deal_rows.extend(d); inventory["files"].extend(inv["files"])
-        if (folder/"ticks").is_file():
-            d, b, t, inv = extract_files((folder/"ticks").read_bytes(), manifest.get("ticks_filename", "ticks.csv")); ohlc_rows.extend(b); tick_rows.extend(t); deal_rows.extend(d); inventory["files"].extend(inv["files"])
 
-        trades = build_trades(deal_rows); candles = build_market(ohlc_rows); ticks = build_ticks(tick_rows); atrs = atr14(candles)
-        tick_times = [x["time"].timestamp() for x in ticks]
-        contexts = [enrich_trade(t, candles, atrs, e.timeframe, ticks, tick_times) for t in trades] if candles else []
-        analysis = analyze(trades, contexts, parse_ea(ea), tick_available=bool(ticks), bar_available=bool(candles))
+        # Backtest may be a normal Deals CSV OR a full MT5 Strategy Tester report.
+        backtest_bytes = (folder/"backtest").read_bytes()
+        deal_rows, ohlc_rows, _, inv_bt = extract_files(backtest_bytes, bt_name)
+        inventory = inv_bt
+
+        if (folder/"bars").is_file():
+            d, b, _, inv = extract_files((folder/"bars").read_bytes(), manifest.get("bars_filename", "bars.csv"))
+            ohlc_rows.extend(b); deal_rows.extend(d)
+            inventory["files"].extend(inv["files"])
+
+        trades = build_trades(deal_rows)
+        candles = build_market(ohlc_rows)
+        atrs = atr14(candles)
+
+        # First build all pre-entry OHLC context. This is the primary evidence layer.
+        contexts = [enrich_trade(t, candles, atrs, e.timeframe) for t in trades] if candles else []
+        contexts = [c for c in contexts if c]
+
+        # Tick layer is deliberately streaming. A 600+ MB tick file is never
+        # converted into a Python list and never duplicated in RAM.
+        tick_available = False
+        tick_stats = {}
+        tick_path = folder / "ticks"
+        if tick_path.is_file() and trades:
+            tick_available = tick_path.stat().st_size > 0
+            if tick_available:
+                tick_stats = stream_tick_contexts(trades, tick_path, manifest.get("ticks_filename", "ticks.csv"))
+                by_trade = {c["trade"]["trade_id"]: c for c in contexts}
+                for i, t in enumerate(trades):
+                    c = by_trade.get(t["trade_id"])
+                    s = tick_stats.get(i)
+                    if c and s:
+                        c["tick_context"] = s["tick_context"]
+                        c["mfe_tick"] = s["mfe_tick"]
+                        c["mae_tick"] = s["mae_tick"]
+
+        analysis = analyze(
+            trades, contexts, parse_ea(ea),
+            tick_available=tick_available,
+            bar_available=bool(candles)
+        )
+
         limitations = []
-        if not candles: limitations.append("MT5 backtest input did not expose usable OHLC bars; pre-entry bar price-action/regime analysis is NOT_AVAILABLE_FROM_INPUT_DATA.")
-        if not ticks: limitations.append("Tick data was not supplied or could not be parsed; tick-level pre-entry context and tick-level MFE/MAE are NOT_AVAILABLE_FROM_INPUT_DATA.")
-        if not trades: limitations.append("No completed trades could be reconstructed from the supplied backtest input.")
-        if analysis["findings"] == []: limitations.append("No pattern passed the evidence gate; this is not evidence that no relationship exists.")
+        if not candles:
+            limitations.append("NOT_AVAILABLE_FROM_INPUT_DATA: usable OHLC bars were not parsed.")
+        if not tick_available:
+            limitations.append("NOT_AVAILABLE_FROM_INPUT_DATA: tick file absent or empty.")
+        elif len(tick_stats) < len(trades):
+            limitations.append("INSUFFICIENT_EVIDENCE: some trades had no usable tick window.")
+        if not trades:
+            limitations.append("INSUFFICIENT_EVIDENCE: no completed trades could be reconstructed from MT5 deals.")
+        if not analysis["findings"]:
+            limitations.append("INSUFFICIENT_EVIDENCE: no pattern passed the evidence gate; absence of a finding is not evidence that no relationship exists.")
+
         result_obj = {
-            "engine":"unified_research_v2",
-            "status":"completed",
-            "experiment_id":eid,
-            "input_lineage":{"ea_file":"ea.mq5","source_inventory":inventory,"roles":{"trades":"MT5 deals/trades","bars":"OHLC primary market context","ticks":"high-resolution supporting context"}},
-            "ea_analysis":parse_ea(ea),
-            "data_quality":{"parsed_trade_count":len(trades),"bar_count":len(candles),"tick_count":len(ticks),"market_context_coverage":round(len(contexts)/len(trades),4) if trades else 0,"time_range":{"bars_start":candles[0]["time"].isoformat() if candles else None,"bars_end":candles[-1]["time"].isoformat() if candles else None,"ticks_start":ticks[0]["time"].isoformat() if ticks else None,"ticks_end":ticks[-1]["time"].isoformat() if ticks else None}},
-            "analysis":analysis,
-            "limitations":limitations,
-            "evidence_policy":{"min_group_n":MIN_GROUP_N,"pattern_gap":PATTERN_GAP,"primary_market_context":"OHLC bars","tick_role":"supporting high-resolution context and tick-level MFE/MAE","lookahead_policy":"Pre-entry bar context uses only candles whose full close time is <= entry. Pre-entry tick context uses only ticks strictly before entry. Post-entry MFE/MAE is explicitly separated from pre-entry evidence.","causality":"not_claimed"},
-            "generated_at":now().isoformat(),
+            "engine": "unified_research_v3_evidence_first_streaming",
+            "status": "completed",
+            "experiment_id": eid,
+            "input_lineage": {
+                "ea_file": "ea.mq5",
+                "source_inventory": inventory,
+                "roles": {
+                    "trades": "MT5 deals/trades; full Strategy Tester CSV Reports are parsed from their Deals section",
+                    "bars": "OHLC primary pre-entry market context",
+                    "ticks": "streamed high-resolution context; never loaded as a full in-memory row list"
+                },
+                "trade_reconstruction": "FIFO pairing of MT5 IN/OUT deals when Position ID is unavailable; explicitly traceable by entry_deal->exit_deal"
+            },
+            "ea_analysis": parse_ea(ea),
+            "data_quality": {
+                "raw_deal_rows": len(deal_rows),
+                "completed_trade_count": len(trades),
+                "bar_count": len(candles),
+                "tick_file_bytes": tick_path.stat().st_size if tick_path.is_file() else 0,
+                "tick_processing": "streaming_one_pass",
+                "market_context_coverage": round(len(contexts)/len(trades), 4) if trades else 0,
+                "time_range": {
+                    "bars_start": candles[0]["time"].isoformat() if candles else None,
+                    "bars_end": candles[-1]["time"].isoformat() if candles else None,
+                    "trades_start": trades[0]["entry_time"] if trades else None,
+                    "trades_end": trades[-1]["exit_time"] if trades else None
+                }
+            },
+            "analysis": analysis,
+            "limitations": limitations,
+            "evidence_policy": {
+                "minimum_group_n": MIN_GROUP_N,
+                "minimum_absolute_rate_gap": PATTERN_GAP,
+                "statistical_gate": "two-proportion test with Bonferroni correction across pre-registered feature/bucket tests; adjusted p < 0.05 plus minimum effect size",
+                "primary_market_context": "completed OHLC candles only; no partial candle at entry",
+                "tick_role": "pre-entry microstructure context and post-entry MFE/MAE; never used to create pre-entry evidence after the entry timestamp",
+                "lookahead_policy": "pre-entry features use only information available strictly before entry; post-entry MFE/MAE is stored separately",
+                "causality": "not_claimed",
+                "publication_rule": "Only VALIDATED_PATTERN findings pass the research publication layer; near-miss associations remain excluded."
+            },
+            "generated_at": now().isoformat(),
         }
-        r = ExperimentResult(id=str(uuid4()), experiment_id=e.id, summary="Unified EA + MT5 trades/deals + bars + ticks research", metrics=json.dumps(result_obj, ensure_ascii=False, default=str), evidence=json.dumps({"finding_count":len(analysis["findings"]),"data_sources":["EA","trades/deals","OHLC bars"] + (["ticks"] if ticks else [])}, ensure_ascii=False), limitations=json.dumps(limitations, ensure_ascii=False), conclusion="Research findings are evidence-gated observations from supplied data; no causal or trading recommendation claim is made.")
-        db.add(r); e.status="completed"; e.completed_at=now(); db.commit()
+
+        evidence = {
+            "finding_count": len(analysis["findings"]),
+            "validated_finding_ids": [
+                f"F-{i+1:03d}" for i, _ in enumerate(analysis["findings"])
+            ],
+            "data_sources": ["EA", "MT5 deals/trades", "OHLC bars"] + (["ticks_stream"] if tick_available else []),
+            "lineage_note": "Each finding carries trade IDs and context-candle timestamps; MT5 FIFO trades carry entry_deal and exit_deal."
+        }
+
+        r = ExperimentResult(
+            id=str(uuid4()),
+            experiment_id=e.id,
+            summary="Evidence-first EA + MT5 market-context research with streaming tick analysis",
+            metrics=json.dumps(result_obj, ensure_ascii=False, default=str),
+            evidence=json.dumps(evidence, ensure_ascii=False),
+            limitations=json.dumps(limitations, ensure_ascii=False),
+            conclusion="Only evidence-gated associations are promoted. No causal or trading recommendation claim is made."
+        )
+        db.add(r)
+        e.status = "completed"
+        e.completed_at = now()
+        db.commit()
         return result_obj
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        # Return a useful application error instead of allowing Render's proxy
+        # to surface an opaque 502.
+        raise HTTPException(500, f"Research engine error: {type(exc).__name__}: {str(exc)[:500]}")
     finally:
         db.close()
