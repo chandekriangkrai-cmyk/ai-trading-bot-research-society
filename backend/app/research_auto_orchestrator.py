@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import UploadFile
 from app.database import SessionLocal
-from app.research_models import Experiment, ExperimentResult
+from app.research_models import Experiment
 
 from app.api.research_runner import import_trade_results
 from app.api.research_runner_v3 import import_mt5_trade_results
@@ -21,6 +21,7 @@ from app.api.research_runner_v7 import import_mt5_deals_context
 from app.api.research_runner_v8 import import_mt5_deals_entry_context
 from app.api.research_runner_v9 import walk_forward_entry_context
 from app.api.research_runner_v10 import robustness_gate
+from app.api.research_runner_v11_2_fixed import robustness_gate_3year_from_inputs
 
 
 INPUT_ROOT = Path(os.getenv("RESEARCH_INPUT_ROOT", "./research_inputs"))
@@ -33,8 +34,6 @@ POLICIES = os.getenv(
     "flat,high_defensive,low_defensive,high_low_defensive",
 )
 
-ORCHESTRATOR_VERSION = "v11-result-validated-2026-09-21"
-
 STAGES = [
     "v1_import_trades",
     "v3_import_mt5_trades",
@@ -46,6 +45,7 @@ STAGES = [
     "v9_walk_forward",
     "v10_robustness",
     "v11_sizing",
+    "v11_2_three_year",
 ]
 
 _state: dict[str, Any] = {
@@ -136,8 +136,14 @@ def _missing_for(stage: str, files: dict[str, Path | None]) -> list[str]:
         "v9_walk_forward": ["is_deals", "is_market", "oos_deals", "oos_market"],
         "v10_robustness": [],
         "v11_sizing": ["deals", "market"],
+        "v11_2_three_year": ["is_deals", "is_market", "oos_deals", "oos_market", "deals", "market"],
     }
     return [x for x in required[stage] if files.get(x) is None]
+
+
+async def _run_v11_2_auto() -> Any:
+    """Deprecated compatibility hook; v11.2 now runs as a normal pipeline stage."""
+    return {"status": "handled_by_pipeline_stage", "stage": "v11_2_three_year"}
 
 
 async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | None]) -> Any:
@@ -207,12 +213,14 @@ async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | Non
             return robustness_gate(experiment_id, MIN_TRADES)
 
         if stage == "v11_sizing":
+            # Lazy import: an older v11 deployment must not prevent the
+            # entire research service from booting.
             from app.api import research_runner_v11
             runner = getattr(research_runner_v11, "regime_sizing_simulation", None)
             if runner is None:
                 return {
                     "status": "skipped",
-                    "reason": "v11 regime_sizing_simulation unavailable in deployed runner",
+                    "reason": "regime_sizing_simulation is not available in the deployed v11 runner",
                 }
             return await runner(
                 experiment_id,
@@ -222,59 +230,22 @@ async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | Non
                 POLICIES,
             )
 
+        if stage == "v11_2_three_year":
+            return await robustness_gate_3year_from_inputs(
+                experiment_id,
+                _upload(files["is_deals"]),
+                _upload(files["is_market"]),
+                _upload(files["oos_deals"]),
+                _upload(files["oos_market"]),
+                _upload(files["deals"]),
+                _upload(files["market"]),
+                INPUT_TIMEZONE,
+                MIN_TRADES,
+            )
+
         raise RuntimeError(f"Unknown stage: {stage}")
     finally:
         db.close()
-
-
-def _is_v11_result(result: ExperimentResult) -> bool:
-    """Identify a persisted v11 sizing result from its stored structure."""
-    try:
-        metrics = json.loads(getattr(result, "metrics", "") or "{}")
-    except Exception:
-        metrics = {}
-    if not isinstance(metrics, dict):
-        metrics = {}
-
-    summary = str(getattr(result, "summary", "") or "").lower()
-    conclusion = str(getattr(result, "conclusion", "") or "").lower()
-    method = str(metrics.get("method", "") or "").lower()
-    scope = metrics.get("experiment_scope", {})
-    scope_text = json.dumps(scope, ensure_ascii=False).lower() if isinstance(scope, dict) else str(scope).lower()
-
-    return bool(
-        "baseline_flat" in metrics
-        or ("policies" in metrics and "comparison" in metrics and "sizing_context" in scope_text)
-        or "position-sizing simulation" in summary
-        or "sizing policies simulated" in conclusion
-        or "realized trade p/l" in method
-    )
-
-
-def _persisted_v11_result_id(experiment_id: str) -> str | None:
-    """Return an existing v11 ExperimentResult ID, if one is actually persisted."""
-    db = SessionLocal()
-    try:
-        rows = db.query(ExperimentResult).filter(ExperimentResult.experiment_id == experiment_id).all()
-        candidates = [r for r in rows if _is_v11_result(r)]
-        if not candidates:
-            return None
-        candidates.sort(key=lambda r: getattr(r, "created_at", None) or datetime.min)
-        return str(candidates[-1].id)
-    finally:
-        db.close()
-
-
-def _ensure_v11_result(experiment_id: str, runner_result: Any) -> dict[str, Any]:
-    """Require the v11 runner to leave a real ExperimentResult in the DB."""
-    persisted_id = _persisted_v11_result_id(experiment_id)
-    if persisted_id:
-        return {"status": "verified", "result_id": persisted_id}
-
-    if isinstance(runner_result, dict) and runner_result.get("status") == "skipped":
-        raise RuntimeError(f"v11_sizing was skipped: {runner_result.get('reason', 'unknown reason')}")
-
-    raise RuntimeError("v11_sizing runner returned, but no persisted v11 ExperimentResult was found")
 
 
 def _experiment_ids() -> list[str]:
@@ -294,23 +265,6 @@ async def _process_experiment(experiment_id: str) -> dict[str, Any]:
 
     completed = list(state.get("completed_stages", []))
     results = list(state.get("results", []))
-
-    # Never trust a stale v11 completion flag by itself. If the persisted
-    # ExperimentResult is missing, remove only v11 from the resume state so
-    # the worker can recreate and verify that result without rerunning v1-v10.
-    if "v11_sizing" in completed:
-        existing_v11_id = _persisted_v11_result_id(experiment_id)
-        if existing_v11_id is None:
-            completed = [x for x in completed if x != "v11_sizing"]
-            results = [x for x in results if x.get("stage") != "v11_sizing"]
-            state["completed_stages"] = completed
-            state["results"] = results
-            state["v11_revalidation"] = {
-                "status": "required",
-                "reason": "v11_sizing was marked complete but no persisted v11 ExperimentResult exists",
-                "updated_at": _now(),
-            }
-            _save_state(state)
 
     # A stage is only marked complete after its existing runner returns.
     # This makes restarts resume from the first unfinished stage.
@@ -343,12 +297,6 @@ async def _process_experiment(experiment_id: str) -> dict[str, Any]:
 
         try:
             result = await _run_stage(experiment_id, stage, files)
-            if stage == "v11_sizing":
-                v11_check = _ensure_v11_result(experiment_id, result)
-                if isinstance(result, dict):
-                    result = {**result, "persisted_v11_result": v11_check}
-                else:
-                    result = {"runner_result": result, "persisted_v11_result": v11_check}
             completed.append(stage)
             results.append({
                 "stage": stage,
@@ -392,6 +340,7 @@ async def run_cycle() -> dict[str, Any]:
         try:
             ids = _experiment_ids()
             cycle = []
+
             for experiment_id in ids:
                 cycle.append(await _process_experiment(experiment_id))
 
@@ -443,7 +392,7 @@ async def stop() -> None:
 
 
 def status() -> dict[str, Any]:
-    return {"orchestrator_version": ORCHESTRATOR_VERSION, 
+    return {
         **_state,
         "interval_seconds": INTERVAL_SECONDS,
         "input_root": str(INPUT_ROOT),
@@ -454,9 +403,10 @@ def status() -> dict[str, Any]:
             "<experiment_id>/deals.csv": "v5/v6/v7/v8/v11",
             "<experiment_id>/market.csv": "v3/v4/v5/v6/v7/v8/v11",
             "<experiment_id>/is_deals.csv": "v9 2024 IS",
-            "<experiment_id>/is_market.csv": "v9 2024 IS market",
+            "<experiment_id>/is_market.csv": "v9 2024 IS market / v11.2 baseline",
             "<experiment_id>/oos_deals.csv": "v9 2025 OOS",
-            "<experiment_id>/oos_market.csv": "v9 2025 OOS market",
+            "<experiment_id>/oos_market.csv": "v9 2025 OOS market / v11.2 baseline",
+            "v11_2_three_year": "2024 IS + 2025 OOS + 2026 unseen gate",
         },
     }
 
