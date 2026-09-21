@@ -341,7 +341,14 @@ def analyze(ea_source, trades):
     for t in trades: by_out["WIN" if t["profit"]>0 else "LOSS" if t["profit"]<0 else "FLAT"].append(t)
     hold_compare={k:stats(v)["avg_hold_minutes"] for k,v in by_out.items() if v}
     if len(by_out.get("WIN",[]))>=MIN_GROUP_N and len(by_out.get("LOSS",[]))>=MIN_GROUP_N:
-        findings.append({"status":"OBSERVED_PATTERN","question":"Do winning and losing trades differ in holding duration?","evidence":{"WIN_avg_hold_minutes":hold_compare.get("WIN"),"LOSS_avg_hold_minutes":hold_compare.get("LOSS"),"WIN":stats(by_out["WIN"]),"LOSS":stats(by_out["LOSS"])},"interpretation":"Describes realized trade behavior; not a causal claim."})
+        win_stats=stats(by_out["WIN"]); loss_stats=stats(by_out["LOSS"])
+        # This comparison is outcome-conditioned by construction. Do not expose
+        # win_rate=1/0 as if it were an independent performance statistic.
+        findings.append({"status":"OBSERVED_PATTERN","question":"Do winning and losing trades differ in holding duration?","evidence":{
+            "winning_trades":{"n":win_stats["n"],"avg_hold_minutes":win_stats["avg_hold_minutes"],"median_hold_minutes":win_stats["median_hold_minutes"]},
+            "losing_trades":{"n":loss_stats["n"],"avg_hold_minutes":loss_stats["avg_hold_minutes"],"median_hold_minutes":loss_stats["median_hold_minutes"]},
+            "difference_avg_hold_minutes":round(win_stats["avg_hold_minutes"]-loss_stats["avg_hold_minutes"],2)
+        },"interpretation":"Outcome-conditioned descriptive comparison; it does not show that holding longer causes a winning trade."})
     # Profit concentration / tail behavior.
     profits=sorted([t["profit"] for t in trades],reverse=True)
     if profits:
@@ -408,7 +415,7 @@ def _run_job(eid):
         limitations=[]
         if not trades: limitations.append("No completed trades could be reconstructed from the supplied backtest.")
         if analysis["findings"]==[]: limitations.append("No evidence-backed pattern was established; absence of a finding is not evidence that no relationship exists.")
-        result={"engine":"ea_backtest_research_v2","status":"completed","experiment_id":eid,"input_lineage":{"sources":["ea.mq5","backtest"],"explicitly_excluded":["OHLC bars","all ticks","external market data"]},"data_quality":{"raw_backtest_rows":len(rows),"reconstructed_trades":len(trades),"initial_capital":INITIAL_CAPITAL},"analysis":analysis,"limitations":limitations,"generated_at":now().isoformat()}
+        result={"engine":"ea_backtest_research_v3","status":"completed","experiment_id":eid,"input_lineage":{"sources":["ea.mq5","backtest"],"explicitly_excluded":["OHLC bars","all ticks","external market data"]},"data_quality":{"raw_backtest_rows":len(rows),"reconstructed_trades":len(trades),"initial_capital":INITIAL_CAPITAL},"analysis":analysis,"limitations":limitations,"generated_at":now().isoformat()}
         r=ExperimentResult(id=str(uuid4()),experiment_id=e.id,summary="EA + Backtest evidence research",metrics=json.dumps(result,ensure_ascii=False,default=str),evidence=json.dumps({"finding_count":len(analysis["findings"])},ensure_ascii=False),limitations=json.dumps(limitations,ensure_ascii=False),conclusion="Evidence-backed observations from supplied EA/backtest only; no market-causal claim or trading recommendation.")
         db.add(r);e.status="completed";e.completed_at=now();db.commit()
     except Exception as ex:
