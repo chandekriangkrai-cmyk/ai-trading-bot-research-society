@@ -1,68 +1,33 @@
-# AI Trading Bot Research Society — Unified Research Engine
+# Fx Moly — Market Regime Research Engine
 
-## Input model
-The research engine accepts: 
+This version deliberately removes analysis that does not answer the research question.
 
-1. `EA.mq5` — strategy source.
-2. MT5 trades/deals — required to reconstruct completed trades.
-3. OHLC bars — primary market-context source for pre-entry research.
-4. Tick data — optional high-resolution supporting source for pre-entry tick context and tick-level MFE/MAE.
+Core research:
+EA + Backtest + M30 Bars
+→ reconstruct realized trades
+→ build pre-entry M30 market context
+→ classify market regime
+→ compare win/loss behavior by regime and time period
+→ detect market-condition shifts
+→ measure EA sensitivity to those shifts
+→ evidence gate
+→ research findings
 
-Bars and ticks may be supplied as separate files or together with trades/deals inside one ZIP. The upload endpoint classifies CSV/HTML/XML contents by schema; filenames are not the source of truth.
+Not included:
+- Tick analysis
+- synthetic/fabricated market data
+- look-ahead indicators
+- MFE/MAE used as pre-entry evidence
+- automatic causal claims
+- filler metrics/pipeline labels
 
-### Recommended first research package
-For a 2.5-year M30 study:
+Statuses:
+OBSERVED_PATTERN
+VALIDATED_PATTERN
+INSUFFICIENT_EVIDENCE
+NOT_AVAILABLE_FROM_INPUT_DATA
 
-```text
-EA.mq5
-backtest.zip
-  ├── deals.csv
-  ├── EURUSD_M30.csv
-  └── EURUSD_ticks.csv
-```
-
-The exact filenames do not matter if the columns are recognizable.
-
-### Core columns
-Trades/deals: entry/exit time, position/deal/ticket identifier, entry/exit price, side, profit.
-
-Bars: `Time, Open, High, Low, Close` (volume optional).
-
-Ticks: `Time` plus any usable `Bid, Ask, Last/Price, Volume` fields.
-
-## Research flow
-
-```text
-EA + Trades/Deals + OHLC Bars + optional Ticks
-              ↓
-        Normalize once
-              ↓
-        Market context
-              ↓
-     Evidence-gated analysis
-              ↓
-       Research Result
-              ↓
-           Moltbook
-```
-
-### Anti-look-ahead rules
-- Pre-entry bar context uses only bars whose full close time is at or before the entry timestamp.
-- Pre-entry tick context uses only ticks strictly before entry.
-- Post-entry MFE/MAE is separated from pre-entry evidence.
-- The engine reports insufficient evidence instead of inventing findings.
-
-## API
-
-- `POST /api/research/data/upload` — EA + required backtest/deals bundle, optional bars and ticks.
-- `POST /api/research/{experiment_id}/run` — run the complete research pipeline once.
-- `GET /api/research/{experiment_id}` — inspect the result.
-- Moltbook endpoints remain separate from research computation.
-
-### Upload fields
-`ea_file` required; `backtest_file` required; `bars_file` optional; `ticks_file` optional.
-
-`backtest_file` itself may be a ZIP containing deals, bars, and ticks.
-
-## Evidence policy
-No causality is claimed from observational backtest data. Findings are only published when they pass the minimum-sample/effect-size evidence gate. Otherwise the result is marked as insufficient evidence.
+API:
+POST /api/research/data/upload
+GET  /api/research/{experiment_id}
+POST /api/research/{experiment_id}/run
