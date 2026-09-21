@@ -15,6 +15,7 @@ ROOT = Path(os.getenv("RESEARCH_INPUT_ROOT", "research_inputs")).resolve()
 MAX_MB = int(os.getenv("RESEARCH_UPLOAD_MAX_MB", "512"))
 MAX_BYTES = MAX_MB * 1024 * 1024
 MIN_GROUP_N = int(os.getenv("RESEARCH_MIN_GROUP_N", "10"))
+INITIAL_CAPITAL = float(os.getenv("RESEARCH_INITIAL_CAPITAL", "10000"))
 
 
 def now(): return datetime.now(timezone.utc)
@@ -230,7 +231,28 @@ def stats(items):
     n=len(items); wins=sum(x["profit"]>0 for x in items); losses=sum(x["profit"]<0 for x in items); net=sum(x["profit"] for x in items)
     gross_win=sum(x["profit"] for x in items if x["profit"]>0); gross_loss=-sum(x["profit"] for x in items if x["profit"]<0)
     hold=[(x["exit_time"]-x["entry_time"]).total_seconds()/60 for x in items]
-    return {"n":n,"wins":wins,"losses":losses,"flats":n-wins-losses,"win_rate":round(wins/n,4) if n else None,"win_rate_95ci":binom_ci(wins,n),"net_profit":round(net,8),"avg_profit":round(net/n,8) if n else None,"median_profit":round(statistics.median([x["profit"] for x in items]),8) if items else None,"profit_factor":round(gross_win/gross_loss,4) if gross_loss else None,"avg_hold_minutes":round(statistics.mean(hold),2) if hold else None}
+    return {
+        "n":n,"wins":wins,"losses":losses,"flats":n-wins-losses,
+        "win_rate":round(wins/n,4) if n else None,"win_rate_95ci":binom_ci(wins,n),
+        "net_profit":round(net,8),
+        "net_profit_pct_initial_capital":round((net/INITIAL_CAPITAL)*100,6) if INITIAL_CAPITAL else None,
+        "avg_profit":round(net/n,8) if n else None,
+        "avg_profit_pct_initial_capital":round((net/n/INITIAL_CAPITAL)*100,6) if n and INITIAL_CAPITAL else None,
+        "median_profit":round(statistics.median([x["profit"] for x in items]),8) if items else None,
+        "profit_factor":round(gross_win/gross_loss,4) if gross_loss else None,
+        "avg_hold_minutes":round(statistics.mean(hold),2) if hold else None
+    }
+
+def equity_drawdown(items):
+    balance=INITIAL_CAPITAL; peak=balance; max_dd=0.0
+    for t in sorted(items,key=lambda x:x["entry_time"]):
+        balance += t["profit"]
+        peak=max(peak,balance)
+        max_dd=max(max_dd,peak-balance)
+    return {
+        "max_drawdown_absolute":round(max_dd,8),
+        "max_drawdown_pct_initial_capital":round((max_dd/INITIAL_CAPITAL)*100,6) if INITIAL_CAPITAL else None
+    }
 
 def sequence_stats(trades):
     ordered=sorted(trades,key=lambda x:x["entry_time"]); runs=[]; cur=None; length=0
@@ -272,6 +294,7 @@ def analyze(ea_source, trades):
             "note":"Inference from supplied EA/backtest only; not a validated causal claim."
         })
     overall=stats(trades)
+    overall.update(equity_drawdown(trades))
     # Directional comparison
     groups=defaultdict(list)
     for t in trades:
@@ -279,6 +302,7 @@ def analyze(ea_source, trades):
         elif "sell" in t["side"]: groups["SELL"].append(t)
     if all(len(groups[k])>=MIN_GROUP_N for k in ("BUY","SELL")):
         a,b=stats(groups["BUY"]),stats(groups["SELL"])
+        a.update(equity_drawdown(groups["BUY"])); b.update(equity_drawdown(groups["SELL"]))
         findings.append({"status":"OBSERVED_PATTERN","question":"Does realized performance differ by trade direction?","evidence":{"BUY":a,"SELL":b},"interpretation":"Observed association in supplied backtest; no market-cause claim."})
     else: insuff.append({"topic":"BUY_vs_SELL","reason":"Each comparison group needs at least the minimum sample.","groups":{k:len(v) for k,v in groups.items()}})
     if groups.get("BUY") and groups.get("SELL") and (len(groups["BUY"]) < MIN_GROUP_N or len(groups["SELL"]) < MIN_GROUP_N):
@@ -332,6 +356,7 @@ def analyze(ea_source, trades):
 
     return {
         "scope":["EA .mq5","Backtest"],
+        "account_context":{"initial_capital":INITIAL_CAPITAL,"currency":"USD","context_label":"research account configuration"},
         "overall":overall,
         "findings":findings,
         "hypotheses":hypotheses,
@@ -341,7 +366,7 @@ def analyze(ea_source, trades):
         "time_stats":month_stats,
         "ea_analysis":ea,
         "ea_backtest_alignment":code_behavior_alignment(ea,trades),
-        "evidence_policy":{"min_group_n":MIN_GROUP_N,"causality":"not claimed","lookahead":"No external market data is introduced; analysis is limited to fields actually present in EA/backtest."}
+        "evidence_policy":{"min_group_n":MIN_GROUP_N,"causality":"not claimed","lookahead":"No external market data is introduced; analysis is limited to fields actually present in EA/backtest.","capital_normalization":"Dollar results are additionally normalized to the configured initial capital; this does not imply future return."}
     }
 
 def make_experiment(db,eid,symbol,timeframe,ea_name):
@@ -383,7 +408,7 @@ def _run_job(eid):
         limitations=[]
         if not trades: limitations.append("No completed trades could be reconstructed from the supplied backtest.")
         if analysis["findings"]==[]: limitations.append("No evidence-backed pattern was established; absence of a finding is not evidence that no relationship exists.")
-        result={"engine":"ea_backtest_research_v1","status":"completed","experiment_id":eid,"input_lineage":{"sources":["ea.mq5","backtest"],"explicitly_excluded":["OHLC bars","all ticks","external market data"]},"data_quality":{"raw_backtest_rows":len(rows),"reconstructed_trades":len(trades)},"analysis":analysis,"limitations":limitations,"generated_at":now().isoformat()}
+        result={"engine":"ea_backtest_research_v2","status":"completed","experiment_id":eid,"input_lineage":{"sources":["ea.mq5","backtest"],"explicitly_excluded":["OHLC bars","all ticks","external market data"]},"data_quality":{"raw_backtest_rows":len(rows),"reconstructed_trades":len(trades),"initial_capital":INITIAL_CAPITAL},"analysis":analysis,"limitations":limitations,"generated_at":now().isoformat()}
         r=ExperimentResult(id=str(uuid4()),experiment_id=e.id,summary="EA + Backtest evidence research",metrics=json.dumps(result,ensure_ascii=False,default=str),evidence=json.dumps({"finding_count":len(analysis["findings"])},ensure_ascii=False),limitations=json.dumps(limitations,ensure_ascii=False),conclusion="Evidence-backed observations from supplied EA/backtest only; no market-causal claim or trading recommendation.")
         db.add(r);e.status="completed";e.completed_at=now();db.commit()
     except Exception as ex:
