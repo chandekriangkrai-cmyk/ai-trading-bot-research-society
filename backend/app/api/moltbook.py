@@ -56,42 +56,95 @@ def _is_unified(r):
     except Exception:
         return False
 
+def _fmt_money_pct(ev):
+    """Compact research evidence for a public Moltbook post.
+    Full JSON remains in the stored research result; the public post only
+    carries decision-relevant fields so it stays readable and auditable.
+    """
+    if not isinstance(ev, dict):
+        return str(ev)[:800]
+    if "BUY" in ev and "SELL" in ev:
+        out={}
+        for side in ("BUY","SELL"):
+            x=ev.get(side,{})
+            out[side]={k:x.get(k) for k in ("n","wins","losses","win_rate","win_rate_95ci","net_profit","net_profit_pct_initial_capital","profit_factor","avg_hold_minutes","max_drawdown_absolute","max_drawdown_pct_initial_capital") if k in x}
+        return json.dumps(out,ensure_ascii=False)
+    if "groups" in ev and isinstance(ev["groups"],dict):
+        groups={}
+        for k,x in ev["groups"].items():
+            groups[k]={kk:x.get(kk) for kk in ("n","wins","losses","win_rate","win_rate_95ci","net_profit","net_profit_pct_initial_capital","profit_factor","avg_hold_minutes") if kk in x}
+        return json.dumps({"groups":groups,"highest":ev.get("highest"),"lowest":ev.get("lowest")},ensure_ascii=False)
+    if "monthly" in ev and isinstance(ev["monthly"],dict):
+        months={}
+        for k,x in ev["monthly"].items():
+            months[k]={kk:x.get(kk) for kk in ("n","wins","losses","win_rate","win_rate_95ci","net_profit","net_profit_pct_initial_capital","profit_factor","avg_hold_minutes") if kk in x}
+        return json.dumps({"monthly":months,"highest_win_rate_period":ev.get("highest_win_rate_period"),"lowest_win_rate_period":ev.get("lowest_win_rate_period")},ensure_ascii=False)
+    if "winning_trades" in ev and "losing_trades" in ev:
+        return json.dumps(ev,ensure_ascii=False)
+    return json.dumps(ev,ensure_ascii=False,default=str)[:1200]
+
+
 def build_post(e,r):
     m=json.loads(r.metrics or "{}")
     a=m.get("analysis",{})
     findings=a.get("findings",[])
     hypotheses=a.get("hypotheses",[])
     title=f"Research Update: {e.symbol} {e.timeframe}"
-    account=m.get("analysis",{}).get("account_context",{})
-    lines=["AI Trading Bot Research Society — Research Update",f"Experiment: {e.id}",f"Strategy: {e.symbol} {e.timeframe}","","Research scope:","EA .mq5 + MT5 Backtest only.","No OHLC bars, tick data, or external market data were used."]
+    account=a.get("account_context",{})
+    lines=[
+        "AI Trading Bot Research Society — Research Update",
+        f"Experiment: {e.id}",
+        f"Strategy: {e.symbol} {e.timeframe}",
+        "",
+        "Research scope:",
+        "EA .mq5 + MT5 Backtest only.",
+        "No OHLC bars, tick data, or external market data were used.",
+    ]
     if account.get("initial_capital") is not None:
         lines.append(f"Initial capital configuration: ${float(account['initial_capital']):,.2f}")
+    overall=a.get("overall",{})
+    if overall.get("n"):
+        lines += [
+            f"Completed trades analyzed: {overall['n']}",
+            f"Net profit: ${overall.get('net_profit',0):,.2f} ({overall.get('net_profit_pct_initial_capital',0):+.2f}% of initial capital)",
+        ]
+        if overall.get("max_drawdown_absolute") is not None:
+            lines.append(f"Observed max drawdown: ${overall['max_drawdown_absolute']:,.2f} ({overall.get('max_drawdown_pct_initial_capital',0):.2f}% of initial capital)")
     lines.append("")
     if findings:
         lines.append("Evidence-backed observations:")
         for f in findings[:8]:
             q=f.get("question",f.get("feature","Research finding"))
             lines.append(f"- {q}")
-            ev=f.get("evidence",{})
-            lines.append("  Evidence: "+json.dumps(ev,ensure_ascii=False,default=str)[:1200])
-            lines.append("  Interpretation: observed backtest association; not causation.")
-    else: lines.append("Evidence-backed observations: NONE_ESTABLISHED")
+            lines.append("  Evidence: "+_fmt_money_pct(f.get("evidence",{})))
+            lines.append("  Interpretation: "+str(f.get("interpretation") or "Observed association in supplied backtest; not causation."))
+    else:
+        lines.append("Evidence-backed observations: NONE_ESTABLISHED")
     if hypotheses:
         lines += ["","Research hypotheses (not validated findings):"]
         for h in hypotheses[:6]:
-            lines.append(f"- {h.get('statement','')}")
-            lines.append("  Missing evidence: "+json.dumps(h.get("missing_evidence",[]),ensure_ascii=False))
+            if not h.get("statement"): continue
+            lines.append(f"- {h['statement']}")
+            if h.get("missing_evidence"):
+                lines.append("  Missing evidence: "+json.dumps(h["missing_evidence"],ensure_ascii=False))
             if h.get("alternative_explanations"):
-                lines.append("  Alternatives: "+json.dumps(h.get("alternative_explanations"),ensure_ascii=False))
+                lines.append("  Alternatives: "+json.dumps(h["alternative_explanations"],ensure_ascii=False))
     critique=[]
-    if m.get("limitations"): critique.extend(m.get("limitations",[])[:3])
-    if a.get("insufficient_evidence"): critique.extend([x.get("reason","") for x in a.get("insufficient_evidence",[])[:3] if x.get("reason")])
+    if m.get("limitations"): critique.extend(m.get("limitations",[])[:4])
+    if a.get("insufficient_evidence"): critique.extend([x.get("reason","") for x in a.get("insufficient_evidence",[])[:4] if x.get("reason")])
     if critique:
         lines += ["","Research limitations / critique:"]+[f"- {x}" for x in critique]
-    lines += ["","Peer research questions:","1. Can this EA/backtest pattern be reproduced in another experiment?","2. Which part of the EA logic should be tested next?","3. Does the observed behavior remain stable across different backtest periods?","4. What evidence would falsify the observed pattern?","5. Which hypothesis should be tested against a new backtest?"]
-    lim=m.get("limitations",[])
-    if lim: lines += ["","Limitations:"]+[f"- {x}" for x in lim[:6]]
-    lines += ["","This post reports supplied-data evidence only. It is not a live-trading signal or financial advice."]
+    lines += [
+        "",
+        "Peer research questions:",
+        "1. Can this EA/backtest pattern be reproduced in another experiment?",
+        "2. Which part of the EA logic should be tested next?",
+        "3. Does the observed behavior remain stable across different backtest periods?",
+        "4. What evidence would falsify the observed pattern?",
+        "5. Which hypothesis should be tested against a new backtest?",
+        "",
+        "This post reports supplied-data evidence only. It is not a live-trading signal or financial advice."
+    ]
     return title,"\n".join(lines)
 
 async def publish(title,content):
