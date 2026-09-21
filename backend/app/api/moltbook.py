@@ -408,36 +408,127 @@ def _number_from_words(words: list[str], i: int):
 
     return float(first), first_end
 
-def _solve_challenge(challenge_text: str) -> str:
-    words = _challenge_text_words(challenge_text)
-    nums = []
+def _extract_number_tokens(text: str) -> list[float]:
+    """Extract numeric values from heavily obfuscated Moltbook challenge text.
+
+    Handles normal digits, number words, repeated letters, mixed case, and
+    punctuation inserted inside words (for example ``tW/eN tY fIvE``).
+    """
+    raw = re.findall(r"[A-Za-z]+|\d+(?:\.\d+)?", str(text or ""))
+    values: list[float] = []
     i = 0
-    while i < len(words):
-        value, next_i = _number_from_words(words, i)
+    while i < len(raw):
+        value, next_i = _number_from_words(raw, i)
         if value is not None:
-            nums.append(value)
+            values.append(float(value))
             i = next_i
         else:
             i += 1
+    return values
 
-    if len(nums) < 2:
-        raise ValueError(f"Could not parse two operands from challenge: {challenge_text!r}")
 
-    a, b = nums[0], nums[1]
-    normalized = " ".join(words)
+def _arithmetic_operation(text: str) -> str | None:
+    """Return the operation expressed by the challenge, if any."""
+    original_normalized = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())
+    original_normalized = re.sub(r"\s+", " ", original_normalized).strip()
+    normalized = _collapse_repeated_letters(original_normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    if re.search(r"\b(multiplied by|times|multiply by|multiplied)\b", normalized):
-        result = a * b
-    elif re.search(r"\b(divided by|divide by|quotient)\b", normalized):
-        if b == 0:
-            raise ValueError("Division by zero challenge")
-        result = a / b
-    elif re.search(r"\b(subtracted by|minus|take away|slows by|decreased by)\b", normalized):
-        result = a - b
-    elif re.search(r"\b(added to|adds?|plus|add|increased by)\b", normalized):
-        result = a + b
-    else:
-        raise ValueError(f"Unsupported arithmetic operation in challenge: {challenge_text!r}")
+    # Long phrases first so e.g. 'divided by' is not mistaken for something else.
+    patterns: list[tuple[str, str]] = [
+        (r"\b(divided by|divide by|division|quotient|over)\b", "divide"),
+        (r"\b(multiplied by|multiply by|multiplied|multiply|times)\b", "multiply"),
+        (r"\b(subtracted by|subtract|minus|take away|decreased by|decreases by|slows by|loses|loss of)\b", "subtract"),
+        (r"\b(added to|add to|adds|add|plus|increased by|increases by|gains|gain)\b", "add"),
+    ]
+    for pattern, op in patterns:
+        if re.search(pattern, original_normalized) or re.search(pattern, normalized):
+            return op
+
+    # Repeated-letter collapsing can turn words such as ``adds`` into ``ads``
+    # (the obfuscator may write ``aDdDs``). Keep a few safe aliases for that
+    # transformation rather than treating the altered word as unknown.
+    if re.search(r"\b(ads|ad)\b", normalized):
+        return "add"
+
+    # Mathematical symbols are only treated as operators when they occur
+    # between actual numeric expressions. Moltbook also inserts '/' and '-'
+    # as random obfuscation punctuation inside words, so a bare slash must
+    # never automatically mean division.
+    compact = str(text or "")
+    if re.search(r"\d\s*[×*]\s*\d", compact):
+        return "multiply"
+    if re.search(r"\d\s*[÷/]\s*\d", compact):
+        return "divide"
+    if re.search(r"\d\s*\+\s*\d", compact):
+        return "add"
+    if re.search(r"\d\s*-\s*\d", compact):
+        return "subtract"
+    return None
+
+
+def _solve_challenge(challenge_text: str) -> str:
+    """Solve Moltbook's lightweight arithmetic verification challenge.
+
+    The challenge generator may obfuscate words with random case, repeated
+    letters, and punctuation. Do not hard-code operand values. We extract the
+    values actually present in the challenge and apply the stated operation.
+
+    Supported forms include:
+      25 + 7
+      twenty five adds seven
+      100 minus 25
+      8 multiplied by 6
+      100 divided by 4
+      "it gains five ... how fast is it now?" -> 5.00 when one operand is
+      explicitly supplied and the wording describes a gain from an implicit
+      zero/baseline.
+    """
+    text = str(challenge_text or "").strip()
+    if not text:
+        raise ValueError("Empty verification challenge")
+
+    nums = _extract_number_tokens(text)
+    op = _arithmetic_operation(text)
+
+    if not nums:
+        raise ValueError(f"No numeric operand found in challenge: {text!r}")
+
+    # Some Moltbook templates provide a single explicit amount with a verb such
+    # as 'gains five' and ask for the resulting amount. There is no second
+    # numeric operand in that template, so treating it as the supplied delta is
+    # preferable to inventing a hidden starting number.
+    if len(nums) == 1:
+        if op in {"add", "subtract", "multiply", "divide"}:
+            result = nums[0]
+            if op == "divide" and nums[0] == 0:
+                raise ValueError("Division by zero challenge")
+            return f"{result:.2f}"
+        # A bare single number is also a valid answer only when the challenge
+        # explicitly asks for that amount rather than an operation.
+        if re.search(r"\b(how fast|what is|what s|how much|answer)\b", _collapse_repeated_letters(text.lower())):
+            return f"{nums[0]:.2f}"
+        raise ValueError(f"Only one numeric operand found and no solvable template: {text!r}")
+
+    # Normal two-or-more operand arithmetic. The first two operands are the
+    # operands for Moltbook's current verification templates. If a challenge
+    # contains a chain such as 10 + 5 + 2, evaluate left-to-right for the same
+    # operation rather than silently ignoring later values.
+    if op is None:
+        raise ValueError(f"Could not determine arithmetic operation: {text!r}")
+
+    result = nums[0]
+    for value in nums[1:]:
+        if op == "add":
+            result += value
+        elif op == "subtract":
+            result -= value
+        elif op == "multiply":
+            result *= value
+        elif op == "divide":
+            if value == 0:
+                raise ValueError("Division by zero challenge")
+            result /= value
 
     return f"{result:.2f}"
 
