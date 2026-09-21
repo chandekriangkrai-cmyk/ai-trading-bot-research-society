@@ -1,273 +1,609 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
+import math
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+import pandas as pd
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.research_models import Experiment, ExperimentResult
 
+
 router = APIRouter(
     prefix="/research/experiments",
-    tags=["Research Engine v11 3-Year Robustness"],
+    tags=["Research Engine v11 Sizing"],
 )
 
 
-def _latest_result(db: Session, experiment_id: str) -> ExperimentResult:
-    rows = (
-        db.query(ExperimentResult)
-        .filter(ExperimentResult.experiment_id == experiment_id)
-        .order_by(ExperimentResult.created_at.desc())
-        .all()
-    )
-    if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No ExperimentResult found for experiment {experiment_id}",
-        )
-    return rows[0]
+DEFAULT_POLICIES = (
+    "flat",
+    "high_defensive",
+    "low_defensive",
+    "high_low_defensive",
+)
 
 
-def _load_metrics(result: ExperimentResult) -> dict[str, Any]:
+def _read_upload_bytes(upload: UploadFile) -> bytes:
+    # The endpoint is async, but the actual uploaded bytes are small research CSVs.
+    # FastAPI's UploadFile exposes a synchronous-compatible file object here.
+    return upload.file.read()
+
+
+def _load_csv_bytes(raw: bytes, filename: str) -> pd.DataFrame:
+    if not raw:
+        raise HTTPException(status_code=400, detail=f"Empty CSV upload: {filename}")
+
     try:
-        data = json.loads(result.metrics or "{}")
+        df = pd.read_csv(io.BytesIO(raw))
     except Exception as exc:
         raise HTTPException(
-            status_code=500,
-            detail=f"Stored metrics is not valid JSON for result {result.id}: {exc}",
+            status_code=400,
+            detail=f"Unable to parse CSV '{filename}': {exc}",
+        ) from exc
+
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
+
+
+def _require_columns(
+    df: pd.DataFrame,
+    required: set[str],
+    filename: str,
+) -> None:
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"CSV '{filename}' missing required columns: "
+                + ", ".join(missing)
+            ),
         )
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=500, detail=f"Metrics for result {result.id} is not an object")
-    return data
 
 
-def _overall(data: dict[str, Any]) -> dict[str, Any]:
-    if isinstance(data.get("overall"), dict):
-        return data["overall"]
-    if isinstance(data.get("is_2024"), dict):
-        return data["is_2024"].get("overall", {})
-    return {}
+def _parse_time_series(
+    values: pd.Series,
+    input_timezone: str,
+) -> pd.Series:
+    parsed = pd.to_datetime(values, errors="coerce")
+    if parsed.isna().all():
+        raise HTTPException(
+            status_code=400,
+            detail="No valid timestamps could be parsed from the supplied CSV.",
+        )
+
+    # Treat naive timestamps as the declared input timezone. Convert to UTC
+    # so deals and market data can be aligned consistently.
+    if getattr(parsed.dt, "tz", None) is None:
+        try:
+            parsed = parsed.dt.tz_localize(
+                input_timezone,
+                ambiguous="NaT",
+                nonexistent="NaT",
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid input_timezone '{input_timezone}': {exc}",
+            ) from exc
+
+    return parsed.dt.tz_convert("UTC")
 
 
-def _split_two_year_metrics(data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Extract 2024/2025 from a combined generalization result.
-
-    Supports v9/v10-style shapes such as is_2024/oos_2025,
-    is/oos, and sections whose group values contain is/oos.
-    """
-    if isinstance(data.get("is_2024"), dict) and isinstance(data.get("oos_2025"), dict):
-        return data["is_2024"], data["oos_2025"]
-    if isinstance(data.get("2024"), dict) and isinstance(data.get("2025"), dict):
-        return data["2024"], data["2025"]
-    if isinstance(data.get("is"), dict) and isinstance(data.get("oos"), dict):
-        return data["is"], data["oos"]
-
-    # Some stored results put the split directly inside each section.
-    is_data: dict[str, Any] = {}
-    oos_data: dict[str, Any] = {}
-    for section in [
-        "overall", "by_entry_volatility", "by_entry_trend", "by_entry_session",
-        "entry_volatility_x_trend", "entry_volatility_x_session",
-        "entry_volatility_x_trend_x_session",
-    ]:
-        value = data.get(section)
-        if not isinstance(value, dict):
-            continue
-        if "is" in value and isinstance(value["is"], dict):
-            is_data[section] = value["is"]
-        if "oos" in value and isinstance(value["oos"], dict):
-            oos_data[section] = value["oos"]
-    if is_data or oos_data:
-        return is_data, oos_data
-
-    raise HTTPException(
-        status_code=422,
-        detail="The 2024/2025 experiment result does not contain a recognized IS/OOS split. "
-               "Expected is_2024/oos_2025, 2024/2025, is/oos, or section-level is/oos.",
+def _build_market_regimes(
+    market: pd.DataFrame,
+    input_timezone: str,
+) -> pd.DataFrame:
+    _require_columns(
+        market,
+        {"time", "high", "low", "close"},
+        "market",
     )
 
-def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
-    value = data.get(name)
-    return value if isinstance(value, dict) else {}
+    m = market.copy()
+    m["time"] = _parse_time_series(m["time"], input_timezone)
+    for col in ("high", "low", "close"):
+        m[col] = pd.to_numeric(m[col], errors="coerce")
+
+    m = (
+        m.dropna(subset=["time", "high", "low", "close"])
+        .sort_values("time")
+        .drop_duplicates("time", keep="last")
+        .reset_index(drop=True)
+    )
+
+    if len(m) < 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Market CSV needs at least 20 valid OHLC rows for v11 sizing.",
+        )
+
+    previous_close = m["close"].shift(1)
+    true_range = pd.concat(
+        [
+            m["high"] - m["low"],
+            (m["high"] - previous_close).abs(),
+            (m["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    m["atr_14"] = true_range.rolling(14, min_periods=14).mean()
+    m["atr_pct"] = m["atr_14"] / m["close"].abs()
+
+    # Fixed, deterministic percentile cutoffs from the supplied market sample.
+    # This is a classification step, not parameter optimization.
+    valid_vol = m["atr_pct"].dropna()
+    if valid_vol.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to calculate ATR volatility from market CSV.",
+        )
+
+    low_cut = float(valid_vol.quantile(1 / 3))
+    high_cut = float(valid_vol.quantile(2 / 3))
+
+    def regime(x: Any) -> str:
+        if pd.isna(x):
+            return "unknown"
+        x = float(x)
+        if x <= low_cut:
+            return "low"
+        if x >= high_cut:
+            return "high"
+        return "normal"
+
+    m["volatility_regime"] = m["atr_pct"].map(regime)
+    return m[["time", "atr_14", "atr_pct", "volatility_regime"]].copy()
 
 
-def _group_rows(data_by_year: dict[str, dict[str, Any]], section: str, min_trades: int) -> list[dict[str, Any]]:
-    maps = {year: _section(data, section) for year, data in data_by_year.items()}
-    keys = sorted(set().union(*(set(m.keys()) for m in maps.values())))
-    rows: list[dict[str, Any]] = []
-    for key in keys:
-        years: dict[str, dict[str, Any]] = {}
-        for year, mapping in maps.items():
-            value = mapping.get(key)
-            years[year] = value if isinstance(value, dict) else {}
+def _pair_realized_trades(
+    deals: pd.DataFrame,
+    input_timezone: str,
+) -> pd.DataFrame:
+    _require_columns(
+        deals,
+        {
+            "time",
+            "deal",
+            "symbol",
+            "type",
+            "direction",
+            "volume",
+            "price",
+            "commission",
+            "swap",
+            "profit",
+        },
+        "deals",
+    )
 
-        def n(y: str) -> int:
-            return int(years[y].get("trade_count", 0) or 0)
+    d = deals.copy()
+    d["time"] = _parse_time_series(d["time"], input_timezone)
 
-        def net(y: str) -> float:
-            return float(years[y].get("net_profit", 0) or 0)
+    for col in ("volume", "price", "commission", "swap", "profit"):
+        d[col] = pd.to_numeric(d[col], errors="coerce")
 
-        def pf(y: str):
-            return years[y].get("profit_factor")
+    d["direction"] = d["direction"].astype(str).str.strip().str.lower()
+    d["symbol"] = d["symbol"].astype(str).str.strip()
 
-        sample_ok = all(n(y) >= min_trades for y in data_by_year)
-        nets = [net(y) for y in data_by_year]
-        same_positive = all(x > 0 for x in nets)
-        same_negative = all(x < 0 for x in nets)
-        pfs = [pf(y) for y in data_by_year]
-        pf_both = all(x is not None and float(x) > 1 for x in pfs)
+    d = (
+        d.dropna(subset=["time", "symbol", "direction", "volume"])
+        .sort_values(["time", "deal"], kind="stable")
+        .reset_index(drop=True)
+    )
 
-        rows.append({
-            "group": key,
-            "trade_count": {y: n(y) for y in data_by_year},
-            "net_profit": {y: net(y) for y in data_by_year},
-            "profit_factor": {y: pf(y) for y in data_by_year},
-            "sample_sufficient_all_years": sample_ok,
-            "net_profit_same_positive_all_years": same_positive,
-            "net_profit_same_negative_all_years": same_negative,
-            "pf_gt_1_all_years": pf_both,
-            "robust_positive_3year": sample_ok and same_positive and pf_both,
-            "robust_negative_3year": sample_ok and same_negative,
-        })
+    # MT5 netting-style reconstruction: an "in" deal opens exposure and an
+    # "out" deal closes the oldest compatible open exposure (FIFO).
+    # This keeps the reconstruction accounting-aware and does not invent trades.
+    opens: dict[tuple[str, str], deque[dict[str, Any]]] = defaultdict(deque)
+    trades: list[dict[str, Any]] = []
+
+    for _, row in d.iterrows():
+        direction = str(row["direction"])
+        symbol = str(row["symbol"])
+        volume = float(row["volume"] or 0.0)
+
+        if volume <= 0:
+            continue
+
+        # Some MT5 exports use buy/sell for the transaction side and "in/out"
+        # for direction. The supplied research CSV uses direction=in/out.
+        if direction == "in":
+            key = (symbol, str(row["type"]).strip().lower())
+            opens[key].append(
+                {
+                    "entry_time": row["time"],
+                    "entry_price": float(row["price"]),
+                    "entry_volume": volume,
+                    "entry_commission": float(row["commission"] or 0.0),
+                    "entry_swap": float(row["swap"] or 0.0),
+                    "symbol": symbol,
+                    "type": str(row["type"]).strip().lower(),
+                    "entry_deal": str(row["deal"]),
+                }
+            )
+            continue
+
+        if direction != "out":
+            continue
+
+        # For an exit, the compatible open side is the opposite trade type.
+        exit_type = str(row["type"]).strip().lower()
+        opposite = "sell" if exit_type == "buy" else "buy"
+        key = (symbol, opposite)
+
+        remaining = volume
+        exit_commission = float(row["commission"] or 0.0)
+        exit_swap = float(row["swap"] or 0.0)
+        exit_profit = float(row["profit"] or 0.0)
+
+        while remaining > 1e-12 and opens[key]:
+            opened = opens[key][0]
+            matched = min(remaining, float(opened["entry_volume"]))
+            fraction = matched / float(row["volume"])
+
+            trade_exit_profit = exit_profit * fraction
+            trade_exit_commission = exit_commission * fraction
+            trade_exit_swap = exit_swap * fraction
+
+            pnl = (
+                trade_exit_profit
+                + float(opened["entry_commission"]) * (matched / opened["entry_volume"])
+                + float(opened["entry_swap"]) * (matched / opened["entry_volume"])
+                + trade_exit_commission
+                + trade_exit_swap
+            )
+
+            trades.append(
+                {
+                    "entry_time": opened["entry_time"],
+                    "exit_time": row["time"],
+                    "symbol": symbol,
+                    "type": opened["type"],
+                    "volume": matched,
+                    "entry_price": opened["entry_price"],
+                    "exit_price": float(row["price"]),
+                    "profit": pnl,
+                    "entry_deal": opened["entry_deal"],
+                    "exit_deal": str(row["deal"]),
+                }
+            )
+
+            opened["entry_volume"] -= matched
+            remaining -= matched
+            if opened["entry_volume"] <= 1e-12:
+                opens[key].popleft()
+
+    result = pd.DataFrame(trades)
+    if result.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="No completed MT5 trades could be reconstructed from deals.csv.",
+        )
+
+    return result.sort_values("entry_time").reset_index(drop=True)
+
+
+def _attach_entry_regimes(
+    trades: pd.DataFrame,
+    market_regimes: pd.DataFrame,
+) -> pd.DataFrame:
+    t = trades.copy().sort_values("entry_time")
+    m = market_regimes.copy().sort_values("time")
+
+    merged = pd.merge_asof(
+        t,
+        m,
+        left_on="entry_time",
+        right_on="time",
+        direction="backward",
+    )
+
+    merged["volatility_regime"] = merged["volatility_regime"].fillna("unknown")
+    return merged
+
+
+def _multiplier(policy: str, regime: str) -> float:
+    # Pre-registered, fixed policies. The engine never chooses a winner.
+    if policy == "flat":
+        return 1.0
+    if policy == "high_defensive":
+        return 0.5 if regime == "high" else 1.0
+    if policy == "low_defensive":
+        return 0.5 if regime == "low" else 1.0
+    if policy == "high_low_defensive":
+        return 0.5 if regime in {"high", "low"} else 1.0
+
+    raise ValueError(f"Unknown sizing policy: {policy}")
+
+
+def _summarize(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {
+            "trade_count": 0,
+            "net_profit": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "profit_factor": None,
+            "win_rate": None,
+            "average_trade": None,
+            "max_drawdown": 0.0,
+        }
+
+    series = pd.Series(values, dtype=float)
+    gross_profit = float(series[series > 0].sum())
+    gross_loss_abs = float(-series[series < 0].sum())
+    profit_factor = (
+        gross_profit / gross_loss_abs if gross_loss_abs > 0 else None
+    )
+
+    equity = series.cumsum()
+    running_max = equity.cummax()
+    drawdown = equity - running_max
+
+    return {
+        "trade_count": int(len(series)),
+        "net_profit": float(series.sum()),
+        "gross_profit": gross_profit,
+        "gross_loss": float(-gross_loss_abs),
+        "profit_factor": profit_factor,
+        "win_rate": float((series > 0).mean()),
+        "average_trade": float(series.mean()),
+        "max_drawdown": float(drawdown.min()),
+    }
+
+
+def _simulate_policy(
+    trades: pd.DataFrame,
+    policy: str,
+) -> dict[str, Any]:
+    adjusted: list[float] = []
+
+    for _, row in trades.iterrows():
+        regime = str(row.get("volatility_regime") or "unknown")
+        factor = _multiplier(policy, regime)
+        adjusted.append(float(row["profit"]) * factor)
+
+    overall = _summarize(adjusted)
+
+    by_regime: dict[str, Any] = {}
+    for regime in ("low", "normal", "high", "unknown"):
+        values = [
+            float(row["profit"]) * _multiplier(policy, regime)
+            for _, row in trades.iterrows()
+            if str(row.get("volatility_regime") or "unknown") == regime
+        ]
+        if values:
+            by_regime[regime] = _summarize(values)
+
+    return {
+        "policy": policy,
+        "overall": overall,
+        "by_entry_volatility": by_regime,
+    }
+
+
+def _parse_policies(raw: str) -> list[str]:
+    selected = []
+    for item in (raw or "").split(","):
+        name = item.strip()
+        if not name:
+            continue
+        if name not in DEFAULT_POLICIES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported v11 policy '{name}'. "
+                    f"Allowed policies: {', '.join(DEFAULT_POLICIES)}"
+                ),
+            )
+        if name not in selected:
+            selected.append(name)
+
+    if not selected:
+        selected = list(DEFAULT_POLICIES)
+
+    return selected
+
+
+def _policy_comparison(
+    policies: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows = []
+    for name, result in policies.items():
+        overall = result["overall"]
+        rows.append(
+            {
+                "policy": name,
+                "trade_count": overall["trade_count"],
+                "net_profit": overall["net_profit"],
+                "profit_factor": overall["profit_factor"],
+                "win_rate": overall["win_rate"],
+                "average_trade": overall["average_trade"],
+                "max_drawdown": overall["max_drawdown"],
+            }
+        )
     return rows
 
 
-@router.post("/{experiment_id}/robustness-gate-3year")
-def robustness_gate_3year(
+async def regime_sizing_simulation(
     experiment_id: str,
-    baseline_2024_2025_experiment_id: str = Query(..., description="Experiment containing the combined 2024 IS and 2025 OOS result"),
-    min_trades: int = Query(20, ge=1, le=1000),
+    deals_file: UploadFile = File(...),
+    market_file: UploadFile = File(...),
+    input_timezone: str = Query("UTC"),
+    policies: str = Query(
+        "flat,high_defensive,low_defensive,high_low_defensive",
+        description=(
+            "Comma-separated pre-registered policy names; "
+            "no automatic winner selection."
+        ),
+    ),
 ):
+    """
+    v11 sizing simulation over realized MT5 trades.
 
+    Important:
+    - It does not rerun the MQL5 EA.
+    - It does not optimize or select a winning policy.
+    - It reconstructs completed trades from MT5 deals, includes entry/exit
+      commission and swap, assigns an entry-time ATR volatility regime, and
+      applies fixed pre-registered sizing multipliers.
+    """
     db: Session = SessionLocal()
+
     try:
-        combined_id = baseline_2024_2025_experiment_id
-        ids = {
-            "2024_2025": combined_id,
-            "2026": experiment_id,
-        }
-        for label, eid in ids.items():
-            if not db.query(Experiment).filter(Experiment.id == eid).first():
-                raise HTTPException(status_code=404, detail=f"{label} experiment not found: {eid}")
-
-        combined_result = _latest_result(db, combined_id)
-        result_2026 = _latest_result(db, experiment_id)
-        combined_data = _load_metrics(combined_result)
-        data_2024, data_2025 = _split_two_year_metrics(combined_data)
-        data = {"2024": data_2024, "2025": data_2025, "2026": _load_metrics(result_2026)}
-        results = {"2024": combined_result, "2025": combined_result, "2026": result_2026}
-
-        overall_by_year = {year: _overall(data[year]) for year in data}
-        overall = {
-            "trade_count": {y: int(overall_by_year[y].get("trade_count", 0) or 0) for y in data},
-            "net_profit": {y: float(overall_by_year[y].get("net_profit", 0) or 0) for y in data},
-            "profit_factor": {y: overall_by_year[y].get("profit_factor") for y in data},
-            "expectancy": {y: overall_by_year[y].get("expectancy") for y in data},
-            "max_drawdown_absolute": {y: overall_by_year[y].get("max_drawdown_absolute") for y in data},
-        }
-        overall_sample_ok = all(v >= min_trades for v in overall["trade_count"].values())
-        overall_positive = all(v > 0 for v in overall["net_profit"].values())
-        overall_negative = all(v < 0 for v in overall["net_profit"].values())
-        overall_pf_positive = all(
-            v is not None and float(v) > 1 for v in overall["profit_factor"].values()
+        experiment = (
+            db.query(Experiment)
+            .filter(Experiment.id == experiment_id)
+            .first()
         )
-        overall_gate = {
-            **overall,
-            "min_trades_required_each_year": min_trades,
-            "sample_sufficient_all_years": overall_sample_ok,
-            "net_profit_same_positive_all_years": overall_positive,
-            "net_profit_same_negative_all_years": overall_negative,
-            "pf_gt_1_all_years": overall_pf_positive,
-            "robust_positive_3year": overall_sample_ok and overall_positive and overall_pf_positive,
-        }
+        if not experiment:
+            raise HTTPException(
+                status_code=404,
+                detail="Experiment not found",
+            )
 
-        sections = [
-            "by_entry_volatility",
-            "by_entry_trend",
-            "by_entry_session",
-            "entry_volatility_x_trend",
-            "entry_volatility_x_session",
-            "entry_volatility_x_trend_x_session",
-        ]
-        section_results: dict[str, list[dict[str, Any]]] = {}
-        positives: list[dict[str, Any]] = []
-        negatives: list[dict[str, Any]] = []
-        sampled: list[dict[str, Any]] = []
+        selected = _parse_policies(policies)
 
-        for section in sections:
-            rows = _group_rows(data, section, min_trades)
-            section_results[section] = rows
-            for row in rows:
-                item = {"section": section, **row}
-                if row["sample_sufficient_all_years"]:
-                    sampled.append(item)
-                if row["robust_positive_3year"]:
-                    positives.append(item)
-                if row["robust_negative_3year"]:
-                    negatives.append(item)
+        deals_raw = _read_upload_bytes(deals_file)
+        market_raw = _read_upload_bytes(market_file)
 
-        conclusion = "SUPPORTED_FOR_FURTHER_RESEARCH" if positives else "NOT_ESTABLISHED"
-        limitations = [
-            "2024 is treated as the development/IS year, 2025 as OOS #1, and 2026 as OOS #2.",
-            "2026 is a partial-year dataset through the latest supplied MT5 report date, not a full calendar year.",
-            "This gate is a deterministic evidence filter; minimum trade count is a screening rule, not a statistical significance test.",
-            "No 2026 parameter adjustment is performed by this endpoint.",
-            "Context labels are external research proxies and do not reproduce the EA's internal execution logic.",
-            "A three-year robust positive group still requires further unseen data and actual MQL5 execution validation before deployment decisions.",
-        ]
+        deals = _load_csv_bytes(
+            deals_raw,
+            deals_file.filename or "deals.csv",
+        )
+        market = _load_csv_bytes(
+            market_raw,
+            market_file.filename or "market.csv",
+        )
 
-        payload = {
+        market_regimes = _build_market_regimes(
+            market,
+            input_timezone,
+        )
+        trades = _pair_realized_trades(
+            deals,
+            input_timezone,
+        )
+        trades = _attach_entry_regimes(
+            trades,
+            market_regimes,
+        )
+
+        policy_results: dict[str, dict[str, Any]] = {}
+        for policy in selected:
+            policy_results[policy] = _simulate_policy(
+                trades,
+                policy,
+            )
+
+        baseline = policy_results.get("flat")
+        if baseline is None:
+            # The baseline is always useful for comparison, even if the caller
+            # explicitly requested a subset of defensive policies.
+            baseline = _simulate_policy(trades, "flat")
+
+        regime_counts = (
+            trades["volatility_regime"]
+            .value_counts(dropna=False)
+            .to_dict()
+        )
+
+        analysis = {
             "experiment_id": experiment_id,
-            "source_experiment_ids": ids,
-            "source_result_ids": {year: results[year].id for year in results},
-            "method": "v11 deterministic 3-year robustness gate",
-            "periods": {
-                "2024": "IS / development",
-                "2025": "OOS #1",
-                "2026": "OOS #2 partial-year",
+            "experiment_scope": {
+                "sizing_context": "entry-time volatility regime",
+                "source_type": "user_supplied_mt5_deals_and_ohlc",
+                "ea_reexecution": False,
+                "automatic_policy_selection": False,
             },
-            "min_trades": min_trades,
-            "overall": overall_gate,
-            "summary": {
-                "sufficiently_sampled_groups": len(sampled),
-                "robust_positive_groups": len(positives),
-                "robust_negative_groups": len(negatives),
-                "conclusion": conclusion,
+            "baseline_flat": baseline,
+            "policies": policy_results,
+            "comparison": _policy_comparison(policy_results),
+            "method": {
+                "trade_reconstruction": (
+                    "FIFO pairing of MT5 in/out deals by symbol and "
+                    "opposite trade type."
+                ),
+                "realized_trade_pnl": (
+                    "Exit profit plus matched entry/exit commission and swap."
+                ),
+                "volatility_measure": "ATR(14) divided by close.",
+                "regime_thresholds": "33rd and 67th percentiles of supplied market ATR percentage.",
+                "sizing_multipliers": {
+                    "flat": {"low": 1.0, "normal": 1.0, "high": 1.0},
+                    "high_defensive": {"low": 1.0, "normal": 1.0, "high": 0.5},
+                    "low_defensive": {"low": 0.5, "normal": 1.0, "high": 1.0},
+                    "high_low_defensive": {"low": 0.5, "normal": 1.0, "high": 0.5},
+                },
+                "regime_trade_counts": {
+                    str(k): int(v) for k, v in regime_counts.items()
+                },
             },
-            "robust_positive_groups": positives,
-            "robust_negative_groups": negatives,
-            "sections": section_results,
-            "limitations": limitations,
+            "limitations": [
+                "This is a sizing simulation over realized MT5 trades; it does not rerun the MQL5 EA.",
+                "Sizing multipliers are fixed pre-registered policies and are not optimized by the engine.",
+                "No policy is declared superior automatically.",
+                "ATR volatility regimes are research labels derived from the supplied OHLC data.",
+                "The market sample determines the percentile cutoffs; this is a deterministic classification step, not parameter optimization.",
+                "Partial/unmatched MT5 deals cannot be reconstructed as completed trades and are excluded.",
+                "The simulation does not model spread/slippage beyond costs already represented in the supplied deals.",
+            ],
             "generated_at": datetime.utcnow().isoformat() + "Z",
         }
 
         result = ExperimentResult(
-            id=uuid.uuid4().hex,
-            experiment_id=experiment_id,
-            summary=conclusion,
-            metrics=json.dumps(payload, ensure_ascii=False),
-            evidence=json.dumps({
-                "source_experiment_ids": ids,
-                "source_experiment_2024_2025_combined": combined_id,
-                "source_result_ids": payload["source_result_ids"],
-                "min_trades": min_trades,
-            }, ensure_ascii=False),
-            limitations=json.dumps(limitations, ensure_ascii=False),
-            conclusion=conclusion,
+            id=str(uuid.uuid4()),
+            experiment_id=experiment.id,
+            summary=(
+                "Regime-conditioned position-sizing simulation over "
+                "accounting-aware MT5 trades."
+            ),
+            metrics=json.dumps(
+                analysis,
+                ensure_ascii=False,
+                default=str,
+            ),
+            evidence=json.dumps(
+                {
+                    "deals_filename": deals_file.filename,
+                    "market_filename": market_file.filename,
+                    "policies": selected,
+                    "source_type": "user_supplied_mt5_deals_and_ohlc",
+                },
+                ensure_ascii=False,
+            ),
+            limitations=json.dumps(
+                analysis["limitations"],
+                ensure_ascii=False,
+            ),
+            conclusion=(
+                "Sizing policies simulated; no policy is declared "
+                "superior by the engine."
+            ),
         )
+
         db.add(result)
+        experiment.status = "completed"
+        experiment.completed_at = datetime.utcnow()
         db.commit()
         db.refresh(result)
 
         return {
-            "experiment_id": experiment_id,
+            "experiment_id": experiment.id,
             "result_id": result.id,
-            "status": "completed",
-            "analysis": payload,
+            "status": experiment.status,
+            "analysis": analysis,
         }
+
     finally:
         db.close()
