@@ -10,7 +10,7 @@ from typing import Any
 
 from fastapi import UploadFile
 from app.database import SessionLocal
-from app.research_models import Experiment
+from app.research_models import Experiment, ExperimentResult
 
 from app.api.research_runner import import_trade_results
 from app.api.research_runner_v3 import import_mt5_trade_results
@@ -33,7 +33,7 @@ POLICIES = os.getenv(
     "flat,high_defensive,low_defensive,high_low_defensive",
 )
 
-ORCHESTRATOR_VERSION = "v11-lazy-import-2026-09-21"
+ORCHESTRATOR_VERSION = "v11-result-validated-2026-09-21"
 
 STAGES = [
     "v1_import_trades",
@@ -227,6 +227,56 @@ async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | Non
         db.close()
 
 
+def _is_v11_result(result: ExperimentResult) -> bool:
+    """Identify a persisted v11 sizing result from its stored structure."""
+    try:
+        metrics = json.loads(getattr(result, "metrics", "") or "{}")
+    except Exception:
+        metrics = {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+
+    summary = str(getattr(result, "summary", "") or "").lower()
+    conclusion = str(getattr(result, "conclusion", "") or "").lower()
+    method = str(metrics.get("method", "") or "").lower()
+    scope = metrics.get("experiment_scope", {})
+    scope_text = json.dumps(scope, ensure_ascii=False).lower() if isinstance(scope, dict) else str(scope).lower()
+
+    return bool(
+        "baseline_flat" in metrics
+        or ("policies" in metrics and "comparison" in metrics and "sizing_context" in scope_text)
+        or "position-sizing simulation" in summary
+        or "sizing policies simulated" in conclusion
+        or "realized trade p/l" in method
+    )
+
+
+def _persisted_v11_result_id(experiment_id: str) -> str | None:
+    """Return an existing v11 ExperimentResult ID, if one is actually persisted."""
+    db = SessionLocal()
+    try:
+        rows = db.query(ExperimentResult).filter(ExperimentResult.experiment_id == experiment_id).all()
+        candidates = [r for r in rows if _is_v11_result(r)]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda r: getattr(r, "created_at", None) or datetime.min)
+        return str(candidates[-1].id)
+    finally:
+        db.close()
+
+
+def _ensure_v11_result(experiment_id: str, runner_result: Any) -> dict[str, Any]:
+    """Require the v11 runner to leave a real ExperimentResult in the DB."""
+    persisted_id = _persisted_v11_result_id(experiment_id)
+    if persisted_id:
+        return {"status": "verified", "result_id": persisted_id}
+
+    if isinstance(runner_result, dict) and runner_result.get("status") == "skipped":
+        raise RuntimeError(f"v11_sizing was skipped: {runner_result.get('reason', 'unknown reason')}")
+
+    raise RuntimeError("v11_sizing runner returned, but no persisted v11 ExperimentResult was found")
+
+
 def _experiment_ids() -> list[str]:
     db = SessionLocal()
     try:
@@ -244,6 +294,23 @@ async def _process_experiment(experiment_id: str) -> dict[str, Any]:
 
     completed = list(state.get("completed_stages", []))
     results = list(state.get("results", []))
+
+    # Never trust a stale v11 completion flag by itself. If the persisted
+    # ExperimentResult is missing, remove only v11 from the resume state so
+    # the worker can recreate and verify that result without rerunning v1-v10.
+    if "v11_sizing" in completed:
+        existing_v11_id = _persisted_v11_result_id(experiment_id)
+        if existing_v11_id is None:
+            completed = [x for x in completed if x != "v11_sizing"]
+            results = [x for x in results if x.get("stage") != "v11_sizing"]
+            state["completed_stages"] = completed
+            state["results"] = results
+            state["v11_revalidation"] = {
+                "status": "required",
+                "reason": "v11_sizing was marked complete but no persisted v11 ExperimentResult exists",
+                "updated_at": _now(),
+            }
+            _save_state(state)
 
     # A stage is only marked complete after its existing runner returns.
     # This makes restarts resume from the first unfinished stage.
@@ -276,6 +343,12 @@ async def _process_experiment(experiment_id: str) -> dict[str, Any]:
 
         try:
             result = await _run_stage(experiment_id, stage, files)
+            if stage == "v11_sizing":
+                v11_check = _ensure_v11_result(experiment_id, result)
+                if isinstance(result, dict):
+                    result = {**result, "persisted_v11_result": v11_check}
+                else:
+                    result = {"runner_result": result, "persisted_v11_result": v11_check}
             completed.append(stage)
             results.append({
                 "stage": stage,
