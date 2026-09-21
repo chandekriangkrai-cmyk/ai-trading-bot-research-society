@@ -9,6 +9,7 @@ from tempfile import SpooledTemporaryFile
 from typing import Any
 
 from fastapi import UploadFile
+
 from app.database import SessionLocal
 from app.research_models import Experiment
 
@@ -21,8 +22,7 @@ from app.api.research_runner_v7 import import_mt5_deals_context
 from app.api.research_runner_v8 import import_mt5_deals_entry_context
 from app.api.research_runner_v9 import walk_forward_entry_context
 from app.api.research_runner_v10 import robustness_gate
-from app.api.research_runner_v11_2_fixed import robustness_gate_3year_from_inputs
-
+from app.api.research_runner_v11_2 import robustness_gate_3year_from_inputs
 
 INPUT_ROOT = Path(os.getenv("RESEARCH_INPUT_ROOT", "./research_inputs"))
 STATE_ROOT = Path(os.getenv("RESEARCH_AUTO_STATE_ROOT", "./research_auto_state"))
@@ -59,6 +59,7 @@ _state: dict[str, Any] = {
     "blocked_experiments": 0,
     "completed_experiments": 0,
 }
+
 _lock = asyncio.Lock()
 _stop = asyncio.Event()
 _task: asyncio.Task | None = None
@@ -78,7 +79,13 @@ def _load_state(experiment_id: str) -> dict[str, Any]:
     if not p.exists():
         return {"experiment_id": experiment_id, "completed_stages": [], "blocked": None}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("state file is not an object")
+        data.setdefault("experiment_id", experiment_id)
+        data.setdefault("completed_stages", [])
+        data.setdefault("blocked", None)
+        return data
     except Exception:
         return {"experiment_id": experiment_id, "completed_stages": [], "blocked": None}
 
@@ -86,7 +93,7 @@ def _load_state(experiment_id: str) -> dict[str, Any]:
 def _save_state(data: dict[str, Any]) -> None:
     p = _state_file(str(data["experiment_id"]))
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     tmp.replace(p)
 
 
@@ -138,98 +145,54 @@ def _missing_for(stage: str, files: dict[str, Path | None]) -> list[str]:
         "v11_sizing": ["deals", "market"],
         "v11_2_three_year": ["is_deals", "is_market", "oos_deals", "oos_market", "deals", "market"],
     }
-    return [x for x in required[stage] if files.get(x) is None]
+    return [x for x in required.get(stage, []) if files.get(x) is None]
 
 
-async def _run_v11_2_auto() -> Any:
-    """Deprecated compatibility hook; v11.2 now runs as a normal pipeline stage."""
-    return {"status": "handled_by_pipeline_stage", "stage": "v11_2_three_year"}
+def _is_completed_result(result: Any) -> bool:
+    return isinstance(result, dict) and result.get("status") == "completed"
+
+
+def _is_v11_2_result(result: Any) -> bool:
+    return (
+        isinstance(result, dict)
+        and result.get("status") == "completed"
+        and bool(result.get("result_id"))
+        and isinstance(result.get("analysis"), dict)
+        and bool(result["analysis"].get("summary"))
+    )
 
 
 async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | None]) -> Any:
     db = SessionLocal()
     try:
         if stage == "v1_import_trades":
-            return await import_trade_results(
-                experiment_id, _upload(files["trades"]), db
-            )
-
+            return await import_trade_results(experiment_id, _upload(files["trades"]), db)
         if stage == "v3_import_mt5_trades":
             market = _upload(files["market"]) if files["market"] else None
-            return await import_mt5_trade_results(
-                experiment_id, _upload(files["trades"]), market, db
-            )
-
+            return await import_mt5_trade_results(experiment_id, _upload(files["trades"]), market, db)
         if stage == "v4_major_fx":
             market = _upload(files["market"]) if files["market"] else None
-            return await import_major_fx_trade_results(
-                experiment_id, _upload(files["trades"]), market, db
-            )
-
+            return await import_major_fx_trade_results(experiment_id, _upload(files["trades"]), market, db)
         if stage == "v5_import_mt5_deals":
             market = _upload(files["market"]) if files["market"] else None
-            return await import_mt5_deals(
-                experiment_id, _upload(files["deals"]), market, db
-            )
-
+            return await import_mt5_deals(experiment_id, _upload(files["deals"]), market, db)
         if stage == "v6_is_oos":
-            # v6's implementation derives its 2025 H1/H2 split from the
-            # supplied deals file; it accepts the same deals/market inputs.
             market = _upload(files["market"]) if files["market"] else None
-            return await import_mt5_deals_is_oos(
-                experiment_id, _upload(files["deals"]), market, db
-            )
-
+            return await import_mt5_deals_is_oos(experiment_id, _upload(files["deals"]), market, db)
         if stage == "v7_context":
-            return await import_mt5_deals_context(
-                experiment_id,
-                _upload(files["deals"]),
-                _upload(files["market"]),
-                INPUT_TIMEZONE,
-                db,
-            )
-
+            return await import_mt5_deals_context(experiment_id, _upload(files["deals"]), _upload(files["market"]), INPUT_TIMEZONE, db)
         if stage == "v8_entry_context":
-            return await import_mt5_deals_entry_context(
-                experiment_id,
-                _upload(files["deals"]),
-                _upload(files["market"]),
-                INPUT_TIMEZONE,
-                db,
-            )
-
+            return await import_mt5_deals_entry_context(experiment_id, _upload(files["deals"]), _upload(files["market"]), INPUT_TIMEZONE, db)
         if stage == "v9_walk_forward":
-            return await walk_forward_entry_context(
-                experiment_id,
-                _upload(files["is_deals"]),
-                _upload(files["is_market"]),
-                _upload(files["oos_deals"]),
-                _upload(files["oos_market"]),
-                INPUT_TIMEZONE,
-                db,
-            )
-
+            return await walk_forward_entry_context(experiment_id, _upload(files["is_deals"]), _upload(files["is_market"]), _upload(files["oos_deals"]), _upload(files["oos_market"]), INPUT_TIMEZONE, db)
         if stage == "v10_robustness":
             return robustness_gate(experiment_id, MIN_TRADES)
-
         if stage == "v11_sizing":
-            # Lazy import: an older v11 deployment must not prevent the
-            # entire research service from booting.
             from app.api import research_runner_v11
             runner = getattr(research_runner_v11, "regime_sizing_simulation", None)
             if runner is None:
-                return {
-                    "status": "skipped",
-                    "reason": "regime_sizing_simulation is not available in the deployed v11 runner",
-                }
-            return await runner(
-                experiment_id,
-                _upload(files["deals"]),
-                _upload(files["market"]),
-                INPUT_TIMEZONE,
-                POLICIES,
-            )
-
+                raise RuntimeError("regime_sizing_simulation is not available in the deployed v11 runner")
+            return await runner(experiment_id, _upload(files["deals"]), _upload(files["market"]), INPUT_TIMEZONE, POLICIES)
         if stage == "v11_2_three_year":
             return await robustness_gate_3year_from_inputs(
                 experiment_id,
@@ -242,7 +205,6 @@ async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | Non
                 INPUT_TIMEZONE,
                 MIN_TRADES,
             )
-
         raise RuntimeError(f"Unknown stage: {stage}")
     finally:
         db.close()
@@ -259,15 +221,12 @@ def _experiment_ids() -> list[str]:
 async def _process_experiment(experiment_id: str) -> dict[str, Any]:
     state = _load_state(experiment_id)
     files = _inputs(experiment_id)
-
     state["last_seen_at"] = _now()
     state["input_folder"] = str(files["folder"])
 
     completed = list(state.get("completed_stages", []))
     results = list(state.get("results", []))
 
-    # A stage is only marked complete after its existing runner returns.
-    # This makes restarts resume from the first unfinished stage.
     for stage in STAGES:
         if stage in completed:
             continue
@@ -277,19 +236,12 @@ async def _process_experiment(experiment_id: str) -> dict[str, Any]:
             state["blocked"] = {
                 "stage": stage,
                 "missing_files": missing,
-                "message": (
-                    "Place the missing CSV files in the experiment input folder "
-                    "and the worker will continue automatically."
-                ),
+                "message": "Place the missing CSV files in the experiment input folder and the worker will continue automatically.",
                 "updated_at": _now(),
             }
+            state["current_stage"] = stage
             _save_state(state)
-            return {
-                "experiment_id": experiment_id,
-                "status": "blocked",
-                "stage": stage,
-                "missing_files": missing,
-            }
+            return {"experiment_id": experiment_id, "status": "blocked", "stage": stage, "missing_files": missing}
 
         state["blocked"] = None
         state["current_stage"] = stage
@@ -297,39 +249,30 @@ async def _process_experiment(experiment_id: str) -> dict[str, Any]:
 
         try:
             result = await _run_stage(experiment_id, stage, files)
+            if not _is_completed_result(result):
+                raise RuntimeError(f"{stage} did not return a completed result: {result}")
+            if stage == "v11_2_three_year" and not _is_v11_2_result(result):
+                raise RuntimeError("v11.2 returned without a persisted ExperimentResult (result_id/analysis missing)")
+
             completed.append(stage)
-            results.append({
-                "stage": stage,
-                "completed_at": _now(),
-                "result": result,
-            })
+            results.append({"stage": stage, "completed_at": _now(), "result": result})
             state["completed_stages"] = completed
             state["results"] = results
             state["current_stage"] = None
+            state["blocked"] = None
             _save_state(state)
         except Exception as exc:
-            state["blocked"] = {
-                "stage": stage,
-                "error": f"{type(exc).__name__}: {exc}",
-                "updated_at": _now(),
-            }
+            state["blocked"] = {"stage": stage, "error": f"{type(exc).__name__}: {exc}", "updated_at": _now()}
+            state["current_stage"] = stage
             _save_state(state)
-            return {
-                "experiment_id": experiment_id,
-                "status": "error",
-                "stage": stage,
-                "error": str(exc),
-            }
+            return {"experiment_id": experiment_id, "status": "error", "stage": stage, "error": str(exc)}
 
     state["status"] = "completed"
     state["completed_at"] = state.get("completed_at") or _now()
     state["blocked"] = None
+    state["current_stage"] = None
     _save_state(state)
-    return {
-        "experiment_id": experiment_id,
-        "status": "completed",
-        "completed_stages": completed,
-    }
+    return {"experiment_id": experiment_id, "status": "completed", "completed_stages": completed}
 
 
 async def run_cycle() -> dict[str, Any]:
@@ -339,19 +282,11 @@ async def run_cycle() -> dict[str, Any]:
         _state["last_error"] = None
         try:
             ids = _experiment_ids()
-            cycle = []
-
-            for experiment_id in ids:
-                cycle.append(await _process_experiment(experiment_id))
-
+            cycle = [await _process_experiment(experiment_id) for experiment_id in ids]
             _state["last_cycle"] = cycle
             _state["processed_experiments"] = len(cycle)
-            _state["blocked_experiments"] = sum(
-                1 for x in cycle if x.get("status") == "blocked"
-            )
-            _state["completed_experiments"] = sum(
-                1 for x in cycle if x.get("status") == "completed"
-            )
+            _state["blocked_experiments"] = sum(1 for x in cycle if x.get("status") == "blocked")
+            _state["completed_experiments"] = sum(1 for x in cycle if x.get("status") == "completed")
             return {"status": "completed", "experiments": cycle}
         except Exception as exc:
             _state["last_error"] = f"{type(exc).__name__}: {exc}"
