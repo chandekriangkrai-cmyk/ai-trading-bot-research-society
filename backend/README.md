@@ -66,3 +66,16 @@ EA + Trades/Deals + OHLC Bars + optional Ticks
 
 ## Evidence policy
 No causality is claimed from observational backtest data. Findings are only published when they pass the minimum-sample/effect-size evidence gate. Otherwise the result is marked as insufficient evidence.
+
+
+## Research Engine v3 — Evidence-first
+
+This version:
+- parses full MT5 Strategy Tester CSV reports by locating the Deals table;
+- reconstructs completed trades from MT5 IN/OUT deals with FIFO when Position IDs are absent;
+- processes large tick CSV files in a single streaming pass instead of materializing all ticks in RAM;
+- enforces strict pre-entry look-ahead protection;
+- separates pre-entry evidence from post-entry MFE/MAE;
+- uses a pre-registered feature set and Bonferroni-adjusted statistical gate;
+- publishes only `VALIDATED_PATTERN` findings and records `INSUFFICIENT_EVIDENCE` when evidence does not clear the gate;
+- preserves trade IDs and entry/exit deal IDs for lineage.
