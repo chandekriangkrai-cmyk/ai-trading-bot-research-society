@@ -342,54 +342,103 @@ _NUMBER_WORDS = {
     "hundred": 100,
 }
 
-def _challenge_text_words(text: str) -> list[str]:
-    # Preserve digits and letters while discarding Moltbook's obfuscating symbols.
-    return re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)*|\d+(?:\.\d+)?", str(text or "").lower())
+def _collapse_repeated_letters(word: str) -> str:
+    return re.sub(r"(.)\1+", r"\1", word.lower())
 
-def _parse_number_at(words: list[str], i: int):
-    w=words[i]
-    if re.fullmatch(r"\d+(?:\.\d+)?", w):
-        return float(w), i+1
-    if "-" in w:
-        parts=w.split("-")
-        if all(p in _NUMBER_WORDS for p in parts):
-            return float(sum(_NUMBER_WORDS[p] for p in parts)), i+1
-    if w not in _NUMBER_WORDS:
+def _edit_distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(cur[-1] + 1, prev[j] + 1, prev[j-1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+def _challenge_text_words(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z]+|\d+(?:\.\d+)?", str(text or "").lower())
+
+def _fuzzy_number_word(word: str):
+    clean = _collapse_repeated_letters(word)
+    if clean in _NUMBER_WORDS:
+        return _NUMBER_WORDS[clean]
+    candidates = [
+        (name, value) for name, value in _NUMBER_WORDS.items()
+        if len(name) >= 4 and abs(len(name) - len(clean)) <= 2
+    ]
+    if not candidates:
+        return None
+    name, value = min(candidates, key=lambda item: _edit_distance(clean, item[0]))
+    distance = _edit_distance(clean, name)
+    return value if distance <= max(1, len(name) // 4) else None
+
+def _number_from_words(words: list[str], i: int):
+    if i >= len(words):
         return None, i
-    total=0
-    j=i
-    while j<len(words) and words[j] in _NUMBER_WORDS:
-        v=_NUMBER_WORDS[words[j]]
-        if v==100:
-            total=max(1,total)*100
-        else:
-            total += v
-        j+=1
-    return float(total), j
+    if re.fullmatch(r"\d+(?:\.\d+)?", words[i]):
+        return float(words[i]), i + 1
+
+    # First, join 2-4 obfuscated chunks into a single number word.
+    first = None
+    first_end = i
+    for n in range(1, min(4, len(words) - i) + 1):
+        parts = words[i:i+n]
+        if any(re.fullmatch(r"\d+(?:\.\d+)?", x) for x in parts):
+            continue
+        joined = "".join(_collapse_repeated_letters(x) for x in parts)
+        if joined in _NUMBER_WORDS:
+            first = _NUMBER_WORDS[joined]
+            first_end = i + n
+            break
+        # Only use fuzzy matching for a single chunk; otherwise ordinary prose
+        # can accidentally form a number.
+        if n == 1:
+            fuzzy = _fuzzy_number_word(parts[0])
+            if fuzzy is not None:
+                first = fuzzy
+                first_end = i + 1
+
+    if first is None:
+        return None, i
+
+    # English compound numbers: "twenty five" = 25.
+    if first in {20,30,40,50,60,70,80,90} and first_end < len(words):
+        second = _fuzzy_number_word(words[first_end])
+        if second is not None and 0 < second < 10:
+            return float(first + second), first_end + 1
+
+    return float(first), first_end
 
 def _solve_challenge(challenge_text: str) -> str:
-    words=_challenge_text_words(challenge_text)
-    nums=[]
-    for i in range(len(words)):
-        val,j=_parse_number_at(words,i)
-        if val is not None:
-            nums.append((val,i,j))
-            i=j
-    if len(nums)<2:
+    words = _challenge_text_words(challenge_text)
+    nums = []
+    i = 0
+    while i < len(words):
+        value, next_i = _number_from_words(words, i)
+        if value is not None:
+            nums.append(value)
+            i = next_i
+        else:
+            i += 1
+
+    if len(nums) < 2:
         raise ValueError(f"Could not parse two operands from challenge: {challenge_text!r}")
-    a,b=nums[0][0],nums[1][0]
-    normalized=" ".join(words)
+
+    a, b = nums[0], nums[1]
+    normalized = " ".join(words)
+
     if re.search(r"\b(multiplied by|times|multiply by|multiplied)\b", normalized):
-        result=a*b
+        result = a * b
     elif re.search(r"\b(divided by|divide by|quotient)\b", normalized):
-        if b==0: raise ValueError("Division by zero challenge")
-        result=a/b
+        if b == 0:
+            raise ValueError("Division by zero challenge")
+        result = a / b
     elif re.search(r"\b(subtracted by|minus|take away|slows by|decreased by)\b", normalized):
-        result=a-b
-    elif re.search(r"\b(added to|plus|add|increased by)\b", normalized):
-        result=a+b
+        result = a - b
+    elif re.search(r"\b(added to|adds?|plus|add|increased by)\b", normalized):
+        result = a + b
     else:
         raise ValueError(f"Unsupported arithmetic operation in challenge: {challenge_text!r}")
+
     return f"{result:.2f}"
 
 async def _verify_post(verification: dict[str, Any]) -> dict[str, Any]:
