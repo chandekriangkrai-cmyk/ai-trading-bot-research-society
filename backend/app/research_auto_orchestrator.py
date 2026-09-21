@@ -21,7 +21,6 @@ from app.api.research_runner_v7 import import_mt5_deals_context
 from app.api.research_runner_v8 import import_mt5_deals_entry_context
 from app.api.research_runner_v9 import walk_forward_entry_context
 from app.api.research_runner_v10 import robustness_gate
-from app.api.research_runner_v11 import regime_sizing_simulation
 
 
 INPUT_ROOT = Path(os.getenv("RESEARCH_INPUT_ROOT", "./research_inputs"))
@@ -34,7 +33,7 @@ POLICIES = os.getenv(
     "flat,high_defensive,low_defensive,high_low_defensive",
 )
 
-ORCHESTRATOR_VERSION = "v11-enabled-2026-09-21"
+ORCHESTRATOR_VERSION = "v11-lazy-import-2026-09-21"
 
 STAGES = [
     "v1_import_trades",
@@ -208,8 +207,14 @@ async def _run_stage(experiment_id: str, stage: str, files: dict[str, Path | Non
             return robustness_gate(experiment_id, MIN_TRADES)
 
         if stage == "v11_sizing":
-            # v11 has no DB dependency in its signature.
-            return await regime_sizing_simulation(
+            from app.api import research_runner_v11
+            runner = getattr(research_runner_v11, "regime_sizing_simulation", None)
+            if runner is None:
+                return {
+                    "status": "skipped",
+                    "reason": "v11 regime_sizing_simulation unavailable in deployed runner",
+                }
+            return await runner(
                 experiment_id,
                 _upload(files["deals"]),
                 _upload(files["market"]),
@@ -365,8 +370,7 @@ async def stop() -> None:
 
 
 def status() -> dict[str, Any]:
-    return {
-        "orchestrator_version": ORCHESTRATOR_VERSION,
+    return {"orchestrator_version": ORCHESTRATOR_VERSION, 
         **_state,
         "interval_seconds": INTERVAL_SECONDS,
         "input_root": str(INPUT_ROOT),
