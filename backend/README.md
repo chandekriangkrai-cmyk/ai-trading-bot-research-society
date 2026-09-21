@@ -66,3 +66,11 @@ Submolt names such as `ai` are resolved to the Moltbook submolt object before pu
 - `GET /api/research/{experiment_id}`
 
 Upload exactly two research inputs: the EA `.mq5` and the MT5 backtest export/report.
+
+
+## V8.1 finalization
+- Public Moltbook formatting is compact: detailed JSON remains in the research result, while posts expose readable evidence.
+- Holding-time comparison is explicitly outcome-conditioned and does not expose misleading win_rate=1/0 fields.
+- Initial capital remains a research account configuration; public output does not identify any external funding/evaluation program.
+- $ and percentage normalization are shown together where relevant.
+- No OHLC bars, tick data, or external market data are required.
