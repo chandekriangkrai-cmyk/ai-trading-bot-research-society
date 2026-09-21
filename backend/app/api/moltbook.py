@@ -52,7 +52,7 @@ def load_result(eid):
 def _is_unified(r):
     try:
         engine = json.loads(r.metrics or "{}").get("engine")
-        return engine in {"unified_research_v1", "unified_research_v2", "ea_backtest_research_v1"}
+        return engine in {"unified_research_v1", "unified_research_v2", "ea_backtest_research_v1", "ea_backtest_research_v2"}
     except Exception:
         return False
 
@@ -62,7 +62,11 @@ def build_post(e,r):
     findings=a.get("findings",[])
     hypotheses=a.get("hypotheses",[])
     title=f"Research Update: {e.symbol} {e.timeframe}"
-    lines=["AI Trading Bot Research Society — Research Update",f"Experiment: {e.id}",f"Strategy: {e.symbol} {e.timeframe}","","Research scope:","EA .mq5 + MT5 Backtest only.","No M30 bars, tick data, or external market data were used.",""]
+    account=m.get("analysis",{}).get("account_context",{})
+    lines=["AI Trading Bot Research Society — Research Update",f"Experiment: {e.id}",f"Strategy: {e.symbol} {e.timeframe}","","Research scope:","EA .mq5 + MT5 Backtest only.","No OHLC bars, tick data, or external market data were used."]
+    if account.get("initial_capital") is not None:
+        lines.append(f"Initial capital configuration: ${float(account['initial_capital']):,.2f}")
+    lines.append("")
     if findings:
         lines.append("Evidence-backed observations:")
         for f in findings[:8]:
@@ -79,6 +83,11 @@ def build_post(e,r):
             lines.append("  Missing evidence: "+json.dumps(h.get("missing_evidence",[]),ensure_ascii=False))
             if h.get("alternative_explanations"):
                 lines.append("  Alternatives: "+json.dumps(h.get("alternative_explanations"),ensure_ascii=False))
+    critique=[]
+    if m.get("limitations"): critique.extend(m.get("limitations",[])[:3])
+    if a.get("insufficient_evidence"): critique.extend([x.get("reason","") for x in a.get("insufficient_evidence",[])[:3] if x.get("reason")])
+    if critique:
+        lines += ["","Research limitations / critique:"]+[f"- {x}" for x in critique]
     lines += ["","Peer research questions:","1. Can this EA/backtest pattern be reproduced in another experiment?","2. Which part of the EA logic should be tested next?","3. Does the observed behavior remain stable across different backtest periods?","4. What evidence would falsify the observed pattern?","5. Which hypothesis should be tested against a new backtest?"]
     lim=m.get("limitations",[])
     if lim: lines += ["","Limitations:"]+[f"- {x}" for x in lim[:6]]
