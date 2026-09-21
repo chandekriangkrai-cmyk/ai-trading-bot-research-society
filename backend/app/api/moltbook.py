@@ -270,7 +270,7 @@ def _build_post(
         f"Status: {status}",
         "",
         "Research pipeline:",
-        "v1 → v3 → v4 → v5 → v6 → v7 → v8 → v9 → v10",
+        "v1 → v3 → v4 → v5 → v6 → v7 → v8 → v9 → v10 → v11",
         "",
         "Robustness conclusion:",
         str(conclusion),
@@ -698,12 +698,27 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
             ExperimentResult.experiment_id == experiment_id
         )
         all_results = query.all()
-        result = next((row for row in all_results if _is_v10_result(row)), None)
-        if result is None:
-            result = max(
-                all_results,
-                key=lambda row: getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
-            ) if all_results else None
+
+        # Prefer the newest research stage (v11/v11.2) when available.
+        # Fall back to v10 only when no newer result exists.
+        def _result_stage(row: ExperimentResult) -> int:
+            metrics = _json_dict(getattr(row, "metrics", None))
+            method = str(metrics.get("method", "")).lower()
+            if "v11.2" in method or "three-year robustness" in method:
+                return 112
+            if "v11" in method or "sizing" in method:
+                return 11
+            if _is_v10_result(row):
+                return 10
+            return 0
+
+        result = max(
+            all_results,
+            key=lambda row: (
+                _result_stage(row),
+                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+            ),
+        ) if all_results else None
 
         if result is None:
             raise HTTPException(
@@ -745,12 +760,27 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
             ExperimentResult.experiment_id == experiment_id
         )
         all_results = query.all()
-        result = next((row for row in all_results if _is_v10_result(row)), None)
-        if result is None:
-            result = max(
-                all_results,
-                key=lambda row: getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
-            ) if all_results else None
+
+        # Prefer the newest research stage (v11/v11.2) when available.
+        # Fall back to v10 only when no newer result exists.
+        def _result_stage(row: ExperimentResult) -> int:
+            metrics = _json_dict(getattr(row, "metrics", None))
+            method = str(metrics.get("method", "")).lower()
+            if "v11.2" in method or "three-year robustness" in method:
+                return 112
+            if "v11" in method or "sizing" in method:
+                return 11
+            if _is_v10_result(row):
+                return 10
+            return 0
+
+        result = max(
+            all_results,
+            key=lambda row: (
+                _result_stage(row),
+                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+            ),
+        ) if all_results else None
 
         if result is None:
             raise HTTPException(
