@@ -331,6 +331,157 @@ def _build_post(
     return title, "\n".join(line for line in lines if line != "")
 
 
+def _normalize_challenge(text: str) -> str:
+    """Normalize Moltbook's obfuscated challenge text enough for word-number parsing."""
+    s = str(text or "").lower()
+    # Keep letters and spaces; punctuation/noise is deliberately discarded.
+    s = re.sub(r"[^a-z\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+_NUMBER_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30,
+    "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+    "eighty": 80, "ninety": 90, "hundred": 100,
+}
+
+
+def _extract_number_tokens(words: list[str]) -> list[float]:
+    """Extract ordinary numeric tokens and English number words from a challenge."""
+    values: list[float] = []
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if re.fullmatch(r"\d+(?:\.\d+)?", w):
+            values.append(float(w))
+            i += 1
+            continue
+
+        if w in _NUMBER_WORDS:
+            total = 0
+            current = 0
+            j = i
+            while j < len(words) and words[j] in _NUMBER_WORDS:
+                v = _NUMBER_WORDS[words[j]]
+                if v == 100:
+                    current = max(1, current) * 100
+                else:
+                    current += v
+                j += 1
+            total += current
+            values.append(float(total))
+            i = j
+            continue
+        i += 1
+    return values
+
+
+def _solve_challenge(challenge_text: str) -> str:
+    """
+    Solve the simple arithmetic write-challenge returned by Moltbook.
+
+    This intentionally accepts only a small, deterministic arithmetic grammar:
+    two operands plus one operation. It does not execute arbitrary expressions.
+    """
+    normalized = _normalize_challenge(challenge_text)
+    words = normalized.split()
+    numbers = _extract_number_tokens(words)
+
+    if len(numbers) < 2:
+        raise ValueError(f"Could not extract two operands from Moltbook challenge: {challenge_text!r}")
+
+    # Use the first two numeric values; Moltbook's write challenge asks for one
+    # simple arithmetic result embedded in surrounding obfuscating text.
+    a, b = numbers[0], numbers[1]
+
+    if any(phrase in normalized for phrase in (
+        "multiplied by", "times", "multiply by", "product of",
+    )):
+        result = a * b
+    elif any(phrase in normalized for phrase in (
+        "divided by", "divide by", "quotient",
+    )):
+        if b == 0:
+            raise ValueError("Moltbook challenge requested division by zero")
+        result = a / b
+    elif any(phrase in normalized for phrase in (
+        "subtracted by", "minus", "take away", "less",
+    )):
+        result = a - b
+    elif any(phrase in normalized for phrase in (
+        "added to", "plus", "add",
+    )):
+        result = a + b
+    else:
+        raise ValueError(f"Unsupported Moltbook arithmetic operation: {challenge_text!r}")
+
+    return f"{result:.2f}"
+
+
+async def _verify_post(verification: dict[str, Any]) -> dict[str, Any]:
+    """Immediately answer the write challenge returned by Moltbook after posting."""
+    if not isinstance(verification, dict):
+        return {
+            "attempted": False,
+            "verified": False,
+            "error": "Moltbook post did not contain a verification object",
+        }
+
+    verification_code = str(verification.get("verification_code") or "").strip()
+    challenge_text = str(verification.get("challenge_text") or "").strip()
+
+    if not verification_code or not challenge_text:
+        return {
+            "attempted": False,
+            "verified": False,
+            "error": "Moltbook verification response is missing verification_code or challenge_text",
+        }
+
+    answer = _solve_challenge(challenge_text)
+    api_key = os.getenv("MOLTBOOK_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="MOLTBOOK_API_KEY is not configured")
+
+    payload = {
+        "verification_code": verification_code,
+        "answer": answer,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    status_code, body = await asyncio.to_thread(
+        _request_json,
+        "POST",
+        f"{MOLTBOOK_API_BASE}/verify",
+        headers,
+        payload,
+    )
+
+    if status_code >= 400:
+        return {
+            "attempted": True,
+            "verified": False,
+            "answer": answer,
+            "status_code": status_code,
+            "response": body,
+        }
+
+    return {
+        "attempted": True,
+        "verified": True,
+        "answer": answer,
+        "status_code": status_code,
+        "response": body,
+    }
+
+
 async def _publish(title: str, content: str) -> dict[str, Any]:
     api_key = os.getenv("MOLTBOOK_API_KEY")
     if not api_key:
@@ -409,7 +560,25 @@ async def _publish(title: str, content: str) -> dict[str, Any]:
             },
         )
 
-    return body if isinstance(body, dict) else {"response": body}
+    published = body if isinstance(body, dict) else {"response": body}
+
+    # Moltbook may return a short-lived write-verification challenge inside
+    # the newly-created post. Verify immediately while the challenge is live.
+    post = published.get("post") if isinstance(published, dict) else None
+    verification = post.get("verification") if isinstance(post, dict) else None
+    if isinstance(verification, dict):
+        try:
+            published["verification"] = await _verify_post(verification)
+        except Exception as exc:
+            # Publishing already succeeded; expose the verification failure
+            # without falsely reporting that the post itself failed.
+            published["verification"] = {
+                "attempted": True,
+                "verified": False,
+                "error": str(exc),
+            }
+
+    return published
 
 
 @router.get("/config")
