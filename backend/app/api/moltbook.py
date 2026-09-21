@@ -931,6 +931,107 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
 
 
 
+@router.get("/post/{post_id}")
+async def moltbook_get_post(post_id: str) -> dict[str, Any]:
+    """Read one Moltbook post directly without creating or modifying anything."""
+    post_id = str(post_id or "").strip()
+    if not post_id:
+        raise HTTPException(status_code=400, detail="post_id is required")
+
+    api_key = os.getenv("MOLTBOOK_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="MOLTBOOK_API_KEY is not configured")
+
+    status, body = await asyncio.to_thread(
+        _request_json,
+        "GET",
+        f"{MOLTBOOK_API_BASE}/posts/{post_id}",
+        {"Authorization": f"Bearer {api_key}"},
+    )
+
+    if status >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Moltbook post fetch failed",
+                "status_code": status,
+                "response": body,
+            },
+        )
+
+    return {
+        "status": "ok",
+        "post_id": post_id,
+        "post": body,
+    }
+
+
+@router.get("/post/{post_id}/status")
+async def moltbook_post_status(post_id: str) -> dict[str, Any]:
+    """Return a compact read-only status for one Moltbook post."""
+    post_id = str(post_id or "").strip()
+    if not post_id:
+        raise HTTPException(status_code=400, detail="post_id is required")
+
+    api_key = os.getenv("MOLTBOOK_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="MOLTBOOK_API_KEY is not configured")
+
+    status, body = await asyncio.to_thread(
+        _request_json,
+        "GET",
+        f"{MOLTBOOK_API_BASE}/posts/{post_id}",
+        {"Authorization": f"Bearer {api_key}"},
+    )
+
+    if status >= 400:
+        return {
+            "status": "not_found_or_error",
+            "post_id": post_id,
+            "exists": False,
+            "verified": False,
+            "http_status": status,
+            "response": body,
+        }
+
+    post = body.get("post") if isinstance(body, dict) and isinstance(body.get("post"), dict) else body
+    if not isinstance(post, dict):
+        post = {}
+
+    verification_status = post.get("verification_status", post.get("verificationStatus"))
+    is_deleted = bool(post.get("is_deleted", post.get("isDeleted", False)))
+    is_locked = bool(post.get("is_locked", post.get("isLocked", False)))
+
+    verified = (
+        verification_status in {"verified", "published"}
+        or bool(post.get("verified", False))
+    )
+
+    return {
+        "status": "ok",
+        "post_id": post_id,
+        "exists": True,
+        "verified": verified,
+        "verification_status": verification_status,
+        "published": not is_deleted,
+        "deleted": is_deleted,
+        "locked": is_locked,
+        "title": post.get("title"),
+        "submolt": (
+            post.get("submolt", {}).get("name")
+            if isinstance(post.get("submolt"), dict)
+            else post.get("submolt")
+        ),
+        "upvotes": post.get("upvotes"),
+        "downvotes": post.get("downvotes"),
+        "score": post.get("score"),
+        "comment_count": post.get("comment_count", post.get("commentCount")),
+        "created_at": post.get("created_at", post.get("createdAt")),
+        "updated_at": post.get("updated_at", post.get("updatedAt")),
+        "http_status": status,
+    }
+
+
 @router.get("/inbox")
 async def moltbook_inbox(limit: int = 50) -> dict[str, Any]:
     """Read the agent home feed so Moltbook feedback can become research input.
