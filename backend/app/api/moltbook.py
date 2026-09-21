@@ -733,34 +733,43 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
         )
         all_results = query.all()
 
-        # Select the latest research STAGE, not merely the newest timestamp.
-        # v11 ExperimentResult can have a missing/identical created_at on older
-        # database schemas, so timestamp-only ordering can incorrectly return v10.
+        # Select the latest research stage. v11/v11.2 are identified by their
+        # actual result schema; fall back to v10 for older experiments.
         def _result_stage_rank(row: ExperimentResult) -> int:
             metrics = _json_dict(getattr(row, "metrics", None))
             summary = str(getattr(row, "summary", "") or "").lower()
             conclusion = str(getattr(row, "conclusion", "") or "").lower()
             method = metrics.get("method")
-            method_text = json.dumps(method, ensure_ascii=False).lower() if isinstance(method, (dict, list)) else str(method or "").lower()
+            method_text = (
+                json.dumps(method, ensure_ascii=False).lower()
+                if isinstance(method, (dict, list))
+                else str(method or "").lower()
+            )
+            metrics_text = json.dumps(metrics, ensure_ascii=False).lower()
 
-            # v11 sizing signature: baseline_flat + policies + comparison +
-            # entry-time volatility/sizing method.
+            # v11.2 / three-year robustness must take precedence over v11.
+            if (
+                "v11.2" in method_text
+                or "three-year" in method_text
+                or "three_year" in metrics_text
+            ):
+                return 112
+
+            # v11 sizing signature from research_runner_v11.py.
             if (
                 "baseline_flat" in metrics
-                or ("policies" in metrics and "comparison" in metrics and "sizing_context" in json.dumps(metrics.get("experiment_scope", {})).lower())
+                or (
+                    "policies" in metrics
+                    and "comparison" in metrics
+                    and "sizing_context" in json.dumps(
+                        metrics.get("experiment_scope", {}), ensure_ascii=False
+                    ).lower()
+                )
                 or "position-sizing simulation" in summary
                 or "sizing policies simulated" in conclusion
                 or "realized trade p/l" in method_text
             ):
                 return 11
-
-            # v11.2 / three-year robustness, if present.
-            if (
-                "v11.2" in method_text
-                or "three-year" in method_text
-                or "three_year" in json.dumps(metrics, ensure_ascii=False).lower()
-            ):
-                return 112
 
             if _is_v10_result(row):
                 return 10
@@ -770,7 +779,8 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
             all_results,
             key=lambda row: (
                 _result_stage_rank(row),
-                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+                getattr(row, "created_at", None)
+                or datetime.min.replace(tzinfo=timezone.utc),
             ),
         ) if all_results else None
 
@@ -815,34 +825,43 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
         )
         all_results = query.all()
 
-        # Select the latest research STAGE, not merely the newest timestamp.
-        # v11 ExperimentResult can have a missing/identical created_at on older
-        # database schemas, so timestamp-only ordering can incorrectly return v10.
+        # Select the latest research stage. v11/v11.2 are identified by their
+        # actual result schema; fall back to v10 for older experiments.
         def _result_stage_rank(row: ExperimentResult) -> int:
             metrics = _json_dict(getattr(row, "metrics", None))
             summary = str(getattr(row, "summary", "") or "").lower()
             conclusion = str(getattr(row, "conclusion", "") or "").lower()
             method = metrics.get("method")
-            method_text = json.dumps(method, ensure_ascii=False).lower() if isinstance(method, (dict, list)) else str(method or "").lower()
+            method_text = (
+                json.dumps(method, ensure_ascii=False).lower()
+                if isinstance(method, (dict, list))
+                else str(method or "").lower()
+            )
+            metrics_text = json.dumps(metrics, ensure_ascii=False).lower()
 
-            # v11 sizing signature: baseline_flat + policies + comparison +
-            # entry-time volatility/sizing method.
+            # v11.2 / three-year robustness must take precedence over v11.
+            if (
+                "v11.2" in method_text
+                or "three-year" in method_text
+                or "three_year" in metrics_text
+            ):
+                return 112
+
+            # v11 sizing signature from research_runner_v11.py.
             if (
                 "baseline_flat" in metrics
-                or ("policies" in metrics and "comparison" in metrics and "sizing_context" in json.dumps(metrics.get("experiment_scope", {})).lower())
+                or (
+                    "policies" in metrics
+                    and "comparison" in metrics
+                    and "sizing_context" in json.dumps(
+                        metrics.get("experiment_scope", {}), ensure_ascii=False
+                    ).lower()
+                )
                 or "position-sizing simulation" in summary
                 or "sizing policies simulated" in conclusion
                 or "realized trade p/l" in method_text
             ):
                 return 11
-
-            # v11.2 / three-year robustness, if present.
-            if (
-                "v11.2" in method_text
-                or "three-year" in method_text
-                or "three_year" in json.dumps(metrics, ensure_ascii=False).lower()
-            ):
-                return 112
 
             if _is_v10_result(row):
                 return 10
@@ -852,7 +871,8 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
             all_results,
             key=lambda row: (
                 _result_stage_rank(row),
-                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
+                getattr(row, "created_at", None)
+                or datetime.min.replace(tzinfo=timezone.utc),
             ),
         ) if all_results else None
 
