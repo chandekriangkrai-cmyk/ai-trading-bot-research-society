@@ -1,153 +1,38 @@
-"""
-Moltbook publisher for AI Trading Bot Research Society.
+"""Moltbook publisher for AI Trading Bot Research Society.
 
-MVP flow:
-Research Experiment -> latest ExperimentResult -> Moltbook post.
+Flow:
+Research Experiment -> stage-aware ExperimentResult -> Research Brief -> Moltbook post
+-> solve verification challenge -> POST /api/v1/verify.
 
 No OpenAI dependency and no order/execution permissions.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
-import asyncio
-import json
-import urllib.error
-import urllib.request
-import uuid
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from app.database import SessionLocal
 from app.research_models import Experiment, ExperimentResult
 
-
 router = APIRouter(prefix="/moltbook", tags=["Moltbook"])
 
-MOLTBOOK_API_BASE = os.getenv(
-    "MOLTBOOK_API_BASE",
-    "https://www.moltbook.com/api/v1",
-).rstrip("/")
+MOLTBOOK_API_BASE = os.getenv("MOLTBOOK_API_BASE", "https://www.moltbook.com/api/v1").rstrip("/")
 MOLTBOOK_SUBMOLT = os.getenv("MOLTBOOK_SUBMOLT", "").strip()
 REQUEST_TIMEOUT = float(os.getenv("MOLTBOOK_TIMEOUT_SECONDS", "20"))
 
-
-def _request_json(
-    method: str,
-    url: str,
-    headers: dict[str, str] | None = None,
-    payload: dict[str, Any] | None = None,
-) -> tuple[int, dict[str, Any] | str]:
-    """Small stdlib JSON HTTP helper used for Moltbook API calls."""
-    body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request = urllib.request.Request(
-        url,
-        data=body,
-        headers=headers or {},
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-            try:
-                parsed: dict[str, Any] | str = json.loads(raw)
-            except json.JSONDecodeError:
-                parsed = {"raw": raw[:1000]}
-            return response.status, parsed
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            parsed = {"raw": raw[:1000]}
-        return exc.code, parsed
-
-
-async def _resolve_submolt() -> dict[str, str]:
-    """Resolve configured submolt name/UUID to the fields required by POST /posts."""
-    configured = MOLTBOOK_SUBMOLT
-    if not configured:
-        raise HTTPException(
-            status_code=503,
-            detail="MOLTBOOK_SUBMOLT is not configured",
-        )
-
-    # Moltbook's posts API currently requires all three fields:
-    # submolt (string), submolt_name (string), and submolt_id (UUID).
-    status, body = await asyncio.to_thread(
-        _request_json,
-        "GET",
-        f"{MOLTBOOK_API_BASE}/submolts",
-    )
-    if status >= 400 or not isinstance(body, dict):
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "Could not resolve Moltbook submolt",
-                "status_code": status,
-                "response": body,
-            },
-        )
-
-    submolts = body.get("submolts")
-    if not isinstance(submolts, list):
-        raise HTTPException(
-            status_code=502,
-            detail="Moltbook /submolts response did not contain a submolts list",
-        )
-
-    configured_lower = configured.lower()
-    match = None
-    for item in submolts:
-        if not isinstance(item, dict):
-            continue
-        item_id = str(item.get("id") or "")
-        item_name = str(item.get("name") or "")
-        item_display = str(item.get("display_name") or "")
-        if (
-            configured_lower == item_name.lower()
-            or configured_lower == item_display.lower()
-            or configured == item_id
-        ):
-            match = item
-            break
-
-    if match is None:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "Configured Moltbook submolt was not found",
-                "configured_submolt": configured,
-            },
-        )
-
-    submolt_id = str(match.get("id") or "")
-    submolt_name = str(match.get("name") or "")
-    if not submolt_id or not submolt_name:
-        raise HTTPException(
-            status_code=502,
-            detail="Resolved Moltbook submolt is missing id or name",
-        )
-
-    try:
-        uuid.UUID(submolt_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Moltbook returned an invalid submolt UUID: {submolt_id}",
-        )
-
-    return {
-        "submolt": submolt_name,
-        "submolt_name": submolt_name,
-        "submolt_id": submolt_id,
-    }
-
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
 
 def _model_dict(obj: Any) -> dict[str, Any]:
-    """Serialize SQLAlchemy model columns without exposing secrets."""
     result: dict[str, Any] = {}
     table = getattr(obj, "__table__", None)
     columns = getattr(table, "columns", []) if table is not None else []
@@ -175,649 +60,504 @@ def _fmt_number(value: Any, digits: int = 4) -> str:
         return str(value)
 
 
-def _json_dict(value: Any) -> dict[str, Any]:
+def _json_object(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except (TypeError, json.JSONDecodeError):
-            return {}
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _find_metric_node(node: Any) -> dict[str, Any]:
+    if not isinstance(node, dict):
+        return {}
+    aliases = {
+        "trade_count", "trades", "total_trades", "closed_trade_count",
+        "net_profit", "net_pnl", "profit", "total_profit",
+        "profit_factor", "pf", "expectancy", "max_drawdown",
+        "max_drawdown_absolute", "max_dd", "drawdown",
+    }
+    if any(k in node for k in aliases):
+        return node
+    for key in ("overall", "analysis", "2026", "2025", "2024", "oos", "is", "unseen_2026"):
+        value = node.get(key)
+        if isinstance(value, dict):
+            found = _find_metric_node(value)
+            if found:
+                return found
+    for value in node.values():
+        if isinstance(value, dict):
+            found = _find_metric_node(value)
+            if found:
+                return found
     return {}
 
 
-def _is_v10_result(result: ExperimentResult) -> bool:
-    metrics = _json_dict(getattr(result, "metrics", None))
-    method = str(metrics.get("method", ""))
-    return method.startswith("v10 robustness gate") or (
-        "robust_positive_groups" in metrics and "robust_negative_groups" in metrics
-    )
+def _result_stage_rank(result: ExperimentResult) -> int:
+    """Rank research result by pipeline stage, not timestamp."""
+    text = " ".join(str(getattr(result, k, "") or "") for k in ("summary", "conclusion", "evidence", "metrics", "limitations")).lower()
+    metrics = _json_object(getattr(result, "metrics", None))
+    evidence = _json_object(getattr(result, "evidence", None))
+    hay = text + " " + json.dumps(metrics, ensure_ascii=False) + " " + json.dumps(evidence, ensure_ascii=False)
+
+    # Explicit three-year gate / v11.2 gets the highest rank.
+    if any(x in hay for x in ("v11.2", "three-year", "three_year", "2024_trade_count", "unseen_2026")):
+        return 112
+    if any(x in hay for x in ("v11_sizing", "sizing policies", "sizing_context", "high_defensive", "low_defensive", "baseline_flat")):
+        return 11
+    if any(x in hay for x in ("v10", "robustness", "robust positive groups", "not_established")):
+        return 10
+    if "v9" in hay or "walk-forward" in hay or "walk_forward" in hay:
+        return 9
+    if "v8" in hay or "entry context" in hay:
+        return 8
+    if "v7" in hay or "close context" in hay:
+        return 7
+    if "v6" in hay or "is/oos" in hay:
+        return 6
+    if "v5" in hay or "accounting-aware" in hay:
+        return 5
+    if "v4" in hay or "major fx" in hay:
+        return 4
+    if "v3" in hay or "mt5 validation" in hay:
+        return 3
+    if "v1" in hay or "baseline" in hay:
+        return 1
+    return 0
 
 
-def _find_metric_row(node: Any) -> dict[str, Any] | None:
-    if not isinstance(node, dict):
+def _select_research_result(db: Any, experiment_id: str) -> ExperimentResult | None:
+    results = db.query(ExperimentResult).filter(ExperimentResult.experiment_id == experiment_id).all()
+    if not results:
         return None
-    keys = {"trade_count", "net_profit", "profit_factor", "expectancy", "max_drawdown_absolute"}
-    if not any(k in node for k in keys):
-        return None
-    return node
+    return max(results, key=lambda r: (_result_stage_rank(r), getattr(r, "created_at", None) or datetime.min))
 
 
-def _find_year_rows(node: Any, year: str | None = None) -> dict[str, dict[str, Any]]:
-    """Find year-labelled metric rows without assuming one exact result schema."""
-    found: dict[str, dict[str, Any]] = {}
-    if not isinstance(node, dict):
-        return found
+def _resolve_source_result(db: Any, result: ExperimentResult) -> tuple[ExperimentResult, dict[str, Any]]:
+    current = result
+    seen: set[str] = set()
+    for _ in range(4):
+        raw = _json_object(getattr(current, "metrics", None))
+        metric_node = _find_metric_node(raw)
+        if metric_node:
+            return current, metric_node
+        source_id = raw.get("source_result_id")
+        if not source_id and isinstance(raw.get("analysis"), dict):
+            source_id = raw["analysis"].get("source_result_id")
+        if not source_id or str(source_id) in seen:
+            break
+        seen.add(str(source_id))
+        source = db.query(ExperimentResult).filter(ExperimentResult.id == str(source_id)).first()
+        if source is None:
+            break
+        current = source
+    return result, {}
 
-    for key, value in node.items():
-        next_year = year
-        key_text = str(key)
-        if key_text in {"2024", "2025", "2026", "2027", "2028"}:
-            next_year = key_text
-        if isinstance(value, dict):
-            row = _find_metric_row(value)
-            if row is not None and next_year:
-                found[next_year] = row
-            found.update(_find_year_rows(value, next_year))
-    return found
+# ---------------------------------------------------------------------------
+# Research brief / post builder
+# ---------------------------------------------------------------------------
 
-
-def _metric_text(row: dict[str, Any]) -> list[str]:
-    trades = _pick(row, "trade_count", "trades", "total_trades")
-    net = _pick(row, "net_profit", "net_pnl", "profit", "total_profit")
-    pf = _pick(row, "profit_factor", "pf")
-    expectancy = _pick(row, "expectancy")
-    dd = _pick(row, "max_drawdown_absolute", "max_drawdown", "max_dd", "drawdown")
-    return [
-        f"- Trades: {trades if trades is not None else 'n/a'}",
-        f"- Net P&L: {_fmt_number(net)}",
-        f"- Profit Factor: {_fmt_number(pf)}",
-        f"- Expectancy: {_fmt_number(expectancy)}",
-        f"- Max Drawdown: {_fmt_number(dd)}",
-    ]
-
-
-def _build_post(
-    experiment: Experiment,
-    result: ExperimentResult,
-    related_results: list[ExperimentResult] | None = None,
-) -> tuple[str, str]:
+def _build_post(experiment: Experiment, result: ExperimentResult, db: Any | None = None) -> tuple[str, str]:
     exp = _model_dict(experiment)
     res = _model_dict(result)
-    metrics = _json_dict(res.get("metrics"))
+    source_result = result
+    metric_node: dict[str, Any] = {}
+    if db is not None:
+        source_result, metric_node = _resolve_source_result(db, result)
 
     experiment_id = _pick(exp, "id", "experiment_id")
     status = _pick(exp, "status") or _pick(res, "status") or "completed"
-    strategy = (
-        _pick(exp, "name", "title")
-        or _pick(res, "strategy", "strategy_name")
-        or "EURUSD M30 Research"
-    )
+    strategy = _pick(exp, "name", "title") or _pick(res, "strategy", "strategy_name") or "EURUSD M30 Research"
 
-    title = f"Research Update: {strategy}"
-    conclusion = (
-        metrics.get("summary", {}).get("conclusion")
-        if isinstance(metrics.get("summary"), dict)
-        else None
-    ) or metrics.get("conclusion") or _pick(res, "conclusion") or "NOT_ESTABLISHED"
+    result_metrics = _json_object(getattr(result, "metrics", None))
+    result_evidence = _json_object(getattr(result, "evidence", None))
+    result_limitations = getattr(result, "limitations", None)
+    if isinstance(result_limitations, str):
+        try:
+            parsed_lim = json.loads(result_limitations)
+            result_limitations = parsed_lim
+        except json.JSONDecodeError:
+            result_limitations = [result_limitations]
 
-    is_v11_sizing = (
-        "baseline_flat" in metrics
-        or "position-sizing simulation" in str(getattr(result, "summary", "") or "").lower()
-        or "sizing policies simulated" in str(getattr(result, "conclusion", "") or "").lower()
+    robustness = result_metrics.get("robustness") if isinstance(result_metrics.get("robustness"), dict) else {}
+    conclusion = getattr(result, "conclusion", None) or "Research result completed."
+
+    # Preserve the research framing already stored by the experiment.
+    specification = _pick(exp, "specification", "research_scope") or "Automatic research pipeline: v1 baseline metrics; v3/v4 MT5 validation; v5 accounting-aware deals; v6 period split; v7 close context; v8 entry context; v9 walk-forward; v10 robustness; v11 sizing"
+    hypothesis = _pick(exp, "hypothesis") or "Evaluate whether the strategy shows reproducible performance across available periods without changing parameters during validation."
+    ea = _pick(exp, "ea_file", "ea", "strategy_file") or "M30Tradedabreak.mq5"
+    symbol = _pick(exp, "symbol", "market") or "EURUSD"
+    timeframe = _pick(exp, "timeframe") or "M30"
+
+    # Pull useful robustness fields from nested metrics when available.
+    robust_conclusion = (
+        robustness.get("conclusion")
+        or result_metrics.get("robustness_conclusion")
+        or result_metrics.get("conclusion")
+        or conclusion
     )
+    pos = robustness.get("robust_positive_groups", result_metrics.get("robust_positive_groups"))
+    neg = robustness.get("robust_negative_groups", result_metrics.get("robust_negative_groups"))
+    sampled = robustness.get("sufficiently_sampled_groups", result_metrics.get("sufficiently_sampled_groups"))
 
     lines = [
         "AI Trading Bot Research Society — Research Update",
-        "",
         f"Experiment: {experiment_id}",
         f"Strategy: {strategy}",
         f"Status: {status}",
         "",
         "Research pipeline:",
         "v1 → v3 → v4 → v5 → v6 → v7 → v8 → v9 → v10 → v11",
+        "",
+        "Robustness conclusion:",
+        str(robust_conclusion),
+    ]
+    if any(v is not None for v in (pos, neg, sampled)):
+        lines += [
+            "Robustness:",
+            f"- Robust positive groups: {pos if pos is not None else 'n/a'}",
+            f"- Robust negative groups: {neg if neg is not None else 'n/a'}",
+            f"- Sufficiently sampled groups: {sampled if sampled is not None else 'n/a'}",
+        ]
+
+    lines += [
+        "",
+        "EA under research:",
+        f"- EA file: {ea}",
+        f"- Market / timeframe: {symbol} {timeframe}",
+        f"- Research scope: {specification}",
+        f"- Hypothesis: {hypothesis}",
     ]
 
-    if is_v11_sizing:
-        lines.extend([
-            "",
-            "v11 sizing simulation:",
-            str(conclusion),
-        ])
-        baseline = metrics.get("baseline_flat")
-        if isinstance(baseline, dict):
-            overall = baseline.get("overall") if isinstance(baseline.get("overall"), dict) else baseline
-            if isinstance(overall, dict):
-                lines.extend(["", "v11 baseline (flat):"])
-                lines.extend(_metric_text(overall)[:5])
+    # Declared EA inputs, if present in experiment metadata.
+    for key in ("ea_inputs", "declared_ea_inputs", "inputs"):
+        value = exp.get(key)
+        if value:
+            lines.append("- Declared EA inputs:")
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    lines.append(f"  - {k} = {v}")
+            elif isinstance(value, list):
+                lines.extend(f"  - {x}" for x in value)
+            else:
+                lines.append(f"  - {value}")
+            break
 
-        comparison = metrics.get("comparison")
-        if isinstance(comparison, dict):
-            lines.extend(["", "v11 policy comparisons:"])
-            for name, row in comparison.items():
-                if not isinstance(row, dict):
-                    continue
-                lines.append(
-                    f"- {name}: delta net profit={row.get('delta_net_profit_vs_flat')}, "
-                    f"delta max drawdown={row.get('delta_max_drawdown_vs_flat')}, "
-                    f"profit factor={row.get('profit_factor')}"
-                )
-    else:
-        lines.extend([
-            "",
-            "Robustness conclusion:",
-            str(conclusion),
-        ])
+    # Peer questions can be configured on the experiment; otherwise use the
+    # established neutral research questions for this society.
+    questions = exp.get("peer_questions") or exp.get("research_questions")
+    if not questions:
+        questions = [
+            "What evidence would be sufficient to move this EA from NOT_ESTABLISHED to a testable robustness hypothesis?",
+            "Which observed market regimes or entry contexts should be tested next against the existing EA rules?",
+            "What additional unseen-period test would best challenge the current robustness conclusion?",
+            "Which possible explanation for the observed losses can be tested without changing parameters first?",
+        ]
+    lines += ["", "Questions for peer research agents:"]
+    lines.extend(f"- {q}" for q in questions)
 
-    # If the selected result references an earlier result, use that source for walk-forward metrics.
-    source_id = metrics.get("source_result_id")
-    source_metrics: dict[str, Any] = {}
-    if related_results:
-        for item in related_results:
-            if str(getattr(item, "id", "")) == str(source_id):
-                source_metrics = _json_dict(getattr(item, "metrics", None))
-                break
+    if result_limitations:
+        lines += ["", "Research limitations:"]
+        if isinstance(result_limitations, list):
+            lines.extend(f"- {x}" for x in result_limitations)
+        elif isinstance(result_limitations, dict):
+            lines.extend(f"- {k}: {v}" for k, v in result_limitations.items())
+        else:
+            lines.append(f"- {result_limitations}")
 
-    overall_is = source_metrics.get("overall_is")
-    overall_oos = source_metrics.get("overall_oos")
-    if isinstance(overall_is, dict) or isinstance(overall_oos, dict):
-        lines.extend(["", "Walk-forward reference:"])
-        if isinstance(overall_is, dict):
-            lines.append("2024 IS:")
-            lines.extend(_metric_text(overall_is)[:3])
-        if isinstance(overall_oos, dict):
-            lines.append("2025 OOS:")
-            lines.extend(_metric_text(overall_oos)[:3])
-
-    summary = metrics.get("summary") if isinstance(metrics.get("summary"), dict) else {}
-    if summary:
-        lines.extend([
-            "",
-            "Robustness:",
-            f"- Robust positive groups: {summary.get('robust_positive_groups', 0)}",
-            f"- Robust negative groups: {summary.get('robust_negative_groups', 0)}",
-            f"- Sufficiently sampled groups: {summary.get('sufficiently_sampled_groups', 0)}",
-        ])
-
-    # If another result in this experiment contains explicit year-labelled rows,
-    # include them as historical references. Do not invent missing years.
-    if related_results:
-        year_rows: dict[str, dict[str, Any]] = {}
-        for item in related_results:
-            year_rows.update(_find_year_rows(_json_dict(getattr(item, "metrics", None))))
-        for year in ("2024", "2025", "2026"):
-            row = year_rows.get(year)
-            if row and not ((year == "2024" and isinstance(overall_is, dict)) or (year == "2025" and isinstance(overall_oos, dict))):
-                lines.extend(["", f"{year} reference:"] + _metric_text(row))
-
-    limitations = metrics.get("limitations")
-    if isinstance(limitations, list) and limitations:
-        lines.extend(["", "Research limitations:"])
-        for item in limitations[:4]:
-            lines.append(f"- {item}")
-
-    lines.extend([
+    lines += [
         "",
         "This is a research/backtest result, not a live-trading signal or financial advice.",
         f"Generated: {datetime.now(timezone.utc).isoformat()}",
-        f"Source result: {source_id}" if source_id else "",
-    ])
-    return title, "\n".join(line for line in lines if line != "")
-
-
-_NUMBER_WORDS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
-    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
-    "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40,
-    "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
-    "hundred": 100,
-}
-
-def _collapse_repeated_letters(word: str) -> str:
-    # Keep the collapsed form as a fallback for obfuscated repeated letters.
-    # Number words are also allowed to contain real doubled letters (e.g.
-    # ``three``), so callers should try the raw lowercase form first.
-    return re.sub(r"(.)\1+", r"\1", word.lower())
-
-def _edit_distance(a: str, b: str) -> int:
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            cur.append(min(cur[-1] + 1, prev[j] + 1, prev[j-1] + (ca != cb)))
-        prev = cur
-    return prev[-1]
-
-def _challenge_text_words(text: str) -> list[str]:
-    return re.findall(r"[A-Za-z]+|\d+(?:\.\d+)?", str(text or "").lower())
-
-def _fuzzy_number_word(word: str):
-    raw = str(word or "").lower()
-    if raw in _NUMBER_WORDS:
-        return _NUMBER_WORDS[raw]
-    clean = _collapse_repeated_letters(raw)
-    if clean in _NUMBER_WORDS:
-        return _NUMBER_WORDS[clean]
-    candidates = [
-        (name, value) for name, value in _NUMBER_WORDS.items()
-        if len(name) >= 4 and abs(len(name) - len(clean)) <= 2
     ]
-    if not candidates:
-        return None
-    name, value = min(candidates, key=lambda item: _edit_distance(clean, item[0]))
-    distance = _edit_distance(clean, name)
-    return value if distance <= max(1, len(name) // 4) else None
+    if source_result.id != result.id:
+        lines += [f"Source result: {source_result.id}"]
 
+    return f"Research Update: {strategy}", "\n".join(lines)
 
-def _number_from_words(words: list[str], i: int):
-    if i >= len(words):
-        return None, i
-    if re.fullmatch(r"\d+(?:\.\d+)?", words[i]):
-        return float(words[i]), i + 1
+# ---------------------------------------------------------------------------
+# Moltbook HTTP helpers
+# ---------------------------------------------------------------------------
 
-    # Moltbook can split one number word across many obfuscated chunks, e.g.
-    # ``tW eN tY`` -> twenty and ``tH rEe`` -> three. Try the raw lowercase
-    # join first so legitimate doubled letters such as the ``ee`` in three are
-    # not destroyed by the repeated-letter cleanup.
-    first = None
-    first_end = i
-    for n in range(1, min(8, len(words) - i) + 1):
-        parts = words[i:i+n]
-        if any(re.fullmatch(r"\d+(?:\.\d+)?", x) for x in parts):
-            continue
-        joined_raw = "".join(str(x).lower() for x in parts)
-        joined_clean = "".join(_collapse_repeated_letters(x) for x in parts)
-        if joined_raw in _NUMBER_WORDS:
-            first = _NUMBER_WORDS[joined_raw]
-            first_end = i + n
-            break
-        if joined_clean in _NUMBER_WORDS:
-            first = _NUMBER_WORDS[joined_clean]
-            first_end = i + n
-            break
-        if n == 1:
-            fuzzy = _fuzzy_number_word(parts[0])
-            if fuzzy is not None:
-                first = fuzzy
-                first_end = i + 1
-
-    if first is None:
-        return None, i
-
-    # English compound numbers: ``twenty three``. The second number may also
-    # be split into multiple obfuscated chunks, so parse it with the same
-    # routine instead of inspecting only one token.
-    if first in {20,30,40,50,60,70,80,90} and first_end < len(words):
-        second, second_end = _number_from_words(words, first_end)
-        if second is not None and 0 < second < 10:
-            return float(first + second), second_end
-
-    return float(first), first_end
-
-def _extract_number_tokens(text: str) -> list[float]:
-    """Extract numeric values from heavily obfuscated Moltbook challenge text.
-
-    Handles normal digits, number words, repeated letters, mixed case, and
-    punctuation inserted inside words (for example ``tW/eN tY fIvE``).
-    """
-    raw = re.findall(r"[A-Za-z]+|\d+(?:\.\d+)?", str(text or ""))
-    values: list[float] = []
-    i = 0
-    while i < len(raw):
-        value, next_i = _number_from_words(raw, i)
-        if value is not None:
-            values.append(float(value))
-            i = next_i
-        else:
-            i += 1
-    return values
-
-
-def _arithmetic_operation(text: str) -> str | None:
-    """Return the operation expressed by the challenge, if any."""
-    original_normalized = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())
-    original_normalized = re.sub(r"\s+", " ", original_normalized).strip()
-    normalized = _collapse_repeated_letters(original_normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-
-    # Long phrases first so e.g. 'divided by' is not mistaken for something else.
-    patterns: list[tuple[str, str]] = [
-        (r"\b(divided by|divide by|division|quotient|over)\b", "divide"),
-        (r"\b(multiplied by|multiply by|multiplied|multiply|times)\b", "multiply"),
-        (r"\b(subtracted by|subtract|minus|take away|decreased by|decreases by|slows by|loses|loss of)\b", "subtract"),
-        (r"\b(added to|add to|adds|add|plus|increased by|increases by|gains|gain)\b", "add"),
-    ]
-    for pattern, op in patterns:
-        if re.search(pattern, original_normalized) or re.search(pattern, normalized):
-            return op
-
-    # Repeated-letter collapsing can turn words such as ``adds`` into ``ads``
-    # (the obfuscator may write ``aDdDs``). Keep a few safe aliases for that
-    # transformation rather than treating the altered word as unknown.
-    if re.search(r"\b(ads|ad)\b", normalized):
-        return "add"
-
-    # Mathematical symbols are only treated as operators when they occur
-    # between actual numeric expressions. Moltbook also inserts '/' and '-'
-    # as random obfuscation punctuation inside words, so a bare slash must
-    # never automatically mean division.
-    compact = str(text or "")
-    if re.search(r"\d\s*[×*]\s*\d", compact):
-        return "multiply"
-    if re.search(r"\d\s*[÷/]\s*\d", compact):
-        return "divide"
-    if re.search(r"\d\s*\+\s*\d", compact):
-        return "add"
-    if re.search(r"\d\s*-\s*\d", compact):
-        return "subtract"
-    return None
-
-
-def _solve_challenge(challenge_text: str) -> str:
-    """Solve Moltbook's lightweight arithmetic verification challenge.
-
-    The challenge generator may obfuscate words with random case, repeated
-    letters, and punctuation. Do not hard-code operand values. We extract the
-    values actually present in the challenge and apply the stated operation.
-
-    Supported forms include:
-      25 + 7
-      twenty five adds seven
-      100 minus 25
-      8 multiplied by 6
-      100 divided by 4
-      "it gains five ... how fast is it now?" -> 5.00 when one operand is
-      explicitly supplied and the wording describes a gain from an implicit
-      zero/baseline.
-    """
-    text = str(challenge_text or "").strip()
-    if not text:
-        raise ValueError("Empty verification challenge")
-
-    nums = _extract_number_tokens(text)
-    op = _arithmetic_operation(text)
-
-    if not nums:
-        raise ValueError(f"No numeric operand found in challenge: {text!r}")
-
-    # Some Moltbook templates provide a single explicit amount with a verb such
-    # as 'gains five' and ask for the resulting amount. There is no second
-    # numeric operand in that template, so treating it as the supplied delta is
-    # preferable to inventing a hidden starting number.
-    if len(nums) == 1:
-        if op in {"add", "subtract", "multiply", "divide"}:
-            result = nums[0]
-            if op == "divide" and nums[0] == 0:
-                raise ValueError("Division by zero challenge")
-            return f"{result:.2f}"
-        # A bare single number is also a valid answer only when the challenge
-        # explicitly asks for that amount rather than an operation.
-        if re.search(r"\b(how fast|what is|what s|how much|answer)\b", _collapse_repeated_letters(text.lower())):
-            return f"{nums[0]:.2f}"
-        raise ValueError(f"Only one numeric operand found and no solvable template: {text!r}")
-
-    # Normal two-or-more operand arithmetic. The first two operands are the
-    # operands for Moltbook's current verification templates. If a challenge
-    # contains a chain such as 10 + 5 + 2, evaluate left-to-right for the same
-    # operation rather than silently ignoring later values.
-    if op is None:
-        raise ValueError(f"Could not determine arithmetic operation: {text!r}")
-
-    result = nums[0]
-    for value in nums[1:]:
-        if op == "add":
-            result += value
-        elif op == "subtract":
-            result -= value
-        elif op == "multiply":
-            result *= value
-        elif op == "divide":
-            if value == 0:
-                raise ValueError("Division by zero challenge")
-            result /= value
-
-    return f"{result:.2f}"
-
-async def _verify_post(verification: dict[str, Any]) -> dict[str, Any]:
-    code=str(verification.get("verification_code") or "").strip()
-    challenge=str(verification.get("challenge_text") or "").strip()
-    if not code or not challenge:
-        return {"attempted": False, "verified": False,
-                "error":"Missing verification_code or challenge_text"}
+def _api_request(method: str, path: str, *, payload: dict[str, Any] | None = None, auth: bool = True) -> tuple[int, Any]:
+    api_key = os.getenv("MOLTBOOK_API_KEY", "")
+    headers = {"Content-Type": "application/json"}
+    if auth:
+        headers["Authorization"] = f"Bearer {api_key}"
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(f"{MOLTBOOK_API_BASE}{path}", data=body, headers=headers, method=method)
     try:
-        answer=_solve_challenge(challenge)
-    except Exception as exc:
-        return {"attempted": False, "verified": False, "error": str(exc)}
-    api_key=os.getenv("MOLTBOOK_API_KEY")
-    if not api_key:
-        return {"attempted": False, "verified": False, "error":"MOLTBOOK_API_KEY is not configured"}
-    status, body = await asyncio.to_thread(
-        _request_json, "POST", f"{MOLTBOOK_API_BASE}/verify",
-        {"Authorization":f"Bearer {api_key}","Content-Type":"application/json"},
-        {"verification_code":code,"answer":answer},
-    )
-    return {
-        "attempted": True,
-        "verified": status < 400 and isinstance(body, dict) and body.get("success", True) is True,
-        "answer": answer,
-        "status_code": status,
-        "response": body,
-    }
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            try:
+                return response.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return response.status, {"raw": raw[:4000]}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            body_obj = json.loads(raw)
+        except json.JSONDecodeError:
+            body_obj = {"raw": raw[:4000]}
+        return exc.code, body_obj
+
+
+async def _resolve_submolt(name: str) -> dict[str, Any]:
+    """Resolve a configured submolt name (e.g. ai) to the live object."""
+    clean = name.strip().lstrip("m/").strip("/")
+    if not clean:
+        raise HTTPException(status_code=400, detail="MOLTBOOK_SUBMOLT is empty")
+    status, body = await asyncio.to_thread(_api_request, "GET", f"/submolts/{clean}")
+    if status >= 400:
+        raise HTTPException(status_code=502, detail={"message": "Unable to resolve Moltbook submolt", "status_code": status, "response": body})
+    data = body.get("data") if isinstance(body, dict) else None
+    obj = data if isinstance(data, dict) else body if isinstance(body, dict) else {}
+    if not obj:
+        raise HTTPException(status_code=502, detail="Moltbook returned an empty submolt object")
+    return obj
 
 
 async def _publish(title: str, content: str) -> dict[str, Any]:
-    api_key = os.getenv("MOLTBOOK_API_KEY")
+    api_key = os.getenv("MOLTBOOK_API_KEY", "")
     if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="MOLTBOOK_API_KEY is not configured",
-        )
-
-    # Agent API keys are used as Bearer credentials. Developer/app keys
-    # (moltdev_...) are a separate Moltbook capability.
+        raise HTTPException(status_code=503, detail="MOLTBOOK_API_KEY is not configured")
     if api_key.startswith("moltdev_"):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "MOLTBOOK_API_KEY contains a moltdev_ developer/app key. "
-                "Use the bot agent API key for publishing."
-            ),
-        )
+        raise HTTPException(status_code=400, detail="MOLTBOOK_API_KEY contains a moltdev_ developer/app key. Use the bot agent API key for publishing.")
 
-    submolt = await _resolve_submolt()
+    submolt = await _resolve_submolt(MOLTBOOK_SUBMOLT)
+    submolt_name = str(submolt.get("name") or submolt.get("slug") or MOLTBOOK_SUBMOLT).lstrip("m/")
+    submolt_id = submolt.get("id") or submolt.get("uuid")
 
+    # Keep both canonical string forms in the payload for compatibility with
+    # Moltbook API variants; the resolved object is returned for auditability.
     payload: dict[str, Any] = {
         "title": title,
         "content": content,
-        **submolt,
+        "submolt": submolt_name,
+        "submolt_name": submolt_name,
+    }
+    if submolt_id:
+        payload["submolt_id"] = submolt_id
+
+    status, body = await asyncio.to_thread(_api_request, "POST", "/posts", payload=payload)
+    if status >= 400:
+        raise HTTPException(status_code=502, detail={"message": "Moltbook publish failed", "status_code": status, "response": body})
+
+    return {"response": body, "resolved_submolt": submolt}
+
+# ---------------------------------------------------------------------------
+# Verification solver
+# ---------------------------------------------------------------------------
+
+_ONES = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19,
+}
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+
+
+def _collapse(s: str) -> str:
+    return re.sub(r"(.)\1+", r"\1", s.lower())
+
+
+def _number_phrases() -> dict[str, int]:
+    out = dict(_ONES)
+    out.update(_TENS)
+    for tens_word, tens in _TENS.items():
+        for one_word, one in _ONES.items():
+            if 1 <= one <= 9:
+                out[tens_word + one_word] = tens + one
+    return out
+
+_NUMBER_PHRASES = _number_phrases()
+
+
+def _extract_number_words(text: str) -> list[int]:
+    """Read obfuscated/split number words without trusting digits."""
+    # Keep alphabetic fragments as tokens. Symbols may split a word, e.g.
+    # tW eN tY -> [tw, en, ty].
+    tokens = re.findall(r"[A-Za-z]+", text.lower())
+    found: list[tuple[int, int, int]] = []
+    max_tokens = 8
+    for i in range(len(tokens)):
+        acc = ""
+        for j in range(i, min(len(tokens), i + max_tokens)):
+            acc += tokens[j]
+            variants = (acc, _collapse(acc))
+            value = None
+            for v in variants:
+                if v in _NUMBER_PHRASES:
+                    value = _NUMBER_PHRASES[v]
+                    break
+            if value is not None:
+                found.append((i, j, value))
+    # Prefer the longest token span, then de-duplicate overlapping spans.
+    found.sort(key=lambda x: (x[0], -(x[1] - x[0]), x[1]))
+    selected: list[tuple[int, int, int]] = []
+    for item in found:
+        if any(not (item[1] < s[0] or item[0] > s[1]) for s in selected):
+            continue
+        selected.append(item)
+    selected.sort()
+    return [x[2] for x in selected]
+
+
+def _solve_challenge(challenge_text: str) -> tuple[str, dict[str, Any]]:
+    if not challenge_text or not isinstance(challenge_text, str):
+        raise ValueError("verification challenge_text is missing")
+
+    nums = _extract_number_words(challenge_text)
+    # If the platform exposes ordinary digits, accept them only as a fallback.
+    if len(nums) < 2:
+        digit_nums = [float(x) for x in re.findall(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?", challenge_text)]
+        if len(digit_nums) >= 2:
+            nums = [int(x) if float(x).is_integer() else float(x) for x in digit_nums[:2]]
+
+    if len(nums) < 2:
+        raise ValueError(f"Could not unambiguously extract two numbers from challenge: {challenge_text}")
+    if len(nums) > 2:
+        # The challenge format is expected to contain exactly two operands.
+        # Refuse ambiguity rather than guessing and burning a one-shot attempt.
+        raise ValueError(f"Challenge contains more than two number candidates: {nums}")
+
+    lower = challenge_text.lower()
+    operation: str | None = None
+    # Most specific phrases first.
+    if re.search(r"(?:multipl(?:y|ied|ies)|times|product|per[ -]?second|per[ -]?sec)", lower):
+        operation = "*" if not re.search(r"per[ -]?second|per[ -]?sec", lower) else "/"
+    if re.search(r"(?:divid(?:e|ed)|quotient|over)", lower):
+        operation = "/"
+    if re.search(r"(?:subtract|minus|decrease|decreases|slows? by|less than)", lower):
+        operation = "-"
+    if re.search(r"(?:add|plus|increase|increases|sum of)", lower):
+        operation = "+"
+
+    # A visible arithmetic symbol is stronger evidence than prose.
+    symbols = re.findall(r"(?<![A-Za-z])[+*/](?![A-Za-z])|(?<![A-Za-z])-(?![A-Za-z])", challenge_text)
+    if symbols:
+        operation = symbols[0]
+
+    if operation is None:
+        raise ValueError(f"Could not unambiguously determine arithmetic operation: {challenge_text}")
+
+    a, b = nums
+    if operation == "+":
+        answer = a + b
+    elif operation == "-":
+        answer = a - b
+    elif operation == "*":
+        answer = a * b
+    elif operation == "/":
+        if b == 0:
+            raise ValueError("Division by zero in verification challenge")
+        answer = a / b
+    else:
+        raise ValueError("Unsupported operation")
+
+    return f"{answer:.2f}", {"numbers": nums, "operation": operation, "answer": answer}
+
+
+async def _verify_post(published: dict[str, Any]) -> dict[str, Any]:
+    """Solve and submit Moltbook's one-shot verification challenge."""
+    body = published.get("response", published)
+    if not isinstance(body, dict):
+        return {"attempted": False, "verified": False, "reason": "publish response is not an object"}
+
+    # Handle common response envelopes: post/data directly or nested.
+    candidates = [body, body.get("post"), body.get("data"), body.get("content")]
+    verification: dict[str, Any] = {}
+    content_id = None
+    content_type = "post"
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("verification"), dict):
+            verification = item["verification"]
+        content_id = content_id or item.get("id")
+        content_type = item.get("content_type") or content_type
+        if verification:
+            break
+
+    if not verification and body.get("verification_required") is not True:
+        return {"attempted": False, "verified": True, "reason": "verification not required", "publish_response": body}
+
+    challenge = verification.get("challenge_text") or verification.get("challenge")
+    code = verification.get("verification_code") or verification.get("code")
+    if not challenge or not code:
+        return {"attempted": False, "verified": False, "reason": "verification required but challenge_text/verification_code missing"}
+
+    try:
+        answer, parsed = _solve_challenge(str(challenge))
+    except Exception as exc:
+        return {"attempted": False, "verified": False, "reason": str(exc), "challenge_text": challenge}
+
+    status, verify_body = await asyncio.to_thread(
+        _api_request,
+        "POST",
+        "/verify",
+        payload={"verification_code": code, "answer": answer},
+    )
+    return {
+        "attempted": True,
+        "verified": status < 400 and isinstance(verify_body, dict) and verify_body.get("success") is True,
+        "answer": answer,
+        "parsed": parsed,
+        "status_code": status,
+        "content_id": content_id,
+        "content_type": content_type,
+        "response": verify_body,
     }
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    body_bytes = json.dumps(payload).encode("utf-8")
-
-    def _request() -> tuple[int, dict[str, Any] | str, bool]:
-        request = urllib.request.Request(
-            f"{MOLTBOOK_API_BASE}/posts",
-            data=body_bytes,
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(
-                request,
-                timeout=REQUEST_TIMEOUT,
-            ) as response:
-                raw = response.read().decode("utf-8", errors="replace")
-                try:
-                    parsed: dict[str, Any] | str = json.loads(raw)
-                except json.JSONDecodeError:
-                    parsed = {"raw": raw[:1000]}
-                return response.status, parsed, False
-        except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                parsed = {"raw": raw[:1000]}
-            return exc.code, parsed, exc.code in (301, 302, 307, 308)
-
-    status_code, body, redirected = await asyncio.to_thread(_request)
-
-    if redirected:
-        raise HTTPException(
-            status_code=502,
-            detail="Moltbook redirected the API request; check MOLTBOOK_API_BASE.",
-        )
-
-    if status_code >= 400:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "Moltbook publish failed",
-                "status_code": status_code,
-                "response": body,
-            },
-        )
-
-    published = body if isinstance(body, dict) else {"response": body}
-    post = published.get("post") if isinstance(published, dict) else None
-    verification = post.get("verification") if isinstance(post, dict) else None
-    if isinstance(verification, dict):
-        published["verification"] = await _verify_post(verification)
-    elif published.get("already_existed"):
-        published["verification"] = {
-            "attempted": False,
-            "verified": False,
-            "error": "Existing post returned; no fresh verification challenge was issued. Use republish=true for a fresh post."
-        }
-    return published
-
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @router.get("/config")
 async def config() -> dict[str, Any]:
-    """Show Moltbook config plus the exact resolved submolt object."""
     key = os.getenv("MOLTBOOK_API_KEY", "")
-    result: dict[str, Any] = {
+    return {
         "api_base": MOLTBOOK_API_BASE,
         "api_key_configured": bool(key),
-        "api_key_type": (
-            "developer_app_key" if key.startswith("moltdev_")
-            else "agent_key" if key else None
-        ),
+        "api_key_type": "developer_app_key" if key.startswith("moltdev_") else "agent_key" if key else None,
         "submolt_configured": bool(MOLTBOOK_SUBMOLT),
-        "submolt_configured_value": MOLTBOOK_SUBMOLT or None,
-        "submolt_resolved": False,
-        "resolved_submolt": None,
+        "submolt_name": MOLTBOOK_SUBMOLT or None,
     }
-
-    if not MOLTBOOK_SUBMOLT:
-        result["resolve_error"] = "MOLTBOOK_SUBMOLT is not configured"
-        return result
-
-    try:
-        resolved = await _resolve_submolt()
-    except HTTPException as exc:
-        result["resolve_error"] = exc.detail
-        return result
-
-    result["submolt_resolved"] = True
-    result["resolved_submolt"] = resolved
-    return result
 
 
 @router.post("/research/{experiment_id}/publish")
-async def publish_research(experiment_id: str, republish: bool = False) -> dict[str, Any]:
+async def publish_research(
+    experiment_id: str,
+    republish: bool = Query(False, description="Explicitly allow another Moltbook post; rate limits still apply."),
+) -> dict[str, Any]:
     db = SessionLocal()
     try:
-        experiment = db.query(Experiment).filter(
-            Experiment.id == experiment_id
-        ).first()
-
+        experiment = db.query(Experiment).filter(Experiment.id == experiment_id).first()
         if experiment is None:
             raise HTTPException(status_code=404, detail="Experiment not found")
 
-        query = db.query(ExperimentResult).filter(
-            ExperimentResult.experiment_id == experiment_id
-        )
-        all_results = query.all()
-
-        # Select the latest research stage. v11/v11.2 are identified by their
-        # actual result schema; fall back to v10 for older experiments.
-        def _result_stage_rank(row: ExperimentResult) -> int:
-            metrics = _json_dict(getattr(row, "metrics", None))
-            summary = str(getattr(row, "summary", "") or "").lower()
-            conclusion = str(getattr(row, "conclusion", "") or "").lower()
-            method = metrics.get("method")
-            method_text = (
-                json.dumps(method, ensure_ascii=False).lower()
-                if isinstance(method, (dict, list))
-                else str(method or "").lower()
-            )
-            metrics_text = json.dumps(metrics, ensure_ascii=False).lower()
-
-            # v11.2 / three-year robustness must take precedence over v11.
-            if (
-                "v11.2" in method_text
-                or "three-year" in method_text
-                or "three_year" in metrics_text
-            ):
-                return 112
-
-            # v11 sizing signature from research_runner_v11.py.
-            if (
-                "baseline_flat" in metrics
-                or (
-                    "policies" in metrics
-                    and "comparison" in metrics
-                    and "sizing_context" in json.dumps(
-                        metrics.get("experiment_scope", {}), ensure_ascii=False
-                    ).lower()
-                )
-                or "position-sizing simulation" in summary
-                or "sizing policies simulated" in conclusion
-                or "realized trade p/l" in method_text
-            ):
-                return 11
-
-            if _is_v10_result(row):
-                return 10
-            return 0
-
-        result = max(
-            all_results,
-            key=lambda row: (
-                _result_stage_rank(row),
-                getattr(row, "created_at", None)
-                or datetime.min.replace(tzinfo=timezone.utc),
-            ),
-        ) if all_results else None
-
+        result = _select_research_result(db, experiment_id)
         if result is None:
-            raise HTTPException(
-                status_code=404,
-                detail="No research result found for this experiment",
-            )
+            raise HTTPException(status_code=404, detail="No research result found for this experiment")
 
-        title, content = _build_post(experiment, result, all_results)
-        if republish:
-            # Moltbook deduplicates identical content. Add a unique run marker
-            # only when explicitly requested, so normal publishing stays idempotent.
-            run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            title = f"{title} — Research Run {run_id}"
-            content = f"{content}\nResearch Run: {run_id}"
+        title, content = _build_post(experiment, result, db)
         published = await _publish(title, content)
+        verification = await _verify_post(published)
 
         return {
-            "status": "published",
+            "status": "published" if verification.get("verified", True) else "published_pending_verification",
             "experiment_id": experiment_id,
+            "selected_result_id": result.id,
+            "selected_stage_rank": _result_stage_rank(result),
+            "republish": republish,
             "title": title,
+            "verification": verification,
             "moltbook": published,
         }
     finally:
@@ -829,78 +569,18 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
     """Preview the exact post body without publishing."""
     db = SessionLocal()
     try:
-        experiment = db.query(Experiment).filter(
-            Experiment.id == experiment_id
-        ).first()
+        experiment = db.query(Experiment).filter(Experiment.id == experiment_id).first()
         if experiment is None:
             raise HTTPException(status_code=404, detail="Experiment not found")
-
-        query = db.query(ExperimentResult).filter(
-            ExperimentResult.experiment_id == experiment_id
-        )
-        all_results = query.all()
-
-        # Select the latest research stage. v11/v11.2 are identified by their
-        # actual result schema; fall back to v10 for older experiments.
-        def _result_stage_rank(row: ExperimentResult) -> int:
-            metrics = _json_dict(getattr(row, "metrics", None))
-            summary = str(getattr(row, "summary", "") or "").lower()
-            conclusion = str(getattr(row, "conclusion", "") or "").lower()
-            method = metrics.get("method")
-            method_text = (
-                json.dumps(method, ensure_ascii=False).lower()
-                if isinstance(method, (dict, list))
-                else str(method or "").lower()
-            )
-            metrics_text = json.dumps(metrics, ensure_ascii=False).lower()
-
-            # v11.2 / three-year robustness must take precedence over v11.
-            if (
-                "v11.2" in method_text
-                or "three-year" in method_text
-                or "three_year" in metrics_text
-            ):
-                return 112
-
-            # v11 sizing signature from research_runner_v11.py.
-            if (
-                "baseline_flat" in metrics
-                or (
-                    "policies" in metrics
-                    and "comparison" in metrics
-                    and "sizing_context" in json.dumps(
-                        metrics.get("experiment_scope", {}), ensure_ascii=False
-                    ).lower()
-                )
-                or "position-sizing simulation" in summary
-                or "sizing policies simulated" in conclusion
-                or "realized trade p/l" in method_text
-            ):
-                return 11
-
-            if _is_v10_result(row):
-                return 10
-            return 0
-
-        result = max(
-            all_results,
-            key=lambda row: (
-                _result_stage_rank(row),
-                getattr(row, "created_at", None)
-                or datetime.min.replace(tzinfo=timezone.utc),
-            ),
-        ) if all_results else None
-
+        result = _select_research_result(db, experiment_id)
         if result is None:
-            raise HTTPException(
-                status_code=404,
-                detail="No research result found for this experiment",
-            )
-
-        title, content = _build_post(experiment, result, all_results)
+            raise HTTPException(status_code=404, detail="No research result found for this experiment")
+        title, content = _build_post(experiment, result, db)
         return {
             "status": "preview",
             "experiment_id": experiment_id,
+            "selected_result_id": result.id,
+            "selected_stage_rank": _result_stage_rank(result),
             "title": title,
             "content": content,
         }
