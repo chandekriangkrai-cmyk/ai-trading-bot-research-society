@@ -276,7 +276,7 @@ def _build_post(
         str(conclusion),
     ]
 
-    # Prefer the v10 result's source (v9) for the walk-forward headline metrics.
+    # If the selected result references an earlier result, use that source for walk-forward metrics.
     source_id = metrics.get("source_result_id")
     source_metrics: dict[str, Any] = {}
     if related_results:
@@ -699,25 +699,13 @@ async def publish_research(experiment_id: str, republish: bool = False) -> dict[
         )
         all_results = query.all()
 
-        # Prefer the newest research stage (v11/v11.2) when available.
-        # Fall back to v10 only when no newer result exists.
-        def _result_stage(row: ExperimentResult) -> int:
-            metrics = _json_dict(getattr(row, "metrics", None))
-            method = str(metrics.get("method", "")).lower()
-            if "v11.2" in method or "three-year robustness" in method:
-                return 112
-            if "v11" in method or "sizing" in method:
-                return 11
-            if _is_v10_result(row):
-                return 10
-            return 0
-
+        # Select the newest ExperimentResult for Moltbook.
+        # The research runner creates results in stage order, so the newest
+        # result represents the latest completed stage (v11/v11.2 when present).
+        # Do not prefer v10 here: v10 is an intermediate robustness result.
         result = max(
             all_results,
-            key=lambda row: (
-                _result_stage(row),
-                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
-            ),
+            key=lambda row: getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
         ) if all_results else None
 
         if result is None:
@@ -761,25 +749,13 @@ async def preview_research(experiment_id: str) -> dict[str, Any]:
         )
         all_results = query.all()
 
-        # Prefer the newest research stage (v11/v11.2) when available.
-        # Fall back to v10 only when no newer result exists.
-        def _result_stage(row: ExperimentResult) -> int:
-            metrics = _json_dict(getattr(row, "metrics", None))
-            method = str(metrics.get("method", "")).lower()
-            if "v11.2" in method or "three-year robustness" in method:
-                return 112
-            if "v11" in method or "sizing" in method:
-                return 11
-            if _is_v10_result(row):
-                return 10
-            return 0
-
+        # Select the newest ExperimentResult for Moltbook.
+        # The research runner creates results in stage order, so the newest
+        # result represents the latest completed stage (v11/v11.2 when present).
+        # Do not prefer v10 here: v10 is an intermediate robustness result.
         result = max(
             all_results,
-            key=lambda row: (
-                _result_stage(row),
-                getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
-            ),
+            key=lambda row: getattr(row, "created_at", None) or datetime.min.replace(tzinfo=timezone.utc),
         ) if all_results else None
 
         if result is None:
