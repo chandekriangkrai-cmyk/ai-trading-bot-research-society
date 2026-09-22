@@ -271,7 +271,7 @@ async def publish(title,content,republish=False):
     if republish:
         run_id=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         payload["title"]=f"{title} — Research Run {run_id}"
-        payload["content"]=f"{content}\\nResearch Run: {run_id}"
+        payload["content"]=f"{content}\nResearch Run: {run_id}"
     status,body=await asyncio.to_thread(req,"POST",f"{BASE}/posts",{"Authorization":f"Bearer {key}","Content-Type":"application/json"},payload)
     if status>=400: raise HTTPException(502,{"message":"Moltbook publish failed","status_code":status,"response":body})
     return body
@@ -313,18 +313,44 @@ def _extract_number_words(text: str) -> list[int]:
     selected.sort()
     return [x[2] for x in selected]
 
+_OP_PATTERNS=[
+    (r"(?:multipl(?:y|ied|ies)|times|product)","*"),
+    (r"(?:per[ -]?second|per[ -]?sec)","/"),
+    (r"(?:divid(?:e|ed)|quotient|over)","/"),
+    (r"(?:subtract|minus|decrease|decreases|slows? by|less than)","-"),
+    (r"(?:add|plus|increase|increases|sum of|gain|gains)","+"),
+]
+
+def _fmt_answer(x):
+    """Render the numeric answer without a spurious '.00' on whole numbers.
+
+    Division always yields a float in Python even for evenly-divisible
+    inputs (12/2 -> 6.0). If Moltbook compares the submitted answer as an
+    exact string, sending '6.00' instead of '6' can fail verification --
+    and since verification is one-shot per post, that failure is permanent.
+    """
+    if isinstance(x, float) and x.is_integer():
+        return str(int(x))
+    if isinstance(x, int):
+        return str(x)
+    return f"{x:.2f}"
+
 def _solve_challenge(challenge_text: str):
     nums=_extract_number_words(challenge_text)
     if len(nums)<2:
         digits=[float(x) for x in re.findall(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?",challenge_text)]
         if len(digits)>=2: nums=[int(x) if float(x).is_integer() else x for x in digits[:2]]
     if len(nums)!=2: raise ValueError(f"Could not unambiguously extract two numbers from challenge: {challenge_text}")
-    lower=challenge_text.lower(); operation=None
-    if re.search(r"(?:multipl(?:y|ied|ies)|times|product)",lower): operation="*"
-    if re.search(r"(?:per[ -]?second|per[ -]?sec)",lower): operation="/"
-    if re.search(r"(?:divid(?:e|ed)|quotient|over)",lower): operation="/"
-    if re.search(r"(?:subtract|minus|decrease|decreases|slows? by|less than)",lower): operation="-"
-    if re.search(r"(?:add|plus|increase|increases|sum of|gain|gains)",lower): operation="+"
+    lower=challenge_text.lower(); collapsed=_collapse(challenge_text); operation=None
+    for pattern,op in _OP_PATTERNS:
+        # Check the literal text first, then the de-obfuscated (case-duplication
+        # collapsed) form: Moltbook challenges can garble the operation word the
+        # same way they garble numbers (e.g. "<GaAiInSs>" decodes to "gains").
+        # Checking only `lower` here was the reason auto-verify silently failed
+        # ("Could not unambiguously determine arithmetic operation") whenever a
+        # challenge obfuscated the operation word instead of (or as well as)
+        # the numbers.
+        if re.search(pattern,lower) or re.search(pattern,collapsed): operation=op
     symbols=re.findall(r"(?<![A-Za-z])[+*/](?![A-Za-z])|(?<![A-Za-z])-(?![A-Za-z])",challenge_text)
     if symbols: operation=symbols[0]
     if operation is None: raise ValueError("Could not unambiguously determine arithmetic operation")
@@ -335,7 +361,7 @@ def _solve_challenge(challenge_text: str):
     elif operation=="/":
         if b==0: raise ValueError("Division by zero")
         answer=a/b
-    return f"{answer:.2f}",{"numbers":nums,"operation":operation,"answer":answer}
+    return _fmt_answer(answer),{"numbers":nums,"operation":operation,"answer":answer}
 
 async def _verify_post(published):
     body=published.get("post",published) if isinstance(published,dict) else {}
@@ -384,7 +410,32 @@ async def publish_manual_verify(experiment_id:str, republish:bool=Query(False)):
     e,r=load_result(experiment_id); title,content=build_post(e,r); out=await publish(title,content,republish=republish)
     post=out.get("post") if isinstance(out,dict) and isinstance(out.get("post"),dict) else out
     verification=post.get("verification") if isinstance(post,dict) else None
-    return {"status":"published_pending_verification","experiment_id":experiment_id,"title":post.get("title") or title,"post_id":post.get("id") if isinstance(post,dict) else out.get("id"),"verification_question":(verification or {}).get("challenge_text") if isinstance(verification,dict) else post.get("verification_question") if isinstance(post,dict) else None,"verification_code":(verification or {}).get("verification_code") if isinstance(verification,dict) else post.get("verification_code") if isinstance(post,dict) else None,"moltbook":out}
+    challenge=(verification or {}).get("challenge_text") or (verification or {}).get("challenge") or (post.get("verification_question") if isinstance(post,dict) else None)
+    verification_code=(verification or {}).get("verification_code") or (verification or {}).get("code") or (post.get("verification_code") if isinstance(post,dict) else None)
+    # Try the same auto-solver used by /publish, but only to SUGGEST an
+    # answer here -- never submit it. Verification is one-shot per post
+    # (a wrong submission to /post/{post_id}/verify fails permanently), so
+    # this exists purely so a human doesn't have to decode the obfuscated
+    # challenge text by hand before their one real attempt.
+    suggested_answer=None; solver_note=None
+    if challenge:
+        try:
+            suggested_answer,parsed=_solve_challenge(str(challenge))
+            solver_note=f"auto-solver read this as: {parsed['numbers'][0]} {parsed['operation']} {parsed['numbers'][1]} = {suggested_answer}"
+        except Exception as exc:
+            solver_note=f"auto-solver could not parse this challenge on its own: {exc}"
+    return {
+        "status":"published_pending_verification",
+        "experiment_id":experiment_id,
+        "title":post.get("title") or title,
+        "post_id":post.get("id") if isinstance(post,dict) else out.get("id"),
+        "verification_question":challenge,
+        "verification_code":verification_code,
+        "suggested_answer":suggested_answer,
+        "solver_note":solver_note,
+        "warning":"Moltbook verification is one-shot per post: submitting a wrong answer to POST /moltbook/post/{post_id}/verify fails permanently for this post (you would need to republish to get a new challenge). Double-check suggested_answer against verification_question yourself before submitting -- do not trust it blindly.",
+        "moltbook":out,
+    }
 
 @router.post("/post/{post_id}/verify")
 async def verify_post(post_id:str,payload:dict[str,Any]):
