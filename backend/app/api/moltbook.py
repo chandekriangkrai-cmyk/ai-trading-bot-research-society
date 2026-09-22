@@ -313,101 +313,130 @@ async def publish(title,content,republish=False):
 # ---------------------------------------------------------------------------
 _ONES = {"zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10,"eleven":11,"twelve":12,"thirteen":13,"fourteen":14,"fifteen":15,"sixteen":16,"seventeen":17,"eighteen":18,"nineteen":19}
 _TENS = {"twenty":20,"thirty":30,"forty":40,"fifty":50,"sixty":60,"seventy":70,"eighty":80,"ninety":90}
+_NUMBER_PHRASES = dict(_ONES)
+_NUMBER_PHRASES.update(_TENS)
+for _tw,_tv in _TENS.items():
+    for _ow,_ov in _ONES.items():
+        if 1 <= _ov <= 9:
+            _NUMBER_PHRASES[f"{_tw} {_ow}"] = _tv + _ov
 
-def _collapse(s: str) -> str:
-    return re.sub(r"(.)\1+", r"\1", s.lower())
 
-def _number_phrases() -> dict[str,int]:
-    out=dict(_ONES); out.update(_TENS)
-    for tw,tv in _TENS.items():
-        for ow,ov in _ONES.items():
-            if 1 <= ov <= 9: out[tw+ow]=tv+ov
-    return out
-_NUMBER_PHRASES=_number_phrases()
+def _obfuscated_word_pattern(word: str) -> str:
+    """Match a word even when Moltbook inserts punctuation and repeats letters."""
+    return "".join(re.escape(ch) + r"+[^A-Za-z]*" for ch in word)
+
+
+def _obfuscated_phrase_pattern(phrase: str) -> str:
+    parts = phrase.split()
+    return r"[^A-Za-z]*".join(_obfuscated_word_pattern(part) for part in parts)
+
 
 def _extract_number_words(text: str) -> list[int]:
-    tokens=re.findall(r"[A-Za-z]+", text.lower())
-    found=[]
-    for i in range(len(tokens)):
-        acc=""
-        for j in range(i,min(len(tokens),i+8)):
-            acc+=tokens[j]
-            for v in (acc,_collapse(acc)):
-                if v in _NUMBER_PHRASES:
-                    found.append((i,j,_NUMBER_PHRASES[v])); break
-    found.sort(key=lambda x:(x[0],-(x[1]-x[0]),x[1]))
+    """Extract exactly the numeric phrases from lobster-speak challenges.
+
+    Moltbook obfuscates by alternating case, repeating letters, and inserting
+    punctuation/whitespace inside words (e.g. tW/eNnTy T hRrEe). Matching the
+    known number vocabulary directly is much safer than trying to normalize
+    the whole sentence, which can merge unrelated words.
+    """
+    matches=[]
+    for phrase,value in sorted(_NUMBER_PHRASES.items(), key=lambda kv: (-len(kv[0]), kv[0])):
+        m=re.search(_obfuscated_phrase_pattern(phrase), text, re.IGNORECASE)
+        if m:
+            matches.append((m.start(),m.end(),value,phrase))
+    matches.sort(key=lambda x:(x[0],-(x[1]-x[0])))
     selected=[]
-    for item in found:
-        if any(not(item[1]<a[0] or item[0]>a[1]) for a in selected): continue
+    for item in matches:
+        if any(not(item[1] <= a[0] or item[0] >= a[1]) for a in selected):
+            continue
         selected.append(item)
-    selected.sort()
+    selected.sort(key=lambda x:x[0])
     return [x[2] for x in selected]
 
-_OP_PATTERNS=[
-    (r"(?:multipl(?:y|ied|ies)|times|product)","*",False),
-    (r"(?:per[ -]?second|per[ -]?sec)","/",False),
-    (r"(?:divid(?:e|ed)|quotient|over)","/",False),
-    # Order-sensitive phrasings: "6 less than 10" and "subtract 6 from 10" both
-    # mean 10 - 6, even though the numbers are extracted in the order 6, 10.
-    # Treating every "-" phrasing as nums[0]-nums[1] silently answered these
-    # backwards (e.g. -4 instead of 4) -- a wrong answer that fails Moltbook's
-    # one-shot verification permanently for that post.
-    (r"subtract\b.*?\bfrom\b","-",True),
-    (r"less than","-",True),
-    (r"(?:subtract|minus|decrease|decreases|slows? by)","-",False),
-    (r"(?:add|plus|increase|increases|sum of|gain|gains)","+",False),
+
+_OP_PHRASES = [
+    # Prefer explicit arithmetic language over unit words such as "per second".
+    ("subtract from", "-", True, 100),
+    ("less than", "-", True, 100),
+    ("multiplied by", "*", False, 100),
+    ("multiply", "*", False, 100),
+    ("times", "*", False, 100),
+    ("product", "*", False, 100),
+    ("divided by", "/", False, 100),
+    ("divide by", "/", False, 100),
+    ("quotient", "/", False, 100),
+    ("subtract", "-", False, 100),
+    ("minus", "-", False, 100),
+    ("decrease", "-", False, 100),
+    ("decreases", "-", False, 100),
+    ("slows by", "-", False, 100),
+    ("add", "+", False, 100),
+    ("plus", "+", False, 110),
+    ("increase", "+", False, 100),
+    ("increases", "+", False, 100),
+    ("sum of", "+", False, 110),
+    ("total", "+", False, 90),
 ]
 
-def _fmt_answer(x):
-    """Render the numeric answer without a spurious '.00' on whole numbers.
 
-    Division always yields a float in Python even for evenly-divisible
-    inputs (12/2 -> 6.0). If Moltbook compares the submitted answer as an
-    exact string, sending '6.00' instead of '6' can fail verification --
-    and since verification is one-shot per post, that failure is permanent.
-    """
-    if isinstance(x, float) and x.is_integer():
-        return str(int(x))
-    if isinstance(x, int):
-        return str(x)
-    return f"{x:.2f}"
+def _find_operation(text: str):
+    candidates=[]
+    for phrase,op,reverse,priority in _OP_PHRASES:
+        m=re.search(_obfuscated_phrase_pattern(phrase),text,re.IGNORECASE)
+        if m:
+            candidates.append((priority,m.start(),op,reverse,phrase))
+    # A literal '+' or '*' is highly reliable. '/' is commonly just junk
+    # inserted into lobster-speak (e.g. "tW/eNnTy"), so only use it when no
+    # textual arithmetic operator was found. '-' is similarly ambiguous.
+    plus=re.search(r"\+",text)
+    star=re.search(r"\*",text)
+    if plus:
+        candidates.append((130,plus.start(),"+",False,"symbol +"))
+    if star:
+        candidates.append((130,star.start(),"*",False,"symbol *"))
+    if candidates:
+        candidates.sort(key=lambda x:(-x[0],x[1]))
+        _,_,op,reverse,phrase=candidates[0]
+        return op,reverse,phrase
+    slash=re.search(r"(?<![A-Za-z])/",text)
+    if slash:
+        return "/",False,"symbol /"
+    minus=re.search(r"(?<![A-Za-z])-(?![A-Za-z])",text)
+    if minus:
+        return "-",False,"symbol -"
+    return None
+
+
+def _fmt_answer(x):
+    # Moltbook's current verification instructions require exactly two decimal
+    # places (e.g. 37.00), so never submit a bare integer such as "37".
+    return f"{float(x):.2f}"
+
 
 def _solve_challenge(challenge_text: str):
-    nums=_extract_number_words(challenge_text)
+    nums=_extract_number_words(str(challenge_text))
     if len(nums)<2:
-        digits=[float(x) for x in re.findall(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?",challenge_text)]
-        if len(digits)>=2: nums=[int(x) if float(x).is_integer() else x for x in digits[:2]]
-    if len(nums)!=2: raise ValueError(f"Could not unambiguously extract two numbers from challenge: {challenge_text}")
-    lower=challenge_text.lower(); collapsed=_collapse(challenge_text)
-    operation=None; reverse=False; best_pos=None
-    for pattern,op,rev in _OP_PATTERNS:
-        # Check the literal text first, then the de-obfuscated (case-duplication
-        # collapsed) form: Moltbook challenges can garble the operation word the
-        # same way they garble numbers (e.g. "<GaAiInSs>" decodes to "gains").
-        # Checking only `lower` here was the reason auto-verify silently failed
-        # ("Could not unambiguously determine arithmetic operation") whenever a
-        # challenge obfuscated the operation word instead of (or as well as)
-        # the numbers.
-        # Also: take whichever matching pattern appears EARLIEST in the text
-        # rather than whichever is last in this list -- a challenge that
-        # happens to contain two operation-ish words should be read the way a
-        # person reads it, left to right, not by our list's arbitrary order.
-        for text in (lower,collapsed):
-            m=re.search(pattern,text)
-            if m and (best_pos is None or m.start()<best_pos):
-                best_pos=m.start(); operation=op; reverse=rev
-    symbols=re.findall(r"(?<![A-Za-z])[+*/](?![A-Za-z])|(?<![A-Za-z])-(?![A-Za-z])",challenge_text)
-    if symbols: operation=symbols[0]; reverse=False
-    if operation is None: raise ValueError("Could not unambiguously determine arithmetic operation")
+        digits=[float(x) for x in re.findall(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?",str(challenge_text))]
+        if len(digits)>=2:
+            nums=[int(x) if float(x).is_integer() else x for x in digits[:2]]
+    if len(nums)!=2:
+        raise ValueError(f"Could not unambiguously extract two numbers from challenge: {challenge_text}")
+    op_info=_find_operation(str(challenge_text))
+    if not op_info:
+        raise ValueError(f"Could not unambiguously determine arithmetic operation: {challenge_text}")
+    operation,reverse,phrase=op_info
     a,b=nums
-    if reverse: a,b=b,a
+    if reverse:
+        a,b=b,a
     if operation=="+": answer=a+b
     elif operation=="-": answer=a-b
     elif operation=="*": answer=a*b
     elif operation=="/":
         if b==0: raise ValueError("Division by zero")
         answer=a/b
-    return _fmt_answer(answer),{"numbers":nums,"operation":operation,"reversed":reverse,"answer":answer}
+    else:
+        raise ValueError(f"Unsupported arithmetic operation: {operation}")
+    return _fmt_answer(answer),{"numbers":nums,"operation":operation,"reversed":reverse,"answer":answer,"operation_phrase":phrase}
 
 async def _verify_post(published):
     body=published.get("post",published) if isinstance(published,dict) else {}
@@ -431,7 +460,7 @@ async def _verify_post(published):
     payload={"answer":answer}
     if code is not None: payload["verification_code"]=code
     key=os.getenv("MOLTBOOK_API_KEY","")
-    status,res=await asyncio.to_thread(req,"POST",f"{BASE}/posts/{post_id}/verify",{"Authorization":f"Bearer {key}","Content-Type":"application/json"},payload)
+    status,res=await asyncio.to_thread(req,"POST",f"{BASE}/verify",{"Authorization":f"Bearer {key}","Content-Type":"application/json"},payload)
     return {"attempted":True,"verified":status<400 and isinstance(res,dict) and res.get("success") is True,"answer":answer,"parsed":parsed,"status_code":status,"post_id":post_id,"response":res}
 
 @router.get("/config")
@@ -502,8 +531,9 @@ async def verify_post(post_id:str,payload:dict[str,Any]):
     key=os.getenv("MOLTBOOK_API_KEY","")
     if not key: raise HTTPException(503,"MOLTBOOK_API_KEY is not configured")
     if "answer" not in payload: raise HTTPException(400,"Provide the verification answer")
-    body={"answer":payload["answer"]}
-    if payload.get("verification_code") is not None: body["verification_code"]=payload["verification_code"]
-    status,res=await asyncio.to_thread(req,"POST",f"{BASE}/posts/{post_id}/verify",{"Authorization":f"Bearer {key}","Content-Type":"application/json"},body)
+    body={"answer":str(payload["answer"])}
+    if not payload.get("verification_code"): raise HTTPException(400,"Provide verification_code from the Moltbook verification object")
+    body["verification_code"]=str(payload["verification_code"])
+    status,res=await asyncio.to_thread(req,"POST",f"{BASE}/verify",{"Authorization":f"Bearer {key}","Content-Type":"application/json"},body)
     if status>=400: raise HTTPException(502,{"message":"Moltbook verification failed","status_code":status,"response":res})
     return {"status":"verified","post_id":post_id,"response":res}
