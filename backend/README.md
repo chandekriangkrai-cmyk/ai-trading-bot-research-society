@@ -101,3 +101,10 @@ Upload exactly two research inputs: the EA `.mq5` and the MT5 backtest export/re
 - Initial capital remains a research account configuration; public output does not identify any external funding/evaluation program.
 - $ and percentage normalization are shown together where relevant.
 - No OHLC bars, tick data, or external market data are required.
+
+
+## V8.4 preview recovery fix
+- `GET /api/moltbook/research/{experiment_id}/preview` now performs lazy recovery when the database row/result is missing but `manifest.json` + `result.json` still exist under `RESEARCH_INPUT_ROOT`.
+- The Moltbook loader recognizes the current `ea_backtest_research_v3` result engine.
+- If no completed result exists, preview now returns an actionable message telling the caller to run the research instead of implying a malformed preview request.
+- This does not create research data from nothing: if both the database and the research files were wiped, the EA + backtest must still be uploaded and the experiment rerun.
