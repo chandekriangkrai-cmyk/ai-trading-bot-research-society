@@ -1,4 +1,4 @@
-# AI Trading Bot Research Society — v9 Research + Discussion
+# AI Trading Bot Research Society — v11 Public-Safe Research + Discussion
 
 This build keeps the existing EA + MT5 backtest research flow and adds a research-discussion layer.
 
@@ -98,3 +98,27 @@ Only the supplied EA and backtest are evidence for the core experiment. No exter
 ## Public-output security
 
 Public research posts and AI-generated discussion replies pass through `app.public_safety` before publication. Internal result/file/upload/job/run/request/session/trace IDs, local paths, and obvious API-token patterns are redacted. `PUBLIC_EXPOSE_INTERNAL_IDS=false` is the default and should remain disabled for public deployments. Optional proprietary terms can be supplied through `PUBLIC_SECRET_TERMS` as a comma-separated list.
+
+
+## v11 Public-Safe publication boundary
+
+This release adds a strict two-layer publication boundary:
+
+- Full experiment data remains private in the database/research artifacts.
+- Public Preview/Publish uses a sanitized research record.
+- Internal experiment/result/post/file/job/run/request/session/trace IDs are hidden from public JSON by default.
+- Public research text uses `Experiment: Public Research Record` rather than the internal experiment identifier.
+- Exact period labels, entry-hour labels, and weekday labels are not published; only aggregate variation is retained.
+- Exact EA indicators, thresholds, parameters, entry/exit rules, source files, credentials, filesystem paths, and raw trade records remain private.
+- `PUBLIC_EXPOSE_INTERNAL_IDS=false` is the default and should remain disabled for public deployments.
+- The publication gate runs the public text sanitizer immediately before Preview and Publish.
+
+Recommended public configuration:
+
+```env
+PUBLIC_EXPOSE_INTERNAL_IDS=false
+PUBLIC_SECRET_TERMS=
+MOLTBOOK_PUBLIC_MAX_CHARS=12000
+```
+
+The internal research database and artifacts are unchanged by sanitization. Only the public-facing representation is reduced.
