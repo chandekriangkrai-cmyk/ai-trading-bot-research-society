@@ -321,6 +321,44 @@ def code_behavior_alignment(ea,trades):
         "alignment_note":"This layer reports observable structural alignment only. It does not pretend to know which internal boolean condition triggered each trade unless the backtest exposes that evidence."
     }
 
+
+
+def permutation_direction_test(trades, iterations=4000):
+    """Permutation test for BUY-vs-SELL mean profit difference.
+
+    This is intentionally framed as an association test under exchangeability;
+    it is not a causal test and does not account for time-series dependence.
+    """
+    import random
+    buy=[t["profit"] for t in trades if "buy" in t["side"]]
+    sell=[t["profit"] for t in trades if "sell" in t["side"]]
+    if len(buy)<MIN_GROUP_N or len(sell)<MIN_GROUP_N:
+        return None
+    observed=statistics.mean(buy)-statistics.mean(sell)
+    values=buy+sell; n_buy=len(buy); rng=random.Random(73129); extreme=0
+    for _ in range(iterations):
+        shuffled=values[:] ; rng.shuffle(shuffled)
+        d=statistics.mean(shuffled[:n_buy])-statistics.mean(shuffled[n_buy:])
+        if abs(d)>=abs(observed): extreme+=1
+    p=(extreme+1)/(iterations+1)
+    return {"observed_mean_profit_difference_buy_minus_sell":round(observed,6),"permutation_iterations":iterations,"two_sided_p_value":round(p,5),"method_note":"Permutation association test assuming exchangeability; serial dependence, multiple testing and market regime effects are not controlled."}
+
+def bootstrap_mean_ci(values, iterations=3000, seed=91827):
+    if len(values)<2: return None
+    import random
+    rng=random.Random(seed); n=len(values); means=[]
+    for _ in range(iterations):
+        sample=[values[rng.randrange(n)] for _ in range(n)]
+        means.append(statistics.mean(sample))
+    means.sort(); lo=means[max(0,int(.025*len(means))-1)]; hi=means[min(len(means)-1,int(.975*len(means)))]
+    return [round(lo,6),round(hi,6)]
+
+def chronological_split_stats(trades):
+    ordered=sorted(trades,key=lambda x:x["entry_time"]); n=len(ordered)
+    if n<2*MIN_GROUP_N: return None
+    mid=n//2; a=stats(ordered[:mid]); b=stats(ordered[mid:])
+    return {"first_half":a,"second_half":b,"expectancy_change":round(b["avg_profit"]-a["avg_profit"],6),"profit_factor_change":None if a["profit_factor"] is None or b["profit_factor"] is None else round(b["profit_factor"]-a["profit_factor"],4)}
+
 def analyze(ea_source, trades):
     ea=parse_ea(ea_source); findings=[]; insuff=[]; hypotheses=[]
     def hypothesis(topic, statement, evidence, missing, alternatives=None):
@@ -336,6 +374,8 @@ def analyze(ea_source, trades):
         })
     overall=stats(trades)
     overall.update(equity_drawdown(trades))
+    all_profits=[t["profit"] for t in trades]
+    overall["expectancy_bootstrap_95ci"] = bootstrap_mean_ci(all_profits) if len(all_profits)>=MIN_GROUP_N else None
     # Profit-distribution structure: distinguish positive expectancy from a high win rate.
     if overall["wins"] >= MIN_GROUP_N and overall["losses"] >= MIN_GROUP_N:
         findings.append({
@@ -370,6 +410,9 @@ def analyze(ea_source, trades):
             "evidence":{"tail_sensitivity":tail_rows},
             "interpretation":"This diagnostic tests whether the headline result is heavily dependent on a small number of extreme winners. It does not estimate future performance and should be interpreted together with the full trade distribution."
         })
+        # Research hypothesis is intentionally about distributional dependence, not future returns.
+        if overall.get("net_profit") is not None:
+            hypothesis("tail_dependence", "The observed profitability may depend materially on a relatively small upper tail of winning trades; this should be tested by progressively trimming extreme winners and repeating the analysis on later periods.", {"tail_sensitivity":tail_rows}, ["independent backtest repetitions","trade-level exit reasons"], ["ordinary payoff asymmetry","sampling variation","period composition"])
 
     # Directional comparison
     groups=defaultdict(list)
@@ -380,6 +423,9 @@ def analyze(ea_source, trades):
         a,b=stats(groups["BUY"]),stats(groups["SELL"])
         a.update(equity_drawdown(groups["BUY"])); b.update(equity_drawdown(groups["SELL"]))
         findings.append({"status":"OBSERVED_PATTERN","question":"Does realized performance differ by trade direction?","evidence":{"BUY":a,"SELL":b},"interpretation":"Observed association in supplied backtest; no market-cause claim."})
+        perm=permutation_direction_test(trades)
+        if perm:
+            findings.append({"status":"STATISTICAL_DIAGNOSTIC","question":"Is the BUY-vs-SELL mean-profit difference unusual under shuffled direction labels?","evidence":perm,"interpretation":"The permutation result quantifies how unusual the observed directional mean-profit gap is under an exchangeability benchmark. It is not evidence that direction causes performance, and it does not correct for serial dependence or multiple comparisons."})
     else: insuff.append({"topic":"BUY_vs_SELL","reason":"Each comparison group needs at least the minimum sample.","groups":{k:len(v) for k,v in groups.items()}})
     if groups.get("BUY") and groups.get("SELL") and (len(groups["BUY"]) < MIN_GROUP_N or len(groups["SELL"]) < MIN_GROUP_N):
         hypothesis("BUY_vs_SELL", "The observed directional difference may be real, but the current sample is too thin to treat it as stable.", {"BUY_n":len(groups["BUY"]),"SELL_n":len(groups["SELL"])}, ["larger repeated samples"], ["sample imbalance","time-period concentration"])
@@ -387,6 +433,9 @@ def analyze(ea_source, trades):
         aa,bb=stats(groups["BUY"]),stats(groups["SELL"])
         if aa["win_rate"] is not None and bb["win_rate"] is not None and abs(aa["win_rate"]-bb["win_rate"]) >= 0.10:
             hypothesis("directional_sensitivity", "The EA may have directional sensitivity because realized BUY and SELL outcomes differ materially in this backtest.", {"BUY":aa,"SELL":bb}, ["trade-level entry-condition values"], ["period mix","different trade counts","execution effects"])
+    split=chronological_split_stats(trades)
+    if split:
+        findings.append({"status":"ROBUSTNESS_DIAGNOSTIC","question":"Does the payoff structure survive a chronological out-of-sample-style split?","evidence":split,"interpretation":"A chronological split is a stronger stability check than selecting the best month because it asks whether the same broad behavior appears in later trades. It is still not an independent external validation and does not control for regime changes."})
     # Monthly stability / change
     months=defaultdict(list)
     for t in trades: months[t["entry_time"].strftime("%Y-%m")].append(t)
@@ -437,6 +486,11 @@ def analyze(ea_source, trades):
     if trades and ea.get("exit_logic_tokens"):
         hypothesis("exit_behavior", "Observed holding-time and profit differences may partly reflect the EA's exit logic because exit mechanisms are present in the source code.", {"ea_exit_logic_tokens":ea.get("exit_logic_tokens"),"trade_count":len(trades)}, ["per-trade exit reason / exact branch"], ["entry quality","trade duration","execution conditions"])
 
+    # Give the research layer a transparent priority signal. This is not a score of the EA;
+    # it only helps the publication layer foreground findings that are more diagnostic/robust.
+    priority_order={"STATISTICAL_DIAGNOSTIC":3,"ROBUSTNESS_DIAGNOSTIC":3,"OBSERVED_PATTERN":1}
+    for f in findings:
+        f["research_priority"]=priority_order.get(f.get("status"),1)
     return {
         "scope":["EA .mq5","Backtest"],
         "account_context":{"initial_capital":INITIAL_CAPITAL,"currency":"USD","context_label":"research account configuration"},
