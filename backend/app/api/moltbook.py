@@ -314,11 +314,18 @@ def _extract_number_words(text: str) -> list[int]:
     return [x[2] for x in selected]
 
 _OP_PATTERNS=[
-    (r"(?:multipl(?:y|ied|ies)|times|product)","*"),
-    (r"(?:per[ -]?second|per[ -]?sec)","/"),
-    (r"(?:divid(?:e|ed)|quotient|over)","/"),
-    (r"(?:subtract|minus|decrease|decreases|slows? by|less than)","-"),
-    (r"(?:add|plus|increase|increases|sum of|gain|gains)","+"),
+    (r"(?:multipl(?:y|ied|ies)|times|product)","*",False),
+    (r"(?:per[ -]?second|per[ -]?sec)","/",False),
+    (r"(?:divid(?:e|ed)|quotient|over)","/",False),
+    # Order-sensitive phrasings: "6 less than 10" and "subtract 6 from 10" both
+    # mean 10 - 6, even though the numbers are extracted in the order 6, 10.
+    # Treating every "-" phrasing as nums[0]-nums[1] silently answered these
+    # backwards (e.g. -4 instead of 4) -- a wrong answer that fails Moltbook's
+    # one-shot verification permanently for that post.
+    (r"subtract\b.*?\bfrom\b","-",True),
+    (r"less than","-",True),
+    (r"(?:subtract|minus|decrease|decreases|slows? by)","-",False),
+    (r"(?:add|plus|increase|increases|sum of|gain|gains)","+",False),
 ]
 
 def _fmt_answer(x):
@@ -341,8 +348,9 @@ def _solve_challenge(challenge_text: str):
         digits=[float(x) for x in re.findall(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?",challenge_text)]
         if len(digits)>=2: nums=[int(x) if float(x).is_integer() else x for x in digits[:2]]
     if len(nums)!=2: raise ValueError(f"Could not unambiguously extract two numbers from challenge: {challenge_text}")
-    lower=challenge_text.lower(); collapsed=_collapse(challenge_text); operation=None
-    for pattern,op in _OP_PATTERNS:
+    lower=challenge_text.lower(); collapsed=_collapse(challenge_text)
+    operation=None; reverse=False; best_pos=None
+    for pattern,op,rev in _OP_PATTERNS:
         # Check the literal text first, then the de-obfuscated (case-duplication
         # collapsed) form: Moltbook challenges can garble the operation word the
         # same way they garble numbers (e.g. "<GaAiInSs>" decodes to "gains").
@@ -350,18 +358,26 @@ def _solve_challenge(challenge_text: str):
         # ("Could not unambiguously determine arithmetic operation") whenever a
         # challenge obfuscated the operation word instead of (or as well as)
         # the numbers.
-        if re.search(pattern,lower) or re.search(pattern,collapsed): operation=op
+        # Also: take whichever matching pattern appears EARLIEST in the text
+        # rather than whichever is last in this list -- a challenge that
+        # happens to contain two operation-ish words should be read the way a
+        # person reads it, left to right, not by our list's arbitrary order.
+        for text in (lower,collapsed):
+            m=re.search(pattern,text)
+            if m and (best_pos is None or m.start()<best_pos):
+                best_pos=m.start(); operation=op; reverse=rev
     symbols=re.findall(r"(?<![A-Za-z])[+*/](?![A-Za-z])|(?<![A-Za-z])-(?![A-Za-z])",challenge_text)
-    if symbols: operation=symbols[0]
+    if symbols: operation=symbols[0]; reverse=False
     if operation is None: raise ValueError("Could not unambiguously determine arithmetic operation")
     a,b=nums
+    if reverse: a,b=b,a
     if operation=="+": answer=a+b
     elif operation=="-": answer=a-b
     elif operation=="*": answer=a*b
     elif operation=="/":
         if b==0: raise ValueError("Division by zero")
         answer=a/b
-    return _fmt_answer(answer),{"numbers":nums,"operation":operation,"answer":answer}
+    return _fmt_answer(answer),{"numbers":nums,"operation":operation,"reversed":reverse,"answer":answer}
 
 async def _verify_post(published):
     body=published.get("post",published) if isinstance(published,dict) else {}
