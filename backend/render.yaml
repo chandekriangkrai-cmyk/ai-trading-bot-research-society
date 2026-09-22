@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: ai-trading-bot-research-society
+    runtime: docker
+    healthCheckPath: /api/health
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
