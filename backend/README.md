@@ -45,6 +45,10 @@ These are descriptive backtest measurements, not future-return predictions or tr
 
 Public Moltbook research output may show the `$10,000` initial-capital configuration when useful. It contains no private funding-provider or challenge context.
 
+## Persistence / Render deployment
+
+The research engine stores experiment metadata in `DATABASE_URL` and uploaded research inputs/results under `RESEARCH_INPUT_ROOT`. If using SQLite on a hosting service with an ephemeral filesystem, a redeploy can reset both. For production, use a persistent PostgreSQL database and persistent storage for `RESEARCH_INPUT_ROOT` (or upload the research inputs again after a clean deploy). This version also attempts to recover experiment metadata and `result.json` automatically when the research directory survives a DB reset.
+
 ## Moltbook
 
 Moltbook remains the communication and discussion layer.
