@@ -376,6 +376,80 @@ def analyze(ea_source, trades):
         "evidence_policy":{"min_group_n":MIN_GROUP_N,"causality":"not claimed","lookahead":"No external market data is introduced; analysis is limited to fields actually present in EA/backtest.","capital_normalization":"Dollar results are additionally normalized to the configured initial capital; this does not imply future return."}
     }
 
+def _read_manifest(folder):
+    """Read a research manifest if one exists; tolerate old manifests."""
+    try:
+        p = folder / "manifest.json"
+        if p.is_file():
+            data = json.loads(p.read_text("utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def recover_experiment(db, eid):
+    """Re-create DB metadata when the research files survived a DB reset/redeploy.
+
+    SQLite on ephemeral hosting can be recreated while the uploaded research
+    directory is still present. Recovery is deliberately conservative: it only
+    acts when both required research inputs exist.
+    """
+    folder = ROOT / eid
+    if not (folder / "ea.mq5").is_file() or not (folder / "backtest").is_file():
+        return None
+    manifest = _read_manifest(folder)
+    ea_name = manifest.get("ea_filename") or "ea.mq5"
+    symbol = manifest.get("symbol") or "UNKNOWN"
+    timeframe = manifest.get("timeframe") or "UNKNOWN"
+    return make_experiment(db, eid, str(symbol), str(timeframe), str(ea_name))
+
+
+def recover_research_state():
+    """Recover experiment metadata/results from the research directory at boot."""
+    ROOT.mkdir(parents=True, exist_ok=True)
+    db = SessionLocal()
+    recovered = 0
+    try:
+        for folder in ROOT.iterdir():
+            if not folder.is_dir():
+                continue
+            eid = folder.name
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", eid):
+                continue
+            e = db.query(Experiment).filter(Experiment.id == eid).first()
+            if e is None:
+                e = recover_experiment(db, eid)
+                if e is not None:
+                    recovered += 1
+            result_file = folder / "result.json"
+            if e is not None and result_file.is_file():
+                existing = db.query(ExperimentResult).filter(ExperimentResult.experiment_id == eid).first()
+                if existing is None:
+                    try:
+                        result = json.loads(result_file.read_text("utf-8"))
+                        r = ExperimentResult(
+                            id=str(uuid4()),
+                            experiment_id=eid,
+                            summary="EA + Backtest evidence research",
+                            metrics=json.dumps(result, ensure_ascii=False, default=str),
+                            evidence=json.dumps({"finding_count": len(result.get("analysis", {}).get("findings", []))}, ensure_ascii=False),
+                            limitations=json.dumps(result.get("limitations", []), ensure_ascii=False),
+                            conclusion="Evidence-backed observations from supplied EA/backtest only; no market-causal claim or trading recommendation.",
+                        )
+                        db.add(r)
+                        e.status = "completed"
+                        e.completed_at = now()
+                        recovered += 1
+                    except Exception:
+                        # A corrupt result.json must not prevent the API from booting.
+                        pass
+        db.commit()
+    finally:
+        db.close()
+    return recovered
+
+
 def make_experiment(db,eid,symbol,timeframe,ea_name):
     e=db.query(Experiment).filter(Experiment.id==eid).first()
     if e:return e
@@ -417,6 +491,9 @@ def _run_job(eid):
         if analysis["findings"]==[]: limitations.append("No evidence-backed pattern was established; absence of a finding is not evidence that no relationship exists.")
         result={"engine":"ea_backtest_research_v3","status":"completed","experiment_id":eid,"input_lineage":{"sources":["ea.mq5","backtest"],"explicitly_excluded":["OHLC bars","all ticks","external market data"]},"data_quality":{"raw_backtest_rows":len(rows),"reconstructed_trades":len(trades),"initial_capital":INITIAL_CAPITAL},"analysis":analysis,"limitations":limitations,"generated_at":now().isoformat()}
         r=ExperimentResult(id=str(uuid4()),experiment_id=e.id,summary="EA + Backtest evidence research",metrics=json.dumps(result,ensure_ascii=False,default=str),evidence=json.dumps({"finding_count":len(analysis["findings"])},ensure_ascii=False),limitations=json.dumps(limitations,ensure_ascii=False),conclusion="Evidence-backed observations from supplied EA/backtest only; no market-causal claim or trading recommendation.")
+        # Keep a filesystem copy so DB metadata can be reconstructed after an
+        # accidental SQLite reset/redeploy when the research directory survives.
+        (folder / "result.json").write_text(json.dumps(result,ensure_ascii=False,default=str),encoding="utf-8")
         db.add(r);e.status="completed";e.completed_at=now();db.commit()
     except Exception as ex:
         e=db.query(Experiment).filter(Experiment.id==eid).first()
@@ -431,7 +508,7 @@ async def upload_data(experiment_id:str=Form(None),symbol:str=Form(""),timeframe
     if not backtest_file.filename or not backtest_file.filename.lower().endswith(allowed):raise HTTPException(400,"backtest_file must be CSV/HTML/XML/ZIP")
     eid=safe_id(experiment_id) if experiment_id else str(uuid4()); folder=ROOT/eid;folder.mkdir(parents=True,exist_ok=True);_delete_unused(folder)
     ea=await save_upload(ea_file,folder/"ea.mq5");bt=await save_upload(backtest_file,folder/"backtest")
-    manifest={"ea_filename":ea[0],"backtest_filename":bt[0],"sizes_bytes":{"ea":ea[1],"backtest":bt[1]},"excluded_inputs":["bars","ticks","external_market_data"]}
+    manifest={"ea_filename":ea[0],"backtest_filename":bt[0],"symbol":symbol,"timeframe":timeframe,"sizes_bytes":{"ea":ea[1],"backtest":bt[1]},"excluded_inputs":["bars","ticks","external_market_data"]}
     (folder/"manifest.json").write_text(json.dumps(manifest,ensure_ascii=False),encoding="utf-8")
     db=SessionLocal()
     try:
@@ -444,8 +521,17 @@ def get_research(experiment_id:str):
     eid=safe_id(experiment_id);db=SessionLocal()
     try:
         e=db.query(Experiment).filter(Experiment.id==eid).first()
+        if not e:
+            e=recover_experiment(db,eid)
         if not e:raise HTTPException(404,"Experiment not found")
         r=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).order_by(ExperimentResult.created_at.desc()).first()
+        if not r and (ROOT/eid/"result.json").is_file():
+            try:
+                result=json.loads((ROOT/eid/"result.json").read_text("utf-8"))
+                r=ExperimentResult(id=str(uuid4()),experiment_id=eid,summary="EA + Backtest evidence research",metrics=json.dumps(result,ensure_ascii=False,default=str),evidence=json.dumps({"finding_count":len(result.get("analysis",{}).get("findings",[]))},ensure_ascii=False),limitations=json.dumps(result.get("limitations",[]),ensure_ascii=False),conclusion="Evidence-backed observations from supplied EA/backtest only; no market-causal claim or trading recommendation.")
+                db.add(r);e.status="completed";e.completed_at=now();db.commit()
+            except Exception:
+                pass
         return {"experiment_id":eid,"status":e.status,"symbol":e.symbol,"timeframe":e.timeframe,"result":json.loads(r.metrics) if r else None,"result_id":r.id if r else None}
     finally:db.close()
 
@@ -456,6 +542,8 @@ def run_research(experiment_id:str,background_tasks:BackgroundTasks):
     db=SessionLocal()
     try:
         e=db.query(Experiment).filter(Experiment.id==eid).first()
+        if not e:
+            e=recover_experiment(db,eid)
         if not e:raise HTTPException(404,"Experiment not found")
         if e.status=="running":return {"experiment_id":eid,"status":"running"}
         e.status="queued";db.commit()

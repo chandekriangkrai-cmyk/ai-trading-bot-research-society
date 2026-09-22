@@ -10,6 +10,9 @@ from app import unified_research
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    # Recover research metadata/results when the SQLite DB was reset but the
+    # research input directory survived the deployment/restart.
+    unified_research.recover_research_state()
     yield
 
 app=FastAPI(title=settings.app_name,version="3.0.0",description="Unified EA + MT5 Backtest Research Engine",lifespan=lifespan)
