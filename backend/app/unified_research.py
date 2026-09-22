@@ -541,11 +541,19 @@ def recover_research_state():
     finally: db.close()
 
 @router.post("/data/upload",summary="Upload EA .mq5 + MT5 Backtest only")
-async def upload_data(experiment_id:str=Form(None),symbol:str=Form(""),timeframe:str=Form(""),ea_file:UploadFile=File(...),backtest_file:UploadFile=File(...)):
+async def upload_data(experiment_id:str=Form("random"),symbol:str=Form(""),timeframe:str=Form(""),ea_file:UploadFile=File(...),backtest_file:UploadFile=File(...)):
     if not ea_file.filename or not ea_file.filename.lower().endswith(".mq5"):raise HTTPException(400,"ea_file must be .mq5")
     allowed=(".csv",".html",".htm",".xml",".zip")
     if not backtest_file.filename or not backtest_file.filename.lower().endswith(allowed):raise HTTPException(400,"backtest_file must be CSV/HTML/XML/ZIP")
-    eid=safe_id(experiment_id) if experiment_id else str(uuid4()); folder=ROOT/eid;folder.mkdir(parents=True,exist_ok=True);_delete_unused(folder)
+    # Experiment IDs can now be generated automatically. In Swagger, leave the
+    # field as the default `random`, or enter `random`/`auto`/`new` explicitly.
+    # UUID4 is used because the DB schema stores experiment IDs as String(36).
+    raw_id=str(experiment_id or "").strip()
+    if raw_id.lower() in {"", "random", "auto", "new", "uuid", "uuid4"}:
+        eid=str(uuid4())
+    else:
+        eid=safe_id(raw_id)
+    folder=ROOT/eid;folder.mkdir(parents=True,exist_ok=True);_delete_unused(folder)
     ea=await save_upload(ea_file,folder/"ea.mq5");bt=await save_upload(backtest_file,folder/"backtest")
     # symbol/timeframe/ea filename are persisted here too (not just in the DB row) so that
     # recover_research_state() can rebuild the Experiment row if the database is ever reset
