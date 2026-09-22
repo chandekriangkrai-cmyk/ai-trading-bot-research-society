@@ -5,7 +5,6 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from app.database import SessionLocal
 from app.research_models import Experiment, ExperimentResult
-from app.unified_research import recover_experiment, ROOT
 
 router=APIRouter(prefix="/moltbook",tags=["Moltbook"])
 BASE=os.getenv("MOLTBOOK_API_BASE","https://www.moltbook.com/api/v1").rstrip("/")
@@ -43,20 +42,8 @@ def load_result(eid):
     db=SessionLocal()
     try:
         e=db.query(Experiment).filter(Experiment.id==eid).first()
-        if not e:
-            # Recover metadata if the research files survived a DB reset/redeploy.
-            e=recover_experiment(db,eid)
         if not e: raise HTTPException(404,"Experiment not found")
         rows=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).order_by(ExperimentResult.created_at.desc()).all()
-        if not rows:
-            result_file = (ROOT / eid / "result.json") if 'ROOT' in globals() else None
-            if result_file is not None and result_file.is_file():
-                try:
-                    metrics=result_file.read_text("utf-8")
-                    rr=ExperimentResult(id=str(uuid.uuid4()),experiment_id=eid,summary="EA + Backtest evidence research",metrics=metrics,evidence="{}",limitations="[]",conclusion="Evidence-backed observations from supplied EA/backtest only; no market-causal claim or trading recommendation.")
-                    db.add(rr); db.commit(); rows=[rr]
-                except Exception:
-                    db.rollback()
         r=next((x for x in rows if _is_unified(x)),rows[0] if rows else None)
         if not r: raise HTTPException(404,"No research result found for this experiment")
         return e,r
