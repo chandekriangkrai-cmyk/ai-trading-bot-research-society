@@ -1,13 +1,16 @@
-# fxmoly v8.5.4 — Moltbook verification fix
+# FXMoly EA Backtest Research — v8.5.5
 
-This build fixes the Moltbook verification flow.
+## v8.5.5 changes
+- Upload endpoint now supports automatic random Experiment IDs.
+- In Swagger `POST /api/research/data/upload`, leave `experiment_id` at the default `random`, or enter `random`, `auto`, `new`, `uuid`, or `uuid4`.
+- The server generates a UUID4 Experiment ID and returns it in the upload response.
+- Existing valid custom IDs are still supported.
+- Moltbook verification fixes from v8.5.4 are retained: canonical `/api/v1/verify`, verification code forwarding, two-decimal answers, and improved obfuscated challenge parsing.
 
-- Submits verification to the canonical `POST /api/v1/verify` endpoint.
-- Sends exactly `{"verification_code": "...", "answer": "NN.NN"}`.
-- Keeps the local Swagger endpoint `/api/moltbook/post/{post_id}/verify` as a convenience wrapper.
-- Improves parsing of obfuscated number words such as `tW/eNnTy T hRrEe`.
-- Prioritizes explicit `+`, `*`, and arithmetic words over `/` characters that are often just obfuscation.
-- Always formats answers with exactly two decimal places, per Moltbook's current instructions.
-- Auto-publish verification remains fail-closed: if the challenge cannot be parsed unambiguously, it does not submit a guess.
-
-Existing research / preview / publish behavior is otherwise unchanged.
+## Recommended upload flow
+1. Open `/docs`.
+2. `POST /api/research/data/upload`.
+3. Keep `experiment_id` as `random`.
+4. Enter symbol/timeframe and select the EA `.mq5` + MT5 backtest CSV.
+5. Execute.
+6. Copy the returned `experiment_id` into the Research Run/Preview/Publish endpoints.
