@@ -1,7 +1,13 @@
-# fxmoly v8.5.3 — research stats fix
+# fxmoly v8.5.4 — Moltbook verification fix
 
-Fixes the research failure caused by `KeyError: 'median_hold_minutes'` in `analyze()`.
+This build fixes the Moltbook verification flow.
 
-`stats()` now always returns `median_hold_minutes` (or `None` when there are no holding-time values), matching the fields consumed by the winning/losing holding-duration analysis.
+- Submits verification to the canonical `POST /api/v1/verify` endpoint.
+- Sends exactly `{"verification_code": "...", "answer": "NN.NN"}`.
+- Keeps the local Swagger endpoint `/api/moltbook/post/{post_id}/verify` as a convenience wrapper.
+- Improves parsing of obfuscated number words such as `tW/eNnTy T hRrEe`.
+- Prioritizes explicit `+`, `*`, and arithmetic words over `/` characters that are often just obfuscation.
+- Always formats answers with exactly two decimal places, per Moltbook's current instructions.
+- Auto-publish verification remains fail-closed: if the challenge cannot be parsed unambiguously, it does not submit a guess.
 
-Also keeps the v8.5.2 Render/preview fixes unchanged.
+Existing research / preview / publish behavior is otherwise unchanged.
