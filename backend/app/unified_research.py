@@ -272,7 +272,8 @@ def stats(items):
         "avg_profit_pct_initial_capital":round((net/n/INITIAL_CAPITAL)*100,6) if n and INITIAL_CAPITAL else None,
         "median_profit":round(statistics.median([x["profit"] for x in items]),8) if items else None,
         "profit_factor":round(gross_win/gross_loss,4) if gross_loss else None,
-        "avg_hold_minutes":round(statistics.mean(hold),2) if hold else None
+        "avg_hold_minutes":round(statistics.mean(hold),2) if hold else None,
+        "median_hold_minutes":round(statistics.median(hold),2) if hold else None
     }
 
 def equity_drawdown(items):
