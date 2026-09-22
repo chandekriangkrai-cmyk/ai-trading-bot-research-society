@@ -73,6 +73,48 @@ def _drop_degenerate_win_rate(d):
         return d
     return {k: v for k, v in d.items() if k not in ("win_rate", "win_rate_95ci")}
 
+def _is_degenerate_group(x):
+    """True when a stats dict is an outcome-carved (all-win or all-loss)
+    subgroup, so its win_rate is tautological (1.0 or 0.0) by construction
+    rather than a real performance signal."""
+    if not isinstance(x, dict):
+        return False
+    n, wins, losses = x.get("n"), x.get("wins"), x.get("losses")
+    if isinstance(n, (int, float)) and n:
+        if isinstance(wins, (int, float)) and wins == n:
+            return True
+        if isinstance(losses, (int, float)) and losses == n:
+            return True
+    return x.get("win_rate") in (0, 0.0, 1, 1.0)
+
+def _scrub_evidence(ev):
+    """Recursively strip win_rate / win_rate_95ci from any degenerate
+    (all-win or all-loss) subgroup found anywhere in an evidence tree.
+
+    Stored research results can come from different versions of the
+    analysis engine (older experiments keep whatever shape was computed
+    at the time), so this does not assume any particular evidence layout
+    the way the shape-specific branches below do — it is a safety net
+    that applies regardless of which engine version wrote the data.
+    """
+    if isinstance(ev, dict):
+        cleaned = {k: _scrub_evidence(v) for k, v in ev.items()}
+        if _is_degenerate_group(cleaned):
+            cleaned = _drop_degenerate_win_rate(cleaned)
+        return cleaned
+    if isinstance(ev, list):
+        return [_scrub_evidence(x) for x in ev]
+    return ev
+
+def _fmt_hold_duration(win_n, win_hold, loss_n, loss_hold):
+    """Human-readable holding-duration comparison, replacing the raw
+    outcome-conditioned WIN/LOSS stat blocks (see _is_degenerate_group)."""
+    parts=[f"Winning trades: n={win_n}, avg hold={win_hold} min",
+           f"Losing trades: n={loss_n}, avg hold={loss_hold} min"]
+    if isinstance(win_hold,(int,float)) and isinstance(loss_hold,(int,float)):
+        parts.append(f"Difference: {win_hold-loss_hold:+.1f} min")
+    return " | ".join(parts)
+
 def _fmt_money_pct(ev):
     """Create a compact, auditable public evidence representation.
 
@@ -82,6 +124,21 @@ def _fmt_money_pct(ev):
     """
     if not isinstance(ev, dict):
         return str(ev)[:800]
+    ev=_scrub_evidence(ev)
+    # Holding-duration comparison: outcome-conditioned by construction, so
+    # render it as a plain comparison rather than dumping the WIN/LOSS stat
+    # blocks (which would otherwise show a tautological win_rate of 1.0/0.0).
+    # Handles both the current engine's "winning_trades"/"losing_trades"
+    # shape and older stored results that still embed full "WIN"/"LOSS" blocks.
+    if "winning_trades" in ev and "losing_trades" in ev:
+        w,l=ev.get("winning_trades") or {},ev.get("losing_trades") or {}
+        return _fmt_hold_duration(w.get("n"),w.get("avg_hold_minutes"),l.get("n"),l.get("avg_hold_minutes"))
+    if "WIN" in ev and "LOSS" in ev and isinstance(ev.get("WIN"),dict) and isinstance(ev.get("LOSS"),dict):
+        w,l=ev["WIN"],ev["LOSS"]
+        return _fmt_hold_duration(
+            w.get("n"), w.get("avg_hold_minutes", ev.get("WIN_avg_hold_minutes")),
+            l.get("n"), l.get("avg_hold_minutes", ev.get("LOSS_avg_hold_minutes")),
+        )
     if "BUY" in ev and "SELL" in ev:
         out={}
         for side in ("BUY","SELL"):
