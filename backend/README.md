@@ -7,6 +7,33 @@ This version preserves the working Moltbook workflow and focuses research strict
 
 No OHLC bars, all-tick data, or external market data are required or used.
 
+## Persistence on Render (important — read this if `preview`/`publish` ever 404s)
+
+By default this app stores everything on local disk inside the container:
+a SQLite file (`DATABASE_URL`) and the uploaded EA/backtest folder
+(`RESEARCH_INPUT_ROOT`). **Render's default web service filesystem is not
+persistent** — every redeploy or restart wipes it, which deletes experiments
+that previously completed and makes `GET /api/research/{id}` and
+`GET /api/moltbook/research/{id}/preview` return `404 Experiment not found`
+even though nothing is wrong with the request itself.
+
+To fix this properly:
+
+1. In the Render dashboard, add a **Disk** to this service (e.g. 1 GB, mount
+   path `/var/data`).
+2. Set these environment variables on the service:
+   - `DATABASE_URL=sqlite:////var/data/research.db`
+   - `RESEARCH_INPUT_ROOT=/var/data/research_inputs`
+3. Redeploy.
+
+As defense in depth, startup also runs `recover_research_state()`, which
+rebuilds the database rows from the files under `RESEARCH_INPUT_ROOT` if the
+database was reset but that folder itself survived (only possible once a
+persistent disk is attached). It cannot recover an experiment whose files
+were also lost — that experiment must be re-uploaded via
+`POST /api/research/data/upload` and re-run via
+`POST /api/research/{experiment_id}/run`.
+
 ## Research design
 
 The engine separates:
