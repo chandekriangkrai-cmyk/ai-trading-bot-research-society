@@ -10,9 +10,6 @@ from app import unified_research
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
-    # Recover Experiment/ExperimentResult rows from disk if the DB was reset but
-    # RESEARCH_INPUT_ROOT survived (see unified_research.recover_research_state).
-    unified_research.recover_research_state()
     yield
 
 app=FastAPI(title=settings.app_name,version="3.0.0",description="Unified EA + MT5 Backtest Research Engine",lifespan=lifespan)

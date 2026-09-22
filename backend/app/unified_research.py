@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json, os, re, statistics, math, traceback
+import json, os, re, statistics, math
 from collections import defaultdict, Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,32 +49,9 @@ def pick(row,*names):
         if any(norm(n) in k or k in norm(n) for n in names): return v
     return None
 
-def decode_bytes(raw):
-    # MT5's own report exports are inconsistent: the Strategy Tester "Save as
-    # Report" CSV is commonly UTF-16 (with or without a BOM), while other
-    # exports are plain UTF-8. Guessing wrong silently corrupts every field,
-    # which previously caused parsing to find zero rows/headers with no
-    # visible error until the whole job crashed further downstream.
-    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        try: return raw.decode("utf-16")
-        except Exception: pass
-    if raw[:3] == b"\xef\xbb\xbf":
-        return raw.decode("utf-8-sig", "replace")
-    # No BOM: heuristically detect UTF-16 by looking for the alternating
-    # NUL-byte pattern typical of ASCII text stored as UTF-16 LE/BE.
-    # LE stores ASCII as [char_byte, 0x00] -> zeros cluster at odd offsets.
-    # BE stores ASCII as [0x00, char_byte] -> zeros cluster at even offsets.
-    sample = raw[:2000]
-    zeros_at_odd = sample[1::2].count(0); zeros_at_even = sample[0::2].count(0)
-    if len(sample) >= 20 and max(zeros_at_odd, zeros_at_even) > len(sample) * 0.3:
-        try: return raw.decode("utf-16-le" if zeros_at_odd > zeros_at_even else "utf-16-be")
-        except Exception: pass
-    try: return raw.decode("utf-8-sig")
-    except Exception: return raw.decode("cp1252", "replace")
-
 def parse_csv_bytes(raw):
     import csv, io
-    text=decode_bytes(raw)
+    text=raw.decode("utf-8-sig","replace")
     try: d=csv.Sniffer().sniff(text[:8192],delimiters=",;\t")
     except: d=csv.excel
     return [dict(r) for r in csv.DictReader(io.StringIO(text),dialect=d)]
@@ -130,14 +107,11 @@ def load_rows(path):
                 if n.lower().endswith((".html",".htm")): out.extend(parse_html(b))
                 else: out.extend(parse_csv_bytes(b))
         return out
-    # MT5 Strategy Tester CSV reports can contain several sections in one CSV,
-    # and can be comma, semicolon, or tab delimited depending on locale/export
-    # method — sniff the real delimiter instead of assuming a comma.
+    # MT5 Strategy Tester CSV reports can contain several sections in one CSV.
+    # Locate every recognizable Deals header instead of assuming row 1 is the data header.
     import csv, io
-    text=decode_bytes(raw)
-    try: dialect=csv.Sniffer().sniff(text[:8192],delimiters=",;\t")
-    except Exception: dialect=csv.excel
-    matrix=list(csv.reader(io.StringIO(text),dialect=dialect))
+    text=raw.decode("utf-8-sig","replace")
+    matrix=list(csv.reader(io.StringIO(text)))
     sections=[]
     for i,row in enumerate(matrix):
         h=[norm(x) for x in row]
@@ -444,61 +418,10 @@ def _run_job(eid):
         result={"engine":"ea_backtest_research_v3","status":"completed","experiment_id":eid,"input_lineage":{"sources":["ea.mq5","backtest"],"explicitly_excluded":["OHLC bars","all ticks","external market data"]},"data_quality":{"raw_backtest_rows":len(rows),"reconstructed_trades":len(trades),"initial_capital":INITIAL_CAPITAL},"analysis":analysis,"limitations":limitations,"generated_at":now().isoformat()}
         r=ExperimentResult(id=str(uuid4()),experiment_id=e.id,summary="EA + Backtest evidence research",metrics=json.dumps(result,ensure_ascii=False,default=str),evidence=json.dumps({"finding_count":len(analysis["findings"])},ensure_ascii=False),limitations=json.dumps(limitations,ensure_ascii=False),conclusion="Evidence-backed observations from supplied EA/backtest only; no market-causal claim or trading recommendation.")
         db.add(r);e.status="completed";e.completed_at=now();db.commit()
-        # Mirror the completed result onto disk too, so a database reset (e.g. a Render
-        # redeploy without a persistent disk previously attached) doesn't erase it as long
-        # as this folder itself survives.
-        (folder/"result.json").write_text(json.dumps({"summary":r.summary,"metrics":result,"evidence":json.loads(r.evidence),"limitations":limitations,"conclusion":r.conclusion},ensure_ascii=False,default=str),encoding="utf-8")
     except Exception as ex:
-        # Persist the real traceback to disk so it's retrievable via the API
-        # even though BackgroundTasks exceptions don't reach the HTTP caller.
-        # Previously a failure only showed as status="failed" with no reason,
-        # requiring a trip to Render's log console to diagnose.
-        try:
-            (folder/"error.txt").write_text(f"{ex}\n\n{traceback.format_exc()}",encoding="utf-8")
-        except Exception: pass
         e=db.query(Experiment).filter(Experiment.id==eid).first()
         if e:e.status="failed";e.completed_at=now();db.commit()
         raise
-    finally: db.close()
-
-def recover_research_state():
-    """Rebuild Experiment/ExperimentResult rows from the on-disk research_inputs
-    folder for any experiment_id that has files on disk but no row in the database.
-
-    This covers the common failure mode on platforms like Render: the SQLite file
-    (or even a fresh Postgres schema) can be reset by a redeploy or restart while
-    RESEARCH_INPUT_ROOT, if it lives on an attached persistent disk, survives.
-    Without this, GET/preview/publish return 404 "Experiment not found" for
-    experiments that a user believes already completed.
-
-    This is NOT a substitute for attaching a persistent disk — if ROOT itself is
-    wiped (no disk attached), there is nothing here to recover from and the
-    EA + backtest must be re-uploaded.
-    """
-    if not ROOT.exists(): return
-    db=SessionLocal()
-    try:
-        for folder in sorted(p for p in ROOT.iterdir() if p.is_dir()):
-            eid=folder.name
-            manifest_path=folder/"manifest.json"
-            if not manifest_path.is_file(): continue
-            try: manifest=json.loads(manifest_path.read_text("utf-8"))
-            except Exception: continue
-            e=db.query(Experiment).filter(Experiment.id==eid).first()
-            if not e:
-                e=make_experiment(db,eid,manifest.get("symbol"),manifest.get("timeframe"),manifest.get("ea_filename") or "recovered")
-            result_path=folder/"result.json"
-            if result_path.is_file():
-                has_result=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).first()
-                if not has_result:
-                    try: saved=json.loads(result_path.read_text("utf-8"))
-                    except Exception: saved=None
-                    if saved:
-                        r=ExperimentResult(id=str(uuid4()),experiment_id=eid,summary=saved.get("summary","EA + Backtest evidence research"),metrics=json.dumps(saved.get("metrics",{}),ensure_ascii=False,default=str),evidence=json.dumps(saved.get("evidence",{}),ensure_ascii=False),limitations=json.dumps(saved.get("limitations",[]),ensure_ascii=False),conclusion=saved.get("conclusion",""))
-                        db.add(r)
-                if e.status!="completed":
-                    e.status="completed"; e.completed_at=e.completed_at or now()
-                db.commit()
     finally: db.close()
 
 @router.post("/data/upload",summary="Upload EA .mq5 + MT5 Backtest only")
@@ -508,10 +431,7 @@ async def upload_data(experiment_id:str=Form(None),symbol:str=Form(""),timeframe
     if not backtest_file.filename or not backtest_file.filename.lower().endswith(allowed):raise HTTPException(400,"backtest_file must be CSV/HTML/XML/ZIP")
     eid=safe_id(experiment_id) if experiment_id else str(uuid4()); folder=ROOT/eid;folder.mkdir(parents=True,exist_ok=True);_delete_unused(folder)
     ea=await save_upload(ea_file,folder/"ea.mq5");bt=await save_upload(backtest_file,folder/"backtest")
-    # symbol/timeframe/ea filename are persisted here too (not just in the DB row) so that
-    # recover_research_state() can rebuild the Experiment row if the database is ever reset
-    # but this folder survives (i.e. it lives on a persistent disk).
-    manifest={"experiment_id":eid,"symbol":symbol or "UNKNOWN","timeframe":timeframe or "UNKNOWN","ea_filename":ea[0],"backtest_filename":bt[0],"sizes_bytes":{"ea":ea[1],"backtest":bt[1]},"excluded_inputs":["bars","ticks","external_market_data"]}
+    manifest={"ea_filename":ea[0],"backtest_filename":bt[0],"sizes_bytes":{"ea":ea[1],"backtest":bt[1]},"excluded_inputs":["bars","ticks","external_market_data"]}
     (folder/"manifest.json").write_text(json.dumps(manifest,ensure_ascii=False),encoding="utf-8")
     db=SessionLocal()
     try:
@@ -526,11 +446,7 @@ def get_research(experiment_id:str):
         e=db.query(Experiment).filter(Experiment.id==eid).first()
         if not e:raise HTTPException(404,"Experiment not found")
         r=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).order_by(ExperimentResult.created_at.desc()).first()
-        error=None
-        if e.status=="failed":
-            error_path=ROOT/eid/"error.txt"
-            if error_path.is_file(): error=error_path.read_text("utf-8",errors="replace")
-        return {"experiment_id":eid,"status":e.status,"symbol":e.symbol,"timeframe":e.timeframe,"result":json.loads(r.metrics) if r else None,"result_id":r.id if r else None,"error":error}
+        return {"experiment_id":eid,"status":e.status,"symbol":e.symbol,"timeframe":e.timeframe,"result":json.loads(r.metrics) if r else None,"result_id":r.id if r else None}
     finally:db.close()
 
 @router.post("/{experiment_id}/run")
