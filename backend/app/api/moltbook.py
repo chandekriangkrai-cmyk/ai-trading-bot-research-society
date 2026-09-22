@@ -5,8 +5,7 @@ from pathlib import Path
 from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from app.database import SessionLocal
-from app.research_models import Experiment, ExperimentResult, MoltbookPostLink
-from app.public_safety import sanitize_public_text, sanitize_public_payload, public_ids_enabled
+from app.research_models import Experiment, ExperimentResult
 
 router=APIRouter(prefix="/moltbook",tags=["Moltbook"])
 BASE=os.getenv("MOLTBOOK_API_BASE","https://www.moltbook.com/api/v1").rstrip("/")
@@ -165,32 +164,33 @@ def _fmt_money_pct(ev):
             if not isinstance(x,dict): continue
             ranked.append((str(k),x))
         ranked.sort()
-        # Public post: keep only aggregate temporal variation. Exact period
-        # labels are withheld because they can fingerprint the underlying
-        # backtest and make reverse-engineering easier. Full period table stays
-        # private in the stored research result.
-        profits=[float(x.get("net_profit",0) or 0) for _,x in ranked]
-        return json.dumps({
-            "period_count": len(ranked),
-            "net_profit_range_across_periods": [
-                round(min(profits), 2) if profits else None,
-                round(max(profits), 2) if profits else None
-            ]
-        },ensure_ascii=False)
+        # Public post: first/last plus strongest/weakest by net profit, while
+        # retaining the total period count. Full monthly table stays private.
+        selected=[]
+        if ranked:
+            selected.extend(ranked[:1])
+            if len(ranked)>1: selected.append(ranked[-1])
+            if len(ranked)>2:
+                strongest=max(ranked,key=lambda z: float(z[1].get("net_profit",0) or 0))
+                weakest=min(ranked,key=lambda z: float(z[1].get("net_profit",0) or 0))
+                for item in (strongest,weakest):
+                    if item not in selected: selected.append(item)
+        # win_rate deliberately excluded: these periods are extrema-selected
+        # (first/last/strongest/weakest), not the full population, so a thin
+        # period can trivially show 1.0/0.0. See _drop_degenerate_win_rate.
+        compact={k:{kk:x.get(kk) for kk in ("n","wins","losses","net_profit","net_profit_pct_initial_capital","profit_factor") if kk in x} for k,x in selected}
+        return json.dumps({"period_count":len(ranked),"selected_periods":compact},ensure_ascii=False)
     if "groups" in ev and isinstance(ev["groups"],dict):
         groups=ev["groups"]
         items=[(str(k),x) for k,x in groups.items() if isinstance(x,dict)]
         if not items: return json.dumps(ev,ensure_ascii=False)[:1600]
-        # Public post: do not publish exact hour/weekday labels or the
-        # corresponding extremum rows. Those values can become a behavioral
-        # fingerprint. Keep only the fact that dispersion exists.
-        profits=[float(x.get("net_profit",0) or 0) for _,x in items]
+        # Do not publish every hour/day group. Show sample size and extrema.
+        hi=max(items,key=lambda z: float(z[1].get("net_profit",0) or 0))
+        lo=min(items,key=lambda z: float(z[1].get("net_profit",0) or 0))
         return json.dumps({
-            "group_count": len(items),
-            "net_profit_range_across_groups": [
-                round(min(profits), 2) if profits else None,
-                round(max(profits), 2) if profits else None
-            ]
+            "group_count":len(items),
+            "highest_net_profit_group":{hi[0]:_drop_degenerate_win_rate(hi[1])},
+            "lowest_net_profit_group":{lo[0]:_drop_degenerate_win_rate(lo[1])},
         },ensure_ascii=False)
     if "winning_trades" in ev and "losing_trades" in ev:
         return json.dumps({
@@ -228,12 +228,8 @@ def build_post(e,r):
     account=_as_dict(a.get("account_context"))
     lines=[
         "AI Trading Bot Research Society — Research Update",
-        "Experiment: Public Research Record",
-        f"Strategy: Proprietary {e.symbol} {e.timeframe} automated trading system",
-        "",
-        "System architecture (high level):",
-        "Rule-based trade selection with indicator-derived decision components, directional logic, and predefined position-management/exit behavior.",
-        "Exact indicators, parameter values, thresholds, entry/exit rules, and source implementation are intentionally undisclosed.",
+        f"Experiment: {e.id}",
+        f"Strategy: {e.symbol} {e.timeframe}",
         "",
         "Research scope:",
         "EA .mq5 + MT5 Backtest only.",
@@ -251,32 +247,40 @@ def build_post(e,r):
             lines.append(f"Observed max drawdown: ${_safe_float(overall.get('max_drawdown_absolute')):,.2f} ({_safe_float(overall.get('max_drawdown_pct_initial_capital')):.2f}% of initial capital)")
     lines.append("")
     if findings:
-        # Foreground diagnostics with the most research value rather than simply
-        # printing the first N metrics. This makes the public post an argument
-        # for further investigation, not a dump of backtest statistics.
-        findings=sorted(findings,key=lambda f:(-int(_as_dict(f).get("research_priority",1)), str(_as_dict(f).get("question", ""))))
-        lines += [
-            "Research findings (prioritized by diagnostic value):",
-            "The strongest observations below are treated as hypotheses to investigate, not as proof of a trading edge.",
-        ]
+        lines.append("Key observations from this run:")
+        # Keep the research voice consistent without forcing every finding into
+        # the same template. The wording is chosen from the finding itself,
+        # so the post reads like a research note rather than a generated form.
         for f in findings[:8]:
             f=_as_dict(f)
-            q=f.get("question",f.get("feature","Research finding"))
+            q=str(f.get("question",f.get("feature","Research finding")))
             lines.append(f"- {q}")
             lines.append("  Evidence: "+_fmt_money_pct(f.get("evidence",{})))
-            lines.append("  Interpretation: "+str(f.get("interpretation") or "Observed association in supplied backtest; not causation."))
+            interpretation=str(f.get("interpretation") or "Observed association in the supplied backtest; this does not establish causation.")
+            ql=q.lower()
+            if "chronological" in ql or "period" in ql or "time" in ql:
+                lead="What this suggests: "
+            elif "sensitive" in ql or "largest" in ql or "concentrated" in ql:
+                lead="Robustness note: "
+            elif "unusual" in ql or "shuffled" in ql or "permutation" in ql:
+                lead="Statistical note: "
+            elif "holding" in ql:
+                lead="A useful caveat: "
+            else:
+                lead="Reading the result: "
+            lines.append("  "+lead+interpretation)
     else:
-        lines.append("Evidence-backed observations: NONE_ESTABLISHED")
+        lines.append("Key observations from this run: none established from the supplied data.")
     if hypotheses:
-        lines += ["","Research hypotheses (not validated findings):"]
+        lines += ["","Questions worth testing next:"]
         for h in hypotheses[:6]:
             h=_as_dict(h)
             if not h.get("statement"): continue
             lines.append(f"- {h['statement']}")
             if h.get("missing_evidence"):
-                lines.append("  Missing evidence: "+json.dumps([x for x in h["missing_evidence"] if "indicator" not in str(x).lower() and "parameter" not in str(x).lower()],ensure_ascii=False))
+                lines.append("  Still needed: "+json.dumps(h["missing_evidence"],ensure_ascii=False))
             if h.get("alternative_explanations"):
-                lines.append("  Alternatives: "+json.dumps(h["alternative_explanations"],ensure_ascii=False))
+                lines.append("  Other plausible explanations: "+json.dumps(h["alternative_explanations"],ensure_ascii=False))
     critique=[]
     limitations=_as_list(m.get("limitations"))
     if limitations: critique.extend([str(x) for x in limitations[:4]])
@@ -284,24 +288,17 @@ def build_post(e,r):
     if insufficient: critique.extend([_as_dict(x).get("reason","") for x in insufficient[:4] if _as_dict(x).get("reason")])
     if critique:
         lines += ["","Research limitations / critique:"]+[f"- {x}" for x in critique]
-    # Do not force a single interpretation. These questions are deliberately
-    # open-ended so independent agents can challenge the current research agenda.
     lines += [
         "",
-        "Open research agenda:",
-        "1. Which observed pattern is most robust to reasonable changes in sample boundaries?",
-        "2. Which finding would disappear if the largest winners were trimmed?",
-        "3. Does the directional asymmetry survive a chronological split or shuffled-label benchmark?",
-        "4. What alternative explanation best accounts for the holding-time difference?",
-        "5. What result would falsify the current leading hypothesis?",
-        "6. What independent experiment should be run before making a stronger claim?",
-        "7. Is there an unexpected pattern in the evidence that deserves a new hypothesis?",
+        "Next research questions:",
+        "1. Does the same pattern appear in a fresh backtest?",
+        "2. Which part of the EA logic is most worth testing next?",
+        "3. Does the result hold when the sample is split chronologically?",
+        "4. What result would make the current interpretation less convincing?",
         "",
-        "The research agent is intentionally allowed to disagree with the experimenter's initial interpretation and propose new questions when the evidence supports them.",
-        "",
-        "This post reports supplied-data evidence only. It is not a live-trading signal or financial advice."
+        "This is a report of the supplied EA/backtest data, not a live-trading signal or financial advice."
     ]
-    content=sanitize_public_text("\n".join(lines))
+    content="\n".join(lines)
     # Keep public posts comfortably below common API/feed limits while preserving
     # the core evidence and limitations. Stored research remains complete.
     max_chars=int(os.getenv("MOLTBOOK_PUBLIC_MAX_CHARS","12000"))
@@ -318,8 +315,7 @@ async def publish(title,content,republish=False):
     if republish:
         run_id=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         payload["title"]=f"{title} — Research Run {run_id}"
-        # Keep run identifiers internal; republishing is intentionally not annotated with an internal run ID.
-        payload["content"]=content
+        payload["content"]=f"{content}\nResearch Run: {run_id}"
     status,body=await asyncio.to_thread(req,"POST",f"{BASE}/posts",{"Authorization":f"Bearer {key}","Content-Type":"application/json"},payload)
     if status>=400: raise HTTPException(502,{"message":"Moltbook publish failed","status_code":status,"response":body})
     return body
@@ -388,6 +384,12 @@ _OP_PHRASES = [
     ("decrease", "-", False, 100),
     ("decreases", "-", False, 100),
     ("slows by", "-", False, 100),
+    # Moltbook frequently phrases subtraction as a natural-language loss:
+    # "it loses five", "loses five", "lost five", etc.
+    ("loses", "-", False, 105),
+    ("lose", "-", False, 105),
+    ("lost", "-", False, 105),
+    ("losing", "-", False, 105),
     ("add", "+", False, 100),
     ("plus", "+", False, 110),
     ("increase", "+", False, 100),
@@ -491,7 +493,6 @@ async def preview(experiment_id:str):
     e,r=load_result(experiment_id)
     try:
         title,content=build_post(e,r)
-        content=sanitize_public_text(content)
     except Exception as exc:
         # Never hide the real Preview failure behind a generic HTML/PlainText 500.
         # This also makes older stored result shapes diagnosable from Swagger.
@@ -500,48 +501,22 @@ async def preview(experiment_id:str):
         raise HTTPException(500,{
             "message":"Research result exists but Preview rendering failed",
             "experiment_id":experiment_id,
-            **({"result_id":getattr(r,"id",None)} if public_ids_enabled() else {}),
+            "result_id":getattr(r,"id",None),
             "error":detail[:12000]
         })
-    out={"status":"preview","experiment_id":experiment_id,"title":title,"content":sanitize_public_text(content)}
-    if public_ids_enabled(): out["result_id"]=getattr(r,"id",None)
-    return sanitize_public_payload(out)
+    return {"status":"preview","experiment_id":experiment_id,"title":title,"content":content,"result_id":getattr(r,"id",None)}
 
 @router.post("/research/{experiment_id}/publish")
 async def publish_research(experiment_id:str, republish:bool=Query(False)):
     e,r=load_result(experiment_id)
     title,content=build_post(e,r)
-    content=sanitize_public_text(content)
     out=await publish(title,content,republish=republish)
     verification=await _verify_post(out)
-    post_id=out.get("id") or (out.get("post") or {}).get("id")
-    if post_id:
-        db=SessionLocal()
-        try:
-            link=db.query(MoltbookPostLink).filter(MoltbookPostLink.experiment_id==experiment_id).first()
-            if not link:
-                link=MoltbookPostLink(experiment_id=experiment_id,post_id=str(post_id),title=out.get("title") or title,status="published")
-                db.add(link)
-            else:
-                link.post_id=str(post_id); link.title=out.get("title") or title; link.status="published"
-            db.commit()
-        finally:
-            db.close()
-    response={
-        "status":"published" if verification.get("verified") else "published_pending_verification",
-        "experiment_id": experiment_id,
-        "title": out.get("title") or title,
-        "post_id": post_id,
-        "verification": verification,
-        "moltbook": out
-    }
-    # Internal IDs are useful for server-side bookkeeping but should not leak
-    # through the default public API response.
-    return sanitize_public_payload(response)
+    return {"status":"published" if verification.get("verified") else "published_pending_verification","experiment_id":experiment_id,"title":out.get("title") or title,"post_id":out.get("id") or (out.get("post") or {}).get("id"),"verification":verification,"moltbook":out}
 
 @router.post("/research/{experiment_id}/publish-manual-verify")
 async def publish_manual_verify(experiment_id:str, republish:bool=Query(False)):
-    e,r=load_result(experiment_id); title,content=build_post(e,r); content=sanitize_public_text(content); out=await publish(title,content,republish=republish)
+    e,r=load_result(experiment_id); title,content=build_post(e,r); out=await publish(title,content,republish=republish)
     post=out.get("post") if isinstance(out,dict) and isinstance(out.get("post"),dict) else out
     verification=post.get("verification") if isinstance(post,dict) else None
     challenge=(verification or {}).get("challenge_text") or (verification or {}).get("challenge") or (post.get("verification_question") if isinstance(post,dict) else None)
@@ -558,7 +533,7 @@ async def publish_manual_verify(experiment_id:str, republish:bool=Query(False)):
             solver_note=f"auto-solver read this as: {parsed['numbers'][0]} {parsed['operation']} {parsed['numbers'][1]} = {suggested_answer}"
         except Exception as exc:
             solver_note=f"auto-solver could not parse this challenge on its own: {exc}"
-    return sanitize_public_payload({
+    return {
         "status":"published_pending_verification",
         "experiment_id":experiment_id,
         "title":post.get("title") or title,
@@ -567,9 +542,9 @@ async def publish_manual_verify(experiment_id:str, republish:bool=Query(False)):
         "verification_code":verification_code,
         "suggested_answer":suggested_answer,
         "solver_note":solver_note,
-        "warning":"Moltbook verification is one-shot per post: submitting a wrong answer fails permanently for this post. Double-check the suggested answer against the verification question before submitting.",
+        "warning":"Moltbook verification is one-shot per post: submitting a wrong answer to POST /moltbook/post/{post_id}/verify fails permanently for this post (you would need to republish to get a new challenge). Double-check suggested_answer against verification_question yourself before submitting -- do not trust it blindly.",
         "moltbook":out,
-    })
+    }
 
 @router.post("/post/{post_id}/verify")
 async def verify_post(post_id:str,payload:dict[str,Any]):
