@@ -69,3 +69,66 @@ class ExperimentResult(Base):
     limitations: Mapped[str] = mapped_column(Text, nullable=False, default="")
     conclusion: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+class MoltbookInteractionLead(Base):
+    __tablename__ = "moltbook_interaction_leads"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    post_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    author: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    relevance_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    novelty_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    research_value_score: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    decision: Mapped[str] = mapped_column(String(40), nullable=False, default="ignore")
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="discovered")
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    draft_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class MoltbookInteraction(Base):
+    __tablename__ = "moltbook_interactions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    post_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    comment_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    parent_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    author: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    direction: Mapped[str] = mapped_column(String(30), nullable=False, default="outbound")
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    classification: Mapped[str] = mapped_column(String(60), nullable=False, default="other")
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="draft")
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+class MoltbookPostLink(Base):
+    __tablename__ = "moltbook_post_links"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    experiment_id: Mapped[str] = mapped_column(String(36), ForeignKey("research_experiments.id"), nullable=False, unique=True, index=True)
+    post_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="published")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class ResearchDiscussion(Base):
+    __tablename__ = "research_discussions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    experiment_id: Mapped[str] = mapped_column(String(36), ForeignKey("research_experiments.id"), nullable=False, index=True)
+    post_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    comment_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    parent_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    author: Mapped[str] = mapped_column(String(255), nullable=False, default="unknown")
+    comment_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    classification: Mapped[str] = mapped_column(String(60), nullable=False, default="other")
+    decision: Mapped[str] = mapped_column(String(40), nullable=False, default="ignore")
+    draft_reply: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_comment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

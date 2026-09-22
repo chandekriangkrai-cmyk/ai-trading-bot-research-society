@@ -64,3 +64,38 @@ def start_if_enabled() -> None:
         _started = True
         t = threading.Thread(target=_loop, name="moltbook-research-discussion", daemon=True)
         t.start()
+
+# Separate AI↔AI discovery loop. It never changes the existing research-comment
+# watcher behavior and remains disabled unless explicitly enabled.
+def interaction_enabled() -> bool:
+    return os.getenv("MOLTBOOK_AI_INTERACTION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def run_interaction_cycle() -> dict:
+    from app.moltbook_interaction import run_cycle
+    auto = os.getenv("MOLTBOOK_AI_INTERACTION_AUTO_COMMENT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    max_comments = max(0, int(os.getenv("MOLTBOOK_INTERACTION_MAX_COMMENTS_PER_CYCLE", "2")))
+    min_relevance = float(os.getenv("MOLTBOOK_INTERACTION_MIN_RELEVANCE", "0.80"))
+    return run_cycle(auto_comment=auto, max_comments=max_comments, min_relevance=min_relevance)
+
+
+def start_interaction_if_enabled() -> None:
+    global _started
+    if not interaction_enabled():
+        return
+    with _lock:
+        # Reuse the existing process-level lock so only one interaction worker
+        # is created. The research-comment watcher has its own startup path;
+        # this guard is intentionally conservative for a single-service deploy.
+        t = threading.Thread(target=_interaction_loop, name="moltbook-ai-ai-interaction", daemon=True)
+        t.start()
+
+
+def _interaction_loop() -> None:
+    interval = max(600, int(os.getenv("MOLTBOOK_AI_INTERACTION_INTERVAL_SECONDS", "1800")))
+    while interaction_enabled():
+        try:
+            run_interaction_cycle()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(interval)
