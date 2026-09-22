@@ -263,6 +263,11 @@ def stats(items):
     n=len(items); wins=sum(x["profit"]>0 for x in items); losses=sum(x["profit"]<0 for x in items); net=sum(x["profit"] for x in items)
     gross_win=sum(x["profit"] for x in items if x["profit"]>0); gross_loss=-sum(x["profit"] for x in items if x["profit"]<0)
     hold=[(x["exit_time"]-x["entry_time"]).total_seconds()/60 for x in items]
+    win_values=[x["profit"] for x in items if x["profit"]>0]
+    loss_values=[x["profit"] for x in items if x["profit"]<0]
+    avg_win=statistics.mean(win_values) if win_values else None
+    avg_loss_abs=-statistics.mean(loss_values) if loss_values else None
+    payoff_ratio=(avg_win/avg_loss_abs) if avg_win is not None and avg_loss_abs else None
     return {
         "n":n,"wins":wins,"losses":losses,"flats":n-wins-losses,
         "win_rate":round(wins/n,4) if n else None,"win_rate_95ci":binom_ci(wins,n),
@@ -271,6 +276,9 @@ def stats(items):
         "avg_profit":round(net/n,8) if n else None,
         "avg_profit_pct_initial_capital":round((net/n/INITIAL_CAPITAL)*100,6) if n and INITIAL_CAPITAL else None,
         "median_profit":round(statistics.median([x["profit"] for x in items]),8) if items else None,
+        "avg_win":round(avg_win,8) if avg_win is not None else None,
+        "avg_loss_abs":round(avg_loss_abs,8) if avg_loss_abs is not None else None,
+        "payoff_ratio":round(payoff_ratio,4) if payoff_ratio is not None else None,
         "profit_factor":round(gross_win/gross_loss,4) if gross_loss else None,
         "avg_hold_minutes":round(statistics.mean(hold),2) if hold else None,
         "median_hold_minutes":round(statistics.median(hold),2) if hold else None
@@ -328,6 +336,41 @@ def analyze(ea_source, trades):
         })
     overall=stats(trades)
     overall.update(equity_drawdown(trades))
+    # Profit-distribution structure: distinguish positive expectancy from a high win rate.
+    if overall["wins"] >= MIN_GROUP_N and overall["losses"] >= MIN_GROUP_N:
+        findings.append({
+            "status":"OBSERVED_PATTERN",
+            "question":"Is realized profitability primarily associated with payoff asymmetry rather than win frequency?",
+            "evidence":{
+                "win_rate":overall["win_rate"],
+                "avg_win":overall["avg_win"],
+                "avg_loss_abs":overall["avg_loss_abs"],
+                "payoff_ratio":overall["payoff_ratio"],
+                "expectancy_per_trade":overall["avg_profit"]
+            },
+            "interpretation":"The backtest can be profitable without a high win rate when winning-trade payoffs and losing-trade payoffs are distributed asymmetrically. This is descriptive evidence about the supplied sample, not a claim that the same payoff structure persists out of sample."
+        })
+    else:
+        insuff.append({"topic":"payoff_structure","reason":"Not enough wins and losses to characterize the payoff distribution reliably."})
+
+    # Tail dependence: recompute profitability after removing the largest winning trades.
+    positive=sorted([t for t in trades if t["profit"]>0], key=lambda t:t["profit"], reverse=True)
+    tail_rows=[]
+    for pct in (0.01,0.05,0.10):
+        remove_n=max(1,math.ceil(len(positive)*pct)) if positive else 0
+        removed_ids={id(t) for t in positive[:remove_n]}
+        retained=[t for t in trades if id(t) not in removed_ids]
+        if retained:
+            rs=stats(retained); rd=equity_drawdown(retained)
+            tail_rows.append({"removed_top_winners_pct":pct,"removed_trade_count":remove_n,"remaining_trades":len(retained),"net_profit":rs["net_profit"],"profit_factor":rs["profit_factor"],"max_drawdown_absolute":rd["max_drawdown_absolute"]})
+    if tail_rows:
+        findings.append({
+            "status":"ROBUSTNESS_DIAGNOSTIC",
+            "question":"How sensitive is realized profitability to the largest winning trades?",
+            "evidence":{"tail_sensitivity":tail_rows},
+            "interpretation":"This diagnostic tests whether the headline result is heavily dependent on a small number of extreme winners. It does not estimate future performance and should be interpreted together with the full trade distribution."
+        })
+
     # Directional comparison
     groups=defaultdict(list)
     for t in trades:

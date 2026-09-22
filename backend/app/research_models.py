@@ -69,3 +69,33 @@ class ExperimentResult(Base):
     limitations: Mapped[str] = mapped_column(Text, nullable=False, default="")
     conclusion: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+class MoltbookPostLink(Base):
+    __tablename__ = "moltbook_post_links"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    experiment_id: Mapped[str] = mapped_column(String(36), ForeignKey("research_experiments.id"), nullable=False, unique=True, index=True)
+    post_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="published")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class ResearchDiscussion(Base):
+    __tablename__ = "research_discussions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    experiment_id: Mapped[str] = mapped_column(String(36), ForeignKey("research_experiments.id"), nullable=False, index=True)
+    post_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    comment_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    parent_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    author: Mapped[str] = mapped_column(String(255), nullable=False, default="unknown")
+    comment_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    classification: Mapped[str] = mapped_column(String(50), nullable=False, default="unclassified")
+    decision: Mapped[str] = mapped_column(String(40), nullable=False, default="pending")
+    draft_reply: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_comment_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
