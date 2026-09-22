@@ -165,33 +165,32 @@ def _fmt_money_pct(ev):
             if not isinstance(x,dict): continue
             ranked.append((str(k),x))
         ranked.sort()
-        # Public post: first/last plus strongest/weakest by net profit, while
-        # retaining the total period count. Full monthly table stays private.
-        selected=[]
-        if ranked:
-            selected.extend(ranked[:1])
-            if len(ranked)>1: selected.append(ranked[-1])
-            if len(ranked)>2:
-                strongest=max(ranked,key=lambda z: float(z[1].get("net_profit",0) or 0))
-                weakest=min(ranked,key=lambda z: float(z[1].get("net_profit",0) or 0))
-                for item in (strongest,weakest):
-                    if item not in selected: selected.append(item)
-        # win_rate deliberately excluded: these periods are extrema-selected
-        # (first/last/strongest/weakest), not the full population, so a thin
-        # period can trivially show 1.0/0.0. See _drop_degenerate_win_rate.
-        compact={k:{kk:x.get(kk) for kk in ("n","wins","losses","net_profit","net_profit_pct_initial_capital","profit_factor") if kk in x} for k,x in selected}
-        return json.dumps({"period_count":len(ranked),"selected_periods":compact},ensure_ascii=False)
+        # Public post: keep only aggregate temporal variation. Exact period
+        # labels are withheld because they can fingerprint the underlying
+        # backtest and make reverse-engineering easier. Full period table stays
+        # private in the stored research result.
+        profits=[float(x.get("net_profit",0) or 0) for _,x in ranked]
+        return json.dumps({
+            "period_count": len(ranked),
+            "net_profit_range_across_periods": [
+                round(min(profits), 2) if profits else None,
+                round(max(profits), 2) if profits else None
+            ]
+        },ensure_ascii=False)
     if "groups" in ev and isinstance(ev["groups"],dict):
         groups=ev["groups"]
         items=[(str(k),x) for k,x in groups.items() if isinstance(x,dict)]
         if not items: return json.dumps(ev,ensure_ascii=False)[:1600]
-        # Do not publish every hour/day group. Show sample size and extrema.
-        hi=max(items,key=lambda z: float(z[1].get("net_profit",0) or 0))
-        lo=min(items,key=lambda z: float(z[1].get("net_profit",0) or 0))
+        # Public post: do not publish exact hour/weekday labels or the
+        # corresponding extremum rows. Those values can become a behavioral
+        # fingerprint. Keep only the fact that dispersion exists.
+        profits=[float(x.get("net_profit",0) or 0) for _,x in items]
         return json.dumps({
-            "group_count":len(items),
-            "highest_net_profit_group":{hi[0]:_drop_degenerate_win_rate(hi[1])},
-            "lowest_net_profit_group":{lo[0]:_drop_degenerate_win_rate(lo[1])},
+            "group_count": len(items),
+            "net_profit_range_across_groups": [
+                round(min(profits), 2) if profits else None,
+                round(max(profits), 2) if profits else None
+            ]
         },ensure_ascii=False)
     if "winning_trades" in ev and "losing_trades" in ev:
         return json.dumps({
@@ -229,7 +228,7 @@ def build_post(e,r):
     account=_as_dict(a.get("account_context"))
     lines=[
         "AI Trading Bot Research Society — Research Update",
-        f"Experiment: {e.id}",
+        "Experiment: Public Research Record",
         f"Strategy: Proprietary {e.symbol} {e.timeframe} automated trading system",
         "",
         "System architecture (high level):",
@@ -528,7 +527,17 @@ async def publish_research(experiment_id:str, republish:bool=Query(False)):
             db.commit()
         finally:
             db.close()
-    return {"status":"published" if verification.get("verified") else "published_pending_verification","experiment_id":experiment_id,"title":out.get("title") or title,"post_id":post_id,"verification":verification,"moltbook":out}
+    response={
+        "status":"published" if verification.get("verified") else "published_pending_verification",
+        "experiment_id": experiment_id,
+        "title": out.get("title") or title,
+        "post_id": post_id,
+        "verification": verification,
+        "moltbook": out
+    }
+    # Internal IDs are useful for server-side bookkeeping but should not leak
+    # through the default public API response.
+    return sanitize_public_payload(response)
 
 @router.post("/research/{experiment_id}/publish-manual-verify")
 async def publish_manual_verify(experiment_id:str, republish:bool=Query(False)):
@@ -549,7 +558,7 @@ async def publish_manual_verify(experiment_id:str, republish:bool=Query(False)):
             solver_note=f"auto-solver read this as: {parsed['numbers'][0]} {parsed['operation']} {parsed['numbers'][1]} = {suggested_answer}"
         except Exception as exc:
             solver_note=f"auto-solver could not parse this challenge on its own: {exc}"
-    return {
+    return sanitize_public_payload({
         "status":"published_pending_verification",
         "experiment_id":experiment_id,
         "title":post.get("title") or title,
@@ -558,9 +567,9 @@ async def publish_manual_verify(experiment_id:str, republish:bool=Query(False)):
         "verification_code":verification_code,
         "suggested_answer":suggested_answer,
         "solver_note":solver_note,
-        "warning":"Moltbook verification is one-shot per post: submitting a wrong answer to POST /moltbook/post/{post_id}/verify fails permanently for this post (you would need to republish to get a new challenge). Double-check suggested_answer against verification_question yourself before submitting -- do not trust it blindly.",
+        "warning":"Moltbook verification is one-shot per post: submitting a wrong answer fails permanently for this post. Double-check the suggested answer against the verification question before submitting.",
         "moltbook":out,
-    }
+    })
 
 @router.post("/post/{post_id}/verify")
 async def verify_post(post_id:str,payload:dict[str,Any]):
