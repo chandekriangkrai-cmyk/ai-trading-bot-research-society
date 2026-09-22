@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, os, re, urllib.error, urllib.request, uuid
+import asyncio, hashlib, json, os, re, urllib.error, urllib.request, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -228,11 +228,19 @@ def build_post(e,r):
     findings=_as_list(a.get("findings"))
     hypotheses=_as_list(a.get("hypotheses"))
     title=f"Research Update: {getattr(e,'symbol',None) or 'UNKNOWN'} {getattr(e,'timeframe',None) or 'UNKNOWN'}"
+    # Every stored result gets a stable run label. This prevents a later result
+    # from being presented as if it were the same research run.
+    run_id = str(m.get("research_run_id") or getattr(r, "id", ""))
+    if run_id:
+        lines_run = [f"Research run: {run_id}"]
+    else:
+        lines_run = []
     account=_as_dict(a.get("account_context"))
     lines=[
         "AI Trading Bot Research Society — Research Update",
         f"Experiment: {e.id}",
         f"Strategy: {e.symbol} {e.timeframe}",
+        *lines_run,
         "",
         "Research scope:",
         "EA .mq5 + MT5 Backtest only.",
@@ -306,17 +314,57 @@ def build_post(e,r):
         content=content[:max(0,max_chars-len(marker))].rsplit("\n",1)[0]+marker
     return title,content
 
-async def publish(title,content,republish=False):
+def _publish_history_path(experiment_id: str) -> Path:
+    root=Path(os.getenv("RESEARCH_INPUT_ROOT","research_inputs")).resolve()
+    p=root/experiment_id/"moltbook_publish_history.json"
+    p.parent.mkdir(parents=True,exist_ok=True)
+    return p
+
+def _content_fingerprint(title: str, content: str) -> str:
+    normalized=re.sub(r"\s+"," ",f"{title}\n{content}").strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+def _load_publish_history(experiment_id: str):
+    p=_publish_history_path(experiment_id)
+    if not p.is_file(): return []
+    try:
+        data=json.loads(p.read_text("utf-8"))
+        return data if isinstance(data,list) else []
+    except Exception:
+        return []
+
+def _save_publish_history(experiment_id: str, history):
+    p=_publish_history_path(experiment_id)
+    tmp=p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(history[-50:],ensure_ascii=False,indent=2),encoding="utf-8")
+    tmp.replace(p)
+
+async def publish(title,content,republish=False,experiment_id=""):
     key=os.getenv("MOLTBOOK_API_KEY","")
     if not key: raise HTTPException(503,"MOLTBOOK_API_KEY is not configured")
     if key.startswith("moltdev_"): raise HTTPException(400,"Use the bot agent API key for publishing, not moltdev_.")
+
+    # Exact duplicate guard: do not waste a Moltbook publish attempt on content
+    # that this service has already submitted. A semantic duplicate may still be
+    # detected by Moltbook, so changing the research run is still recommended.
+    history=_load_publish_history(experiment_id) if experiment_id else []
+    base_fingerprint=_content_fingerprint(title,content)
+    if any(isinstance(x,dict) and x.get("base_fingerprint")==base_fingerprint for x in history):
+        raise HTTPException(409,{"message":"Duplicate publish blocked locally","experiment_id":experiment_id,"hint":"Create a fresh research run with materially changed evidence before publishing again."})
+
     payload={"title":title,"content":content,**(await resolve_submolt())}
+    run_id=None
     if republish:
         run_id=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         payload["title"]=f"{title} — Research Run {run_id}"
         payload["content"]=f"{content}\nResearch Run: {run_id}"
+    fingerprint=_content_fingerprint(payload["title"],payload["content"])
     status,body=await asyncio.to_thread(req,"POST",f"{BASE}/posts",{"Authorization":f"Bearer {key}","Content-Type":"application/json"},payload)
-    if status>=400: raise HTTPException(502,{"message":"Moltbook publish failed","status_code":status,"response":body})
+    if status>=400:
+        # Surface Moltbook's duplicate/spam response rather than hiding it.
+        raise HTTPException(502,{"message":"Moltbook publish failed","status_code":status,"response":body})
+    history.append({"base_fingerprint":base_fingerprint,"fingerprint":fingerprint,"published_at":datetime.now(timezone.utc).isoformat(),"post_id":(body.get("id") if isinstance(body,dict) else None),"run_id":run_id})
+    if experiment_id: _save_publish_history(experiment_id,history)
     return body
 
 # ---------------------------------------------------------------------------
@@ -509,13 +557,13 @@ async def preview(experiment_id:str):
 async def publish_research(experiment_id:str, republish:bool=Query(False)):
     e,r=load_result(experiment_id)
     title,content=build_post(e,r)
-    out=await publish(title,content,republish=republish)
+    out=await publish(title,content,republish=republish,experiment_id=experiment_id)
     verification=await _verify_post(out)
     return {"status":"published" if verification.get("verified") else "published_pending_verification","experiment_id":experiment_id,"title":out.get("title") or title,"post_id":out.get("id") or (out.get("post") or {}).get("id"),"verification":verification,"moltbook":out}
 
 @router.post("/research/{experiment_id}/publish-manual-verify")
 async def publish_manual_verify(experiment_id:str, republish:bool=Query(False)):
-    e,r=load_result(experiment_id); title,content=build_post(e,r); out=await publish(title,content,republish=republish)
+    e,r=load_result(experiment_id); title,content=build_post(e,r); out=await publish(title,content,republish=republish,experiment_id=experiment_id)
     post=out.get("post") if isinstance(out,dict) and isinstance(out.get("post"),dict) else out
     verification=post.get("verification") if isinstance(post,dict) else None
     challenge=(verification or {}).get("challenge_text") or (verification or {}).get("challenge") or (post.get("verification_question") if isinstance(post,dict) else None)
