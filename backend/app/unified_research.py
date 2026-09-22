@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json, os, re, statistics, math, traceback
+import json, os, re, statistics, math, traceback, concurrent.futures, threading
 from collections import defaultdict, Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +16,12 @@ MAX_MB = int(os.getenv("RESEARCH_UPLOAD_MAX_MB", "512"))
 MAX_BYTES = MAX_MB * 1024 * 1024
 MIN_GROUP_N = int(os.getenv("RESEARCH_MIN_GROUP_N", "10"))
 INITIAL_CAPITAL = float(os.getenv("RESEARCH_INITIAL_CAPITAL", "10000"))
+# Background research executor. Using an explicit executor avoids relying on
+# Starlette/FastAPI BackgroundTasks for long CPU/file jobs and makes the job
+# lifecycle observable through the API. The job still lives in this process;
+# for multi-worker deployments keep workers=1 unless a real external queue is used.
+RESEARCH_WORKERS = max(1, int(os.getenv("RESEARCH_WORKERS", "2")))
+RESEARCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=RESEARCH_WORKERS, thread_name_prefix="research")
 
 
 def now(): return datetime.now(timezone.utc)
@@ -433,33 +439,65 @@ def _run_job(eid):
     try:
         e=db.query(Experiment).filter(Experiment.id==eid).first()
         if not e:return
-        e.status="running";db.commit()
-        ea=(folder/"ea.mq5").read_text("utf-8",errors="replace")
-        rows=load_rows(folder/"backtest")
+        # A result already on disk/DB means this job has already completed.
+        existing=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).first()
+        if existing:
+            e.status="completed"; e.completed_at=e.completed_at or now(); db.commit(); return
+        e.status="running"; db.commit()
+
+        # Validate inputs before doing any heavy work. This makes a failed job
+        # explicit instead of silently leaving the experiment at "uploaded".
+        ea_path=folder/"ea.mq5"; bt_path=folder/"backtest"
+        if not ea_path.is_file() or not bt_path.is_file():
+            raise FileNotFoundError("Research inputs are missing: ea.mq5 and/or backtest")
+
+        ea=ea_path.read_text("utf-8",errors="replace")
+        rows=load_rows(bt_path)
         trades=build_trades(rows)
         analysis=analyze(ea,trades)
         limitations=[]
+        if not rows: limitations.append("The supplied backtest file produced zero parsed rows.")
         if not trades: limitations.append("No completed trades could be reconstructed from the supplied backtest.")
         if analysis["findings"]==[]: limitations.append("No evidence-backed pattern was established; absence of a finding is not evidence that no relationship exists.")
         result={"engine":"ea_backtest_research_v3","status":"completed","experiment_id":eid,"input_lineage":{"sources":["ea.mq5","backtest"],"explicitly_excluded":["OHLC bars","all ticks","external market data"]},"data_quality":{"raw_backtest_rows":len(rows),"reconstructed_trades":len(trades),"initial_capital":INITIAL_CAPITAL},"analysis":analysis,"limitations":limitations,"generated_at":now().isoformat()}
-        r=ExperimentResult(id=str(uuid4()),experiment_id=e.id,summary="EA + Backtest evidence research",metrics=json.dumps(result,ensure_ascii=False,default=str),evidence=json.dumps({"finding_count":len(analysis["findings"])},ensure_ascii=False),limitations=json.dumps(limitations,ensure_ascii=False),conclusion="Evidence-backed observations from supplied EA/backtest only; no market-causal claim or trading recommendation.")
+
+        # Write the durable artifact first. If the DB transaction fails, startup
+        # recovery can rebuild ExperimentResult from this file.
+        artifact={"summary":"EA + Backtest evidence research","metrics":result,"evidence":{"finding_count":len(analysis["findings"])},"limitations":limitations,"conclusion":"Evidence-backed observations from supplied EA/backtest only; no market-causal claim or trading recommendation."}
+        tmp=folder/"result.json.tmp"
+        tmp.write_text(json.dumps(artifact,ensure_ascii=False,default=str),encoding="utf-8")
+        tmp.replace(folder/"result.json")
+
+        r=ExperimentResult(id=str(uuid4()),experiment_id=e.id,summary=artifact["summary"],metrics=json.dumps(result,ensure_ascii=False,default=str),evidence=json.dumps(artifact["evidence"],ensure_ascii=False),limitations=json.dumps(limitations,ensure_ascii=False),conclusion=artifact["conclusion"])
         db.add(r);e.status="completed";e.completed_at=now();db.commit()
-        # Mirror the completed result onto disk too, so a database reset (e.g. a Render
-        # redeploy without a persistent disk previously attached) doesn't erase it as long
-        # as this folder itself survives.
-        (folder/"result.json").write_text(json.dumps({"summary":r.summary,"metrics":result,"evidence":json.loads(r.evidence),"limitations":limitations,"conclusion":r.conclusion},ensure_ascii=False,default=str),encoding="utf-8")
     except Exception as ex:
-        # Persist the real traceback to disk so it's retrievable via the API
-        # even though BackgroundTasks exceptions don't reach the HTTP caller.
-        # Previously a failure only showed as status="failed" with no reason,
-        # requiring a trip to Render's log console to diagnose.
+        # Persist the real traceback and make the failure visible through GET /research.
         try:
+            folder.mkdir(parents=True,exist_ok=True)
             (folder/"error.txt").write_text(f"{ex}\n\n{traceback.format_exc()}",encoding="utf-8")
         except Exception: pass
-        e=db.query(Experiment).filter(Experiment.id==eid).first()
-        if e:e.status="failed";e.completed_at=now();db.commit()
+        try:
+            e=db.query(Experiment).filter(Experiment.id==eid).first()
+            if e:
+                e.status="failed"; e.completed_at=now(); db.commit()
+        except Exception: pass
         raise
-    finally: db.close()
+    finally:
+        db.close()
+
+def _submit_research_job(eid):
+    """Submit a research job outside the request lifecycle.
+
+    FastAPI BackgroundTasks is excellent for short post-response work, but EA/CSV
+    analysis can be CPU/file intensive. A dedicated executor prevents the job from
+    being coupled to the response task and gives us a Future we can observe/log.
+    """
+    future=RESEARCH_EXECUTOR.submit(_run_job,eid)
+    def _done(f):
+        try: f.result()
+        except Exception: traceback.print_exc()
+    future.add_done_callback(_done)
+    return future
 
 def recover_research_state():
     """Rebuild Experiment/ExperimentResult rows from the on-disk research_inputs
@@ -534,15 +572,30 @@ def get_research(experiment_id:str):
     finally:db.close()
 
 @router.post("/{experiment_id}/run")
-def run_research(experiment_id:str,background_tasks:BackgroundTasks):
+def run_research(experiment_id:str):
     eid=safe_id(experiment_id);folder=ROOT/eid
     if not (folder/"ea.mq5").is_file() or not (folder/"backtest").is_file():raise HTTPException(409,"Upload EA and backtest first")
     db=SessionLocal()
     try:
         e=db.query(Experiment).filter(Experiment.id==eid).first()
         if not e:raise HTTPException(404,"Experiment not found")
-        if e.status=="running":return {"experiment_id":eid,"status":"running"}
-        e.status="queued";db.commit()
+        existing=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).order_by(ExperimentResult.created_at.desc()).first()
+        if existing:
+            if e.status!="completed": e.status="completed"; e.completed_at=e.completed_at or now(); db.commit()
+            return {"experiment_id":eid,"status":"completed","message":"Research result already exists. Preview is ready.","result_id":existing.id,"scope":["EA .mq5","Backtest"]}
+        if e.status in {"queued","running"}:
+            return {"experiment_id":eid,"status":e.status,"message":"Research is already running. Poll GET /api/research/{experiment_id}.","scope":["EA .mq5","Backtest"]}
+        e.status="queued"; e.completed_at=None; db.commit()
     finally:db.close()
-    background_tasks.add_task(_run_job,eid)
+
+    try:
+        _submit_research_job(eid)
+    except Exception as ex:
+        db=SessionLocal()
+        try:
+            e=db.query(Experiment).filter(Experiment.id==eid).first()
+            if e:e.status="failed";db.commit()
+        finally:db.close()
+        raise HTTPException(500,f"Could not queue research job: {ex}")
+
     return {"experiment_id":eid,"status":"queued","message":"Research is running in background. Poll GET /api/research/{experiment_id}.","scope":["EA .mq5","Backtest"]}
