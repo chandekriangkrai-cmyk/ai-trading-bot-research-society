@@ -10,6 +10,7 @@ from app.database import SessionLocal
 from app.research_models import Experiment, MoltbookPostLink, ResearchDiscussion
 from app.api.moltbook import BASE, TIMEOUT, req
 from app.research_discussion import generate_reply
+from app.public_safety import sanitize_public_text, sanitize_public_payload
 
 router = APIRouter(prefix="/research-discussion", tags=["Research AI Discussion"])
 
@@ -74,7 +75,9 @@ async def draft_reply(experiment_id: str, payload: dict[str, Any]):
     author = str(payload.get("author") or "unknown")
     thread = str(payload.get("thread_context") or "")
     result = await asyncio.to_thread(generate_reply, experiment_id, comment, author, thread)
-    return {"status": "drafted", "experiment_id": experiment_id, **result}
+    if result.get("reply"):
+        result["reply"] = sanitize_public_text(result["reply"])
+    return sanitize_public_payload({"status": "drafted", "experiment_id": experiment_id, **result})
 
 
 @router.post("/research/{experiment_id}/scan")
@@ -112,6 +115,8 @@ async def scan_discussion(experiment_id: str, post_id: str | None = Query(None),
             author = _author(c)
             parent = _parent(c)
             result = await asyncio.to_thread(generate_reply, experiment_id, text, author, "")
+            if result.get("reply"):
+                result["reply"] = sanitize_public_text(result["reply"])
             row = ResearchDiscussion(
                 experiment_id=experiment_id,
                 post_id=resolved_post,

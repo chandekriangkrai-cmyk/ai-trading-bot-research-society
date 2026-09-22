@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from app.database import SessionLocal
 from app.research_models import Experiment, ExperimentResult, MoltbookPostLink
+from app.public_safety import sanitize_public_text, sanitize_public_payload, public_ids_enabled
 
 router=APIRouter(prefix="/moltbook",tags=["Moltbook"])
 BASE=os.getenv("MOLTBOOK_API_BASE","https://www.moltbook.com/api/v1").rstrip("/")
@@ -251,7 +252,14 @@ def build_post(e,r):
             lines.append(f"Observed max drawdown: ${_safe_float(overall.get('max_drawdown_absolute')):,.2f} ({_safe_float(overall.get('max_drawdown_pct_initial_capital')):.2f}% of initial capital)")
     lines.append("")
     if findings:
-        lines.append("Evidence-backed observations:")
+        # Foreground diagnostics with the most research value rather than simply
+        # printing the first N metrics. This makes the public post an argument
+        # for further investigation, not a dump of backtest statistics.
+        findings=sorted(findings,key=lambda f:(-int(_as_dict(f).get("research_priority",1)), str(_as_dict(f).get("question", ""))))
+        lines += [
+            "Research findings (prioritized by diagnostic value):",
+            "The strongest observations below are treated as hypotheses to investigate, not as proof of a trading edge.",
+        ]
         for f in findings[:8]:
             f=_as_dict(f)
             q=f.get("question",f.get("feature","Research finding"))
@@ -277,20 +285,24 @@ def build_post(e,r):
     if insufficient: critique.extend([_as_dict(x).get("reason","") for x in insufficient[:4] if _as_dict(x).get("reason")])
     if critique:
         lines += ["","Research limitations / critique:"]+[f"- {x}" for x in critique]
+    # Do not force a single interpretation. These questions are deliberately
+    # open-ended so independent agents can challenge the current research agenda.
     lines += [
         "",
-        "Peer research questions:",
-        "1. Can this EA/backtest pattern be reproduced in another experiment?",
-        "2. Which part of the EA logic should be tested next?",
-        "3. Does the observed behavior remain stable across different backtest periods?",
-        "4. What evidence would falsify the observed pattern?",
-        "5. Which hypothesis should be tested against a new backtest?",
-        "6. How sensitive is the result to removal of the largest winning trades?",
-        "7. Does the observed payoff structure persist across independent periods?",
+        "Open research agenda:",
+        "1. Which observed pattern is most robust to reasonable changes in sample boundaries?",
+        "2. Which finding would disappear if the largest winners were trimmed?",
+        "3. Does the directional asymmetry survive a chronological split or shuffled-label benchmark?",
+        "4. What alternative explanation best accounts for the holding-time difference?",
+        "5. What result would falsify the current leading hypothesis?",
+        "6. What independent experiment should be run before making a stronger claim?",
+        "7. Is there an unexpected pattern in the evidence that deserves a new hypothesis?",
+        "",
+        "The research agent is intentionally allowed to disagree with the experimenter's initial interpretation and propose new questions when the evidence supports them.",
         "",
         "This post reports supplied-data evidence only. It is not a live-trading signal or financial advice."
     ]
-    content="\n".join(lines)
+    content=sanitize_public_text("\n".join(lines))
     # Keep public posts comfortably below common API/feed limits while preserving
     # the core evidence and limitations. Stored research remains complete.
     max_chars=int(os.getenv("MOLTBOOK_PUBLIC_MAX_CHARS","12000"))
@@ -307,7 +319,8 @@ async def publish(title,content,republish=False):
     if republish:
         run_id=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         payload["title"]=f"{title} — Research Run {run_id}"
-        payload["content"]=f"{content}\nResearch Run: {run_id}"
+        # Keep run identifiers internal; republishing is intentionally not annotated with an internal run ID.
+        payload["content"]=content
     status,body=await asyncio.to_thread(req,"POST",f"{BASE}/posts",{"Authorization":f"Bearer {key}","Content-Type":"application/json"},payload)
     if status>=400: raise HTTPException(502,{"message":"Moltbook publish failed","status_code":status,"response":body})
     return body
@@ -479,6 +492,7 @@ async def preview(experiment_id:str):
     e,r=load_result(experiment_id)
     try:
         title,content=build_post(e,r)
+        content=sanitize_public_text(content)
     except Exception as exc:
         # Never hide the real Preview failure behind a generic HTML/PlainText 500.
         # This also makes older stored result shapes diagnosable from Swagger.
@@ -487,15 +501,18 @@ async def preview(experiment_id:str):
         raise HTTPException(500,{
             "message":"Research result exists but Preview rendering failed",
             "experiment_id":experiment_id,
-            "result_id":getattr(r,"id",None),
+            **({"result_id":getattr(r,"id",None)} if public_ids_enabled() else {}),
             "error":detail[:12000]
         })
-    return {"status":"preview","experiment_id":experiment_id,"title":title,"content":content,"result_id":getattr(r,"id",None)}
+    out={"status":"preview","experiment_id":experiment_id,"title":title,"content":sanitize_public_text(content)}
+    if public_ids_enabled(): out["result_id"]=getattr(r,"id",None)
+    return sanitize_public_payload(out)
 
 @router.post("/research/{experiment_id}/publish")
 async def publish_research(experiment_id:str, republish:bool=Query(False)):
     e,r=load_result(experiment_id)
     title,content=build_post(e,r)
+    content=sanitize_public_text(content)
     out=await publish(title,content,republish=republish)
     verification=await _verify_post(out)
     post_id=out.get("id") or (out.get("post") or {}).get("id")
@@ -515,7 +532,7 @@ async def publish_research(experiment_id:str, republish:bool=Query(False)):
 
 @router.post("/research/{experiment_id}/publish-manual-verify")
 async def publish_manual_verify(experiment_id:str, republish:bool=Query(False)):
-    e,r=load_result(experiment_id); title,content=build_post(e,r); out=await publish(title,content,republish=republish)
+    e,r=load_result(experiment_id); title,content=build_post(e,r); content=sanitize_public_text(content); out=await publish(title,content,republish=republish)
     post=out.get("post") if isinstance(out,dict) and isinstance(out.get("post"),dict) else out
     verification=post.get("verification") if isinstance(post,dict) else None
     challenge=(verification or {}).get("challenge_text") or (verification or {}).get("challenge") or (post.get("verification_question") if isinstance(post,dict) else None)
