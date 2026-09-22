@@ -10,8 +10,8 @@ from app import unified_research
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
-    # Recover research metadata/results when the SQLite DB was reset but the
-    # research input directory survived the deployment/restart.
+    # Recover Experiment/ExperimentResult rows from disk if the DB was reset but
+    # RESEARCH_INPUT_ROOT survived (see unified_research.recover_research_state).
     unified_research.recover_research_state()
     yield
 
