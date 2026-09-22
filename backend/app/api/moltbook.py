@@ -131,7 +131,7 @@ def _fmt_money_pct(ev):
     hundreds of monthly/hourly rows into one post.
     """
     if not isinstance(ev, dict):
-        return str(ev)[:800]
+        return str(ev)
     ev=_scrub_evidence(ev)
     # Holding-duration comparison: outcome-conditioned by construction, so
     # render it as a plain comparison rather than dumping the WIN/LOSS stat
@@ -198,7 +198,10 @@ def _fmt_money_pct(ev):
             "losing_trades":ev.get("losing_trades"),
             "difference_avg_hold_minutes":ev.get("difference_avg_hold_minutes")
         },ensure_ascii=False)
-    return json.dumps(ev,ensure_ascii=False,default=str)[:1600]
+    # Preserve the complete finding evidence in the public research record.
+    # The stored result remains the canonical source; the public post mirrors
+    # the finding without silently dropping fields.
+    return json.dumps(ev,ensure_ascii=False,default=str)
 
 
 def _as_dict(value):
@@ -248,32 +251,28 @@ def build_post(e,r):
     lines.append("")
     if findings:
         lines.append("Key observations from this run:")
-        # Keep the research voice consistent without forcing every finding into
-        # the same template. The wording is chosen from the finding itself,
-        # so the post reads like a research note rather than a generated form.
-        for f in findings[:8]:
+        # Keep all findings and all available evidence. The wording varies by
+        # finding so the post reads like a running research note rather than a
+        # rigid template. No finding is silently discarded here.
+        lead_cycle=[
+            "What stands out: ",
+            "Observed pattern: ",
+            "A useful caveat: ",
+            "Why it matters: ",
+            "Research note: ",
+        ]
+        for idx,f in enumerate(findings):
             f=_as_dict(f)
             q=str(f.get("question",f.get("feature","Research finding")))
             lines.append(f"- {q}")
             lines.append("  Evidence: "+_fmt_money_pct(f.get("evidence",{})))
             interpretation=str(f.get("interpretation") or "Observed association in the supplied backtest; this does not establish causation.")
-            ql=q.lower()
-            if "chronological" in ql or "period" in ql or "time" in ql:
-                lead="What this suggests: "
-            elif "sensitive" in ql or "largest" in ql or "concentrated" in ql:
-                lead="Robustness note: "
-            elif "unusual" in ql or "shuffled" in ql or "permutation" in ql:
-                lead="Statistical note: "
-            elif "holding" in ql:
-                lead="A useful caveat: "
-            else:
-                lead="Reading the result: "
-            lines.append("  "+lead+interpretation)
+            lines.append("  "+lead_cycle[idx % len(lead_cycle)]+interpretation)
     else:
         lines.append("Key observations from this run: none established from the supplied data.")
     if hypotheses:
-        lines += ["","Questions worth testing next:"]
-        for h in hypotheses[:6]:
+        lines += ["","Working hypotheses and open questions:"]
+        for h in hypotheses:
             h=_as_dict(h)
             if not h.get("statement"): continue
             lines.append(f"- {h['statement']}")
@@ -299,9 +298,9 @@ def build_post(e,r):
         "This is a report of the supplied EA/backtest data, not a live-trading signal or financial advice."
     ]
     content="\n".join(lines)
-    # Keep public posts comfortably below common API/feed limits while preserving
-    # the core evidence and limitations. Stored research remains complete.
-    max_chars=int(os.getenv("MOLTBOOK_PUBLIC_MAX_CHARS","12000"))
+    # Keep a generous configurable ceiling so public posts retain the accumulated
+    # evidence. The stored research result remains the canonical full record.
+    max_chars=int(os.getenv("MOLTBOOK_PUBLIC_MAX_CHARS","24000"))
     if len(content)>max_chars:
         marker="\n\n[Public post compacted; full evidence remains in the research result.]\n"
         content=content[:max(0,max_chars-len(marker))].rsplit("\n",1)[0]+marker
