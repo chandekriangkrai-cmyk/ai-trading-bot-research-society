@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from app.database import SessionLocal
-from app.research_models import Experiment, ExperimentResult
+from app.research_models import Experiment, ExperimentResult, MoltbookPostLink
 
 router=APIRouter(prefix="/moltbook",tags=["Moltbook"])
 BASE=os.getenv("MOLTBOOK_API_BASE","https://www.moltbook.com/api/v1").rstrip("/")
@@ -229,7 +229,11 @@ def build_post(e,r):
     lines=[
         "AI Trading Bot Research Society — Research Update",
         f"Experiment: {e.id}",
-        f"Strategy: {e.symbol} {e.timeframe}",
+        f"Strategy: Proprietary {e.symbol} {e.timeframe} automated trading system",
+        "",
+        "System architecture (high level):",
+        "Rule-based trade selection with indicator-derived decision components, directional logic, and predefined position-management/exit behavior.",
+        "Exact indicators, parameter values, thresholds, entry/exit rules, and source implementation are intentionally undisclosed.",
         "",
         "Research scope:",
         "EA .mq5 + MT5 Backtest only.",
@@ -263,7 +267,7 @@ def build_post(e,r):
             if not h.get("statement"): continue
             lines.append(f"- {h['statement']}")
             if h.get("missing_evidence"):
-                lines.append("  Missing evidence: "+json.dumps(h["missing_evidence"],ensure_ascii=False))
+                lines.append("  Missing evidence: "+json.dumps([x for x in h["missing_evidence"] if "indicator" not in str(x).lower() and "parameter" not in str(x).lower()],ensure_ascii=False))
             if h.get("alternative_explanations"):
                 lines.append("  Alternatives: "+json.dumps(h["alternative_explanations"],ensure_ascii=False))
     critique=[]
@@ -281,6 +285,8 @@ def build_post(e,r):
         "3. Does the observed behavior remain stable across different backtest periods?",
         "4. What evidence would falsify the observed pattern?",
         "5. Which hypothesis should be tested against a new backtest?",
+        "6. How sensitive is the result to removal of the largest winning trades?",
+        "7. Does the observed payoff structure persist across independent periods?",
         "",
         "This post reports supplied-data evidence only. It is not a live-trading signal or financial advice."
     ]
@@ -492,7 +498,20 @@ async def publish_research(experiment_id:str, republish:bool=Query(False)):
     title,content=build_post(e,r)
     out=await publish(title,content,republish=republish)
     verification=await _verify_post(out)
-    return {"status":"published" if verification.get("verified") else "published_pending_verification","experiment_id":experiment_id,"title":out.get("title") or title,"post_id":out.get("id") or (out.get("post") or {}).get("id"),"verification":verification,"moltbook":out}
+    post_id=out.get("id") or (out.get("post") or {}).get("id")
+    if post_id:
+        db=SessionLocal()
+        try:
+            link=db.query(MoltbookPostLink).filter(MoltbookPostLink.experiment_id==experiment_id).first()
+            if not link:
+                link=MoltbookPostLink(experiment_id=experiment_id,post_id=str(post_id),title=out.get("title") or title,status="published")
+                db.add(link)
+            else:
+                link.post_id=str(post_id); link.title=out.get("title") or title; link.status="published"
+            db.commit()
+        finally:
+            db.close()
+    return {"status":"published" if verification.get("verified") else "published_pending_verification","experiment_id":experiment_id,"title":out.get("title") or title,"post_id":post_id,"verification":verification,"moltbook":out}
 
 @router.post("/research/{experiment_id}/publish-manual-verify")
 async def publish_manual_verify(experiment_id:str, republish:bool=Query(False)):
