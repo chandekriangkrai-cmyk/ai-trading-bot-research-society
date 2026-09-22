@@ -11,16 +11,15 @@ from typing import Any
 
 # Keys that should never be rendered in public research text.
 _INTERNAL_KEY_RE = re.compile(
-    r"(?i)(?:result[_ -]?id|file[_ -]?id|upload[_ -]?id|job[_ -]?id|run[_ -]?id|"
+    r"(?i)(?:experiment[_ -]?id|result[_ -]?id|post[_ -]?id|file[_ -]?id|upload[_ -]?id|job[_ -]?id|run[_ -]?id|"
     r"request[_ -]?id|task[_ -]?id|session[_ -]?id|trace[_ -]?id|internal[_ -]?id)"
     r"\s*[:=]\s*[\"']?[A-Za-z0-9_.:/\\-]+[\"']?"
 )
 
 # Common infrastructure metadata that has no research value in a public post.
 _INTERNAL_LABEL_RE = re.compile(
-    r"(?i)\b(?:internal\s+id|database\s+id|api\s+response\s+id|"
-    r"upload\s+id|job\s+id|run\s+id|request\s+id|session\s+id|"
-    r"file\s+id|trace\s+id)\b\s*[:=]\s*[^\n,;}]+"
+    r"(?i)\b(?:internal\s+id|database\s+id|api\s+response\s+id|experiment\s+id|post\s+id|"
+    r"upload\s+id|job\s+id|run\s+id|request\s+id|session\s+id|file\s+id|trace\s+id)\b\s*[:=]\s*[^\n,;}]+"
 )
 
 # Absolute local/container paths should never leak into public discussion.
@@ -28,12 +27,12 @@ _PATH_RE = re.compile(r"(?:(?:/mnt|/tmp|/workspace|/app|[A-Za-z]:\\)[^\s\]\[\"']
 
 # API keys / bearer tokens. Do not try to be clever: redact obvious secrets.
 _SECRET_RE = re.compile(
-    r"(?i)\b(?:bearer\s+)?(?:sk-[A-Za-z0-9_-]{12,}|molt(?:dev)?_[A-Za-z0-9_-]{12,}|"
+    r"(?i)\b(?:bearer\s+)?(?:sk-[A-Za-z0-9_-]{12,}|molt(?:dev|book)?_[A-Za-z0-9_-]{12,}|"
     r"api[_-]?key\s*[:=]\s*[A-Za-z0-9_.-]{12,})\b"
 )
 
-# UUIDs are not automatically secret because experiment IDs may intentionally be
-# public. Only redact UUIDs when they are attached to an internal-ID label.
+# Internal UUIDs are retained only in private storage. Public payloads remove
+# experiment/result/post identifiers by key; text labels are scrubbed as well.
 
 
 def _custom_secret_terms() -> list[str]:
@@ -64,7 +63,7 @@ def sanitize_public_payload(value: Any) -> Any:
         out = {}
         for k, v in value.items():
             key = str(k)
-            if re.fullmatch(r"(?i)(result_id|file_id|upload_id|job_id|run_id|request_id|task_id|session_id|trace_id|internal_id)", key):
+            if re.fullmatch(r"(?i)(experiment_id|result_id|post_id|file_id|upload_id|job_id|run_id|request_id|task_id|session_id|trace_id|internal_id)", key):
                 continue
             out[key] = sanitize_public_payload(v)
         return out
