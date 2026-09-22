@@ -44,20 +44,34 @@ def load_result(eid):
         e=db.query(Experiment).filter(Experiment.id==eid).first()
         if not e: raise HTTPException(404,"Experiment not found")
         rows=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).order_by(ExperimentResult.created_at.desc()).all()
-        # Only the current V3 schema is publishable. Never fall back to an older
-        # V1/V2 result, because that can resurrect the legacy holding-duration schema.
-        r=next((x for x in rows if _is_unified(x)),None)
-        if not r:
-            raise HTTPException(409,"No current ea_backtest_research_v3 result found for this experiment. Run research again before preview/publish.")
+        r=next((x for x in rows if _is_unified(x)),rows[0] if rows else None)
+        if not r: raise HTTPException(404,"No research result found for this experiment")
         return e,r
     finally: db.close()
 
 def _is_unified(r):
     try:
         engine = json.loads(r.metrics or "{}").get("engine")
-        return engine == "ea_backtest_research_v3"
+        return engine in {"unified_research_v1", "unified_research_v2", "ea_backtest_research_v1", "ea_backtest_research_v2"}
     except Exception:
         return False
+
+def _drop_degenerate_win_rate(d):
+    """Strip win_rate / win_rate_95ci from a stats dict.
+
+    Same principle already applied to the WIN-vs-LOSS holding-duration
+    finding below (see unified_research.py): once a subgroup has been
+    selected by an extremum (strongest/weakest month, highest/lowest
+    net-profit hour/weekday, first/last period) rather than representing
+    the full population, a small sample can trivially land on
+    win_rate == 1.0 or 0.0. Showing that bare number next to real
+    aggregate stats misleadingly reads as a performance signal, so we
+    omit it here and keep n/wins/losses (from which a reader can judge
+    sample size for themselves) instead.
+    """
+    if not isinstance(d, dict):
+        return d
+    return {k: v for k, v in d.items() if k not in ("win_rate", "win_rate_95ci")}
 
 def _fmt_money_pct(ev):
     """Create a compact, auditable public evidence representation.
@@ -96,8 +110,11 @@ def _fmt_money_pct(ev):
                 weakest=min(ranked,key=lambda z: float(z[1].get("net_profit",0) or 0))
                 for item in (strongest,weakest):
                     if item not in selected: selected.append(item)
-        compact={k:{kk:x.get(kk) for kk in ("n","wins","losses","win_rate","net_profit","net_profit_pct_initial_capital","profit_factor") if kk in x} for k,x in selected}
-        return json.dumps({"period_count":len(ranked),"selected_periods":compact,"highest_win_rate_period":ev.get("highest_win_rate_period"),"lowest_win_rate_period":ev.get("lowest_win_rate_period")},ensure_ascii=False)
+        # win_rate deliberately excluded: these periods are extrema-selected
+        # (first/last/strongest/weakest), not the full population, so a thin
+        # period can trivially show 1.0/0.0. See _drop_degenerate_win_rate.
+        compact={k:{kk:x.get(kk) for kk in ("n","wins","losses","net_profit","net_profit_pct_initial_capital","profit_factor") if kk in x} for k,x in selected}
+        return json.dumps({"period_count":len(ranked),"selected_periods":compact},ensure_ascii=False)
     if "groups" in ev and isinstance(ev["groups"],dict):
         groups=ev["groups"]
         items=[(str(k),x) for k,x in groups.items() if isinstance(x,dict)]
@@ -107,8 +124,8 @@ def _fmt_money_pct(ev):
         lo=min(items,key=lambda z: float(z[1].get("net_profit",0) or 0))
         return json.dumps({
             "group_count":len(items),
-            "highest_net_profit_group":{hi[0]:hi[1]},
-            "lowest_net_profit_group":{lo[0]:lo[1]},
+            "highest_net_profit_group":{hi[0]:_drop_degenerate_win_rate(hi[1])},
+            "lowest_net_profit_group":{lo[0]:_drop_degenerate_win_rate(lo[1])},
         },ensure_ascii=False)
     if "winning_trades" in ev and "losing_trades" in ev:
         return json.dumps({
