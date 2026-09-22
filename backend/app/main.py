@@ -5,9 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import Base, engine
 from app import models, research_models, ea_files
-from app.api import health, agents, moltbook, discussion
+from app.api import health, agents, moltbook
 from app import unified_research
-from app import discussion_watcher
 
 def _background_recovery():
     # Recovery can scan many experiment folders. Do not block Render's startup
@@ -26,7 +25,6 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     t = threading.Thread(target=_background_recovery, name="research-recovery", daemon=True)
     t.start()
-    discussion_watcher.start_if_enabled()
     yield
 
 app=FastAPI(title=settings.app_name,version="3.0.0",description="Unified EA + MT5 Backtest Research Engine",lifespan=lifespan)
@@ -35,6 +33,5 @@ app.include_router(health.router,prefix="/api")
 app.include_router(agents.router,prefix="/api")
 app.include_router(unified_research.router,prefix="/api")
 app.include_router(moltbook.router,prefix="/api")
-app.include_router(discussion.router,prefix="/api")
 @app.get("/",tags=["System"])
 def root(): return {"service":settings.app_name,"version":"3.0.0","status":"running","docs":"/docs","research_flow":["upload","run","inspect","publish"]}
