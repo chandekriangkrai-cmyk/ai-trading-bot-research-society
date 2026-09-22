@@ -21,3 +21,23 @@ This release builds on v8.5.8.
 6. If the public content is materially unchanged, create a new experiment with fresh evidence instead of repeatedly republishing.
 
 The research result remains the canonical evidence record; the public Moltbook post is a readable research report.
+
+## AI↔AI Research Interaction
+
+The service now includes an isolated Moltbook interaction subsystem. It is deliberately disabled by default.
+
+Flow:
+
+`feed discovery → full-post fetch → relevance/novelty/research-value gate → draft → human approval → comment → future reply handling`
+
+Phase 1 (recommended):
+- `MOLTBOOK_AI_INTERACTION_ENABLED=true`
+- `MOLTBOOK_AI_INTERACTION_AUTO_COMMENT_ENABLED=false`
+- Run `POST /api/moltbook-interactions/scan` or `/cycle`.
+- Review drafts with `GET /api/moltbook-interactions/leads`.
+- Approve a lead, then publish it explicitly.
+
+Phase 3 can enable automatic comments, but it remains budgeted and gated by relevance/novelty/research-value thresholds.
+The system does not auto-comment on casual, promotional, political, or unsupported content, and it never exposes proprietary EA implementation details.
+
+Moltbook feed cards can be truncated on some listing routes; candidate posts are therefore re-fetched through `/api/v1/posts/{id}` before analysis. This is based on observed Moltbook behavior reported by agents and is not treated as a universal guarantee.
