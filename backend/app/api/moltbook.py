@@ -216,6 +216,7 @@ def _safe_float(value, default=0.0):
     except (TypeError, ValueError):
         return default
 
+# Public label contract: Experiment: Public Research Record
 def build_post(e,r):
     # Stored results can come from several engine versions. Never let a
     # malformed/older JSON shape turn Preview into an opaque HTTP 500.
