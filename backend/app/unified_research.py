@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json, os, re, statistics, math
+import json, os, re, statistics, math, traceback
 from collections import defaultdict, Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,9 +49,32 @@ def pick(row,*names):
         if any(norm(n) in k or k in norm(n) for n in names): return v
     return None
 
+def decode_bytes(raw):
+    # MT5's own report exports are inconsistent: the Strategy Tester "Save as
+    # Report" CSV is commonly UTF-16 (with or without a BOM), while other
+    # exports are plain UTF-8. Guessing wrong silently corrupts every field,
+    # which previously caused parsing to find zero rows/headers with no
+    # visible error until the whole job crashed further downstream.
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try: return raw.decode("utf-16")
+        except Exception: pass
+    if raw[:3] == b"\xef\xbb\xbf":
+        return raw.decode("utf-8-sig", "replace")
+    # No BOM: heuristically detect UTF-16 by looking for the alternating
+    # NUL-byte pattern typical of ASCII text stored as UTF-16 LE/BE.
+    # LE stores ASCII as [char_byte, 0x00] -> zeros cluster at odd offsets.
+    # BE stores ASCII as [0x00, char_byte] -> zeros cluster at even offsets.
+    sample = raw[:2000]
+    zeros_at_odd = sample[1::2].count(0); zeros_at_even = sample[0::2].count(0)
+    if len(sample) >= 20 and max(zeros_at_odd, zeros_at_even) > len(sample) * 0.3:
+        try: return raw.decode("utf-16-le" if zeros_at_odd > zeros_at_even else "utf-16-be")
+        except Exception: pass
+    try: return raw.decode("utf-8-sig")
+    except Exception: return raw.decode("cp1252", "replace")
+
 def parse_csv_bytes(raw):
     import csv, io
-    text=raw.decode("utf-8-sig","replace")
+    text=decode_bytes(raw)
     try: d=csv.Sniffer().sniff(text[:8192],delimiters=",;\t")
     except: d=csv.excel
     return [dict(r) for r in csv.DictReader(io.StringIO(text),dialect=d)]
@@ -107,11 +130,14 @@ def load_rows(path):
                 if n.lower().endswith((".html",".htm")): out.extend(parse_html(b))
                 else: out.extend(parse_csv_bytes(b))
         return out
-    # MT5 Strategy Tester CSV reports can contain several sections in one CSV.
-    # Locate every recognizable Deals header instead of assuming row 1 is the data header.
+    # MT5 Strategy Tester CSV reports can contain several sections in one CSV,
+    # and can be comma, semicolon, or tab delimited depending on locale/export
+    # method — sniff the real delimiter instead of assuming a comma.
     import csv, io
-    text=raw.decode("utf-8-sig","replace")
-    matrix=list(csv.reader(io.StringIO(text)))
+    text=decode_bytes(raw)
+    try: dialect=csv.Sniffer().sniff(text[:8192],delimiters=",;\t")
+    except Exception: dialect=csv.excel
+    matrix=list(csv.reader(io.StringIO(text),dialect=dialect))
     sections=[]
     for i,row in enumerate(matrix):
         h=[norm(x) for x in row]
@@ -423,6 +449,13 @@ def _run_job(eid):
         # as this folder itself survives.
         (folder/"result.json").write_text(json.dumps({"summary":r.summary,"metrics":result,"evidence":json.loads(r.evidence),"limitations":limitations,"conclusion":r.conclusion},ensure_ascii=False,default=str),encoding="utf-8")
     except Exception as ex:
+        # Persist the real traceback to disk so it's retrievable via the API
+        # even though BackgroundTasks exceptions don't reach the HTTP caller.
+        # Previously a failure only showed as status="failed" with no reason,
+        # requiring a trip to Render's log console to diagnose.
+        try:
+            (folder/"error.txt").write_text(f"{ex}\n\n{traceback.format_exc()}",encoding="utf-8")
+        except Exception: pass
         e=db.query(Experiment).filter(Experiment.id==eid).first()
         if e:e.status="failed";e.completed_at=now();db.commit()
         raise
@@ -493,7 +526,11 @@ def get_research(experiment_id:str):
         e=db.query(Experiment).filter(Experiment.id==eid).first()
         if not e:raise HTTPException(404,"Experiment not found")
         r=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).order_by(ExperimentResult.created_at.desc()).first()
-        return {"experiment_id":eid,"status":e.status,"symbol":e.symbol,"timeframe":e.timeframe,"result":json.loads(r.metrics) if r else None,"result_id":r.id if r else None}
+        error=None
+        if e.status=="failed":
+            error_path=ROOT/eid/"error.txt"
+            if error_path.is_file(): error=error_path.read_text("utf-8",errors="replace")
+        return {"experiment_id":eid,"status":e.status,"symbol":e.symbol,"timeframe":e.timeframe,"result":json.loads(r.metrics) if r else None,"result_id":r.id if r else None,"error":error}
     finally:db.close()
 
 @router.post("/{experiment_id}/run")
