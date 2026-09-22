@@ -435,14 +435,14 @@ def _delete_unused(folder):
         p=folder/name
         if p.exists() and p.is_file(): p.unlink()
 
-def _run_job(eid):
+def _run_job(eid, allow_existing=False):
     folder=ROOT/eid; db=SessionLocal()
     try:
         e=db.query(Experiment).filter(Experiment.id==eid).first()
         if not e:return
         # A result already on disk/DB means this job has already completed.
         existing=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).first()
-        if existing:
+        if existing and not allow_existing:
             e.status="completed"; e.completed_at=e.completed_at or now(); db.commit(); return
         e.status="running"; db.commit()
 
@@ -460,7 +460,8 @@ def _run_job(eid):
         if not rows: limitations.append("The supplied backtest file produced zero parsed rows.")
         if not trades: limitations.append("No completed trades could be reconstructed from the supplied backtest.")
         if analysis["findings"]==[]: limitations.append("No evidence-backed pattern was established; absence of a finding is not evidence that no relationship exists.")
-        result={"engine":"ea_backtest_research_v3","status":"completed","experiment_id":eid,"input_lineage":{"sources":["ea.mq5","backtest"],"explicitly_excluded":["OHLC bars","all ticks","external market data"]},"data_quality":{"raw_backtest_rows":len(rows),"reconstructed_trades":len(trades),"initial_capital":INITIAL_CAPITAL},"analysis":analysis,"limitations":limitations,"generated_at":now().isoformat()}
+        research_run_id=f"run_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid4().hex[:8]}"
+        result={"engine":"ea_backtest_research_v3","status":"completed","research_run_id":research_run_id,"experiment_id":eid,"input_lineage":{"sources":["ea.mq5","backtest"],"explicitly_excluded":["OHLC bars","all ticks","external market data"]},"data_quality":{"raw_backtest_rows":len(rows),"reconstructed_trades":len(trades),"initial_capital":INITIAL_CAPITAL},"analysis":analysis,"limitations":limitations,"generated_at":now().isoformat()}
 
         # Write the durable artifact first. If the DB transaction fails, startup
         # recovery can rebuild ExperimentResult from this file.
@@ -486,14 +487,14 @@ def _run_job(eid):
     finally:
         db.close()
 
-def _submit_research_job(eid):
+def _submit_research_job(eid, allow_existing=False):
     """Submit a research job outside the request lifecycle.
 
     FastAPI BackgroundTasks is excellent for short post-response work, but EA/CSV
     analysis can be CPU/file intensive. A dedicated executor prevents the job from
     being coupled to the response task and gives us a Future we can observe/log.
     """
-    future=RESEARCH_EXECUTOR.submit(_run_job,eid)
+    future=RESEARCH_EXECUTOR.submit(_run_job,eid,allow_existing)
     def _done(f):
         try: f.result()
         except Exception: traceback.print_exc()
@@ -565,6 +566,29 @@ async def upload_data(experiment_id:str=Form("random"),symbol:str=Form(""),timef
         make_experiment(db,eid,symbol,timeframe,ea_file.filename)
         return {"status":"uploaded","experiment_id":eid,"files":{"ea":ea_file.filename,"backtest":backtest_file.filename},"research_scope":["EA .mq5","Backtest"],"excluded":["M30 Bars","All Tick","external market data"],"next":"POST /api/research/{experiment_id}/run"}
     finally:db.close()
+
+@router.post("/{experiment_id}/run-again")
+def run_research_again(experiment_id:str):
+    """Create a fresh research result from the same persisted EA/backtest inputs.
+
+    This does not overwrite prior results; the new result receives its own
+    research_run_id. Use a new experiment_id when the public post itself must
+    represent a materially different experiment.
+    """
+    eid=safe_id(experiment_id); folder=ROOT/eid
+    if not (folder/"ea.mq5").is_file() or not (folder/"backtest").is_file():
+        raise HTTPException(409,"Upload EA and backtest first")
+    db=SessionLocal()
+    try:
+        e=db.query(Experiment).filter(Experiment.id==eid).first()
+        if not e: raise HTTPException(404,"Experiment not found")
+        if e.status in {"queued","running"}:
+            raise HTTPException(409,{"message":"Research is already running","experiment_id":eid})
+        e.status="queued"; e.completed_at=None; db.commit()
+    finally: db.close()
+    # The worker's existing-result guard must be bypassed for this explicit endpoint.
+    _submit_research_job(eid, allow_existing=True)
+    return {"experiment_id":eid,"status":"queued","message":"A fresh research run is being generated. Poll GET /api/research/{experiment_id}.","note":"Previous result records are retained."}
 
 @router.get("/{experiment_id}")
 def get_research(experiment_id:str):
