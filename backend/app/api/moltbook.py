@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio, json, os, re, urllib.error, urllib.request, uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from app.database import SessionLocal
@@ -200,13 +201,31 @@ def _fmt_money_pct(ev):
     return json.dumps(ev,ensure_ascii=False,default=str)[:1600]
 
 
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+def _as_list(value):
+    return value if isinstance(value, list) else []
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
 def build_post(e,r):
-    m=json.loads(r.metrics or "{}")
-    a=m.get("analysis",{})
-    findings=a.get("findings",[])
-    hypotheses=a.get("hypotheses",[])
-    title=f"Research Update: {e.symbol} {e.timeframe}"
-    account=a.get("account_context",{})
+    # Stored results can come from several engine versions. Never let a
+    # malformed/older JSON shape turn Preview into an opaque HTTP 500.
+    try:
+        raw=json.loads(r.metrics or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw={}
+    m=_as_dict(raw)
+    a=_as_dict(m.get("analysis"))
+    findings=_as_list(a.get("findings"))
+    hypotheses=_as_list(a.get("hypotheses"))
+    title=f"Research Update: {getattr(e,'symbol',None) or 'UNKNOWN'} {getattr(e,'timeframe',None) or 'UNKNOWN'}"
+    account=_as_dict(a.get("account_context"))
     lines=[
         "AI Trading Bot Research Society — Research Update",
         f"Experiment: {e.id}",
@@ -217,19 +236,20 @@ def build_post(e,r):
         "No OHLC bars, tick data, or external market data were used.",
     ]
     if account.get("initial_capital") is not None:
-        lines.append(f"Initial capital configuration: ${float(account['initial_capital']):,.2f}")
-    overall=a.get("overall",{})
+        lines.append(f"Initial capital configuration: ${_safe_float(account['initial_capital']):,.2f}")
+    overall=_as_dict(a.get("overall"))
     if overall.get("n"):
         lines += [
             f"Completed trades analyzed: {overall['n']}",
-            f"Net profit: ${overall.get('net_profit',0):,.2f} ({overall.get('net_profit_pct_initial_capital',0):+.2f}% of initial capital)",
+            f"Net profit: ${_safe_float(overall.get('net_profit')):,.2f} ({_safe_float(overall.get('net_profit_pct_initial_capital')):+.2f}% of initial capital)",
         ]
         if overall.get("max_drawdown_absolute") is not None:
-            lines.append(f"Observed max drawdown: ${overall['max_drawdown_absolute']:,.2f} ({overall.get('max_drawdown_pct_initial_capital',0):.2f}% of initial capital)")
+            lines.append(f"Observed max drawdown: ${_safe_float(overall.get('max_drawdown_absolute')):,.2f} ({_safe_float(overall.get('max_drawdown_pct_initial_capital')):.2f}% of initial capital)")
     lines.append("")
     if findings:
         lines.append("Evidence-backed observations:")
         for f in findings[:8]:
+            f=_as_dict(f)
             q=f.get("question",f.get("feature","Research finding"))
             lines.append(f"- {q}")
             lines.append("  Evidence: "+_fmt_money_pct(f.get("evidence",{})))
@@ -239,6 +259,7 @@ def build_post(e,r):
     if hypotheses:
         lines += ["","Research hypotheses (not validated findings):"]
         for h in hypotheses[:6]:
+            h=_as_dict(h)
             if not h.get("statement"): continue
             lines.append(f"- {h['statement']}")
             if h.get("missing_evidence"):
@@ -246,8 +267,10 @@ def build_post(e,r):
             if h.get("alternative_explanations"):
                 lines.append("  Alternatives: "+json.dumps(h["alternative_explanations"],ensure_ascii=False))
     critique=[]
-    if m.get("limitations"): critique.extend(m.get("limitations",[])[:4])
-    if a.get("insufficient_evidence"): critique.extend([x.get("reason","") for x in a.get("insufficient_evidence",[])[:4] if x.get("reason")])
+    limitations=_as_list(m.get("limitations"))
+    if limitations: critique.extend([str(x) for x in limitations[:4]])
+    insufficient=_as_list(a.get("insufficient_evidence"))
+    if insufficient: critique.extend([_as_dict(x).get("reason","") for x in insufficient[:4] if _as_dict(x).get("reason")])
     if critique:
         lines += ["","Research limitations / critique:"]+[f"- {x}" for x in critique]
     lines += [
@@ -418,7 +441,21 @@ async def config():
 
 @router.get("/research/{experiment_id}/preview")
 async def preview(experiment_id:str):
-    e,r=load_result(experiment_id); title,content=build_post(e,r); return {"status":"preview","experiment_id":experiment_id,"title":title,"content":content}
+    e,r=load_result(experiment_id)
+    try:
+        title,content=build_post(e,r)
+    except Exception as exc:
+        # Never hide the real Preview failure behind a generic HTML/PlainText 500.
+        # This also makes older stored result shapes diagnosable from Swagger.
+        import traceback
+        detail=f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+        raise HTTPException(500,{
+            "message":"Research result exists but Preview rendering failed",
+            "experiment_id":experiment_id,
+            "result_id":getattr(r,"id",None),
+            "error":detail[:12000]
+        })
+    return {"status":"preview","experiment_id":experiment_id,"title":title,"content":content,"result_id":getattr(r,"id",None)}
 
 @router.post("/research/{experiment_id}/publish")
 async def publish_research(experiment_id:str, republish:bool=Query(False)):
