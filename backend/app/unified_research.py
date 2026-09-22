@@ -445,19 +445,7 @@ def get_research(experiment_id:str):
     try:
         e=db.query(Experiment).filter(Experiment.id==eid).first()
         if not e:raise HTTPException(404,"Experiment not found")
-        rows=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).order_by(ExperimentResult.created_at.desc()).all()
-        # Prefer the current V3 research schema so an older V2 result can never
-        # mask a newly generated V3 result.
-        r=None
-        for candidate in rows:
-            try:
-                if json.loads(candidate.metrics or "{}").get("engine") == "ea_backtest_research_v3":
-                    r=candidate
-                    break
-            except Exception:
-                continue
-        if r is None and rows:
-            r=rows[0]
+        r=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).order_by(ExperimentResult.created_at.desc()).first()
         return {"experiment_id":eid,"status":e.status,"symbol":e.symbol,"timeframe":e.timeframe,"result":json.loads(r.metrics) if r else None,"result_id":r.id if r else None}
     finally:db.close()
 
