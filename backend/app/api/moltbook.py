@@ -39,20 +39,97 @@ async def resolve_submolt():
     return {"submolt":name,"submolt_name":name,"submolt_id":sid}
 
 def load_result(eid):
+    """Load a completed research result for Moltbook preview/publish.
+
+    Recovery is deliberately lazy as well as startup-based. Render/container
+    restarts can reset the database while a persistent research_inputs disk
+    survives. In that case the preview endpoint used to return:
+    "No research result found for this experiment" even though result.json
+    was still present on disk. Rebuild the DB row from the on-disk manifest
+    and result before declaring the experiment missing.
+    """
     db=SessionLocal()
     try:
         e=db.query(Experiment).filter(Experiment.id==eid).first()
-        if not e: raise HTTPException(404,"Experiment not found")
-        rows=db.query(ExperimentResult).filter(ExperimentResult.experiment_id==eid).order_by(ExperimentResult.created_at.desc()).all()
-        r=next((x for x in rows if _is_unified(x)),rows[0] if rows else None)
-        if not r: raise HTTPException(404,"No research result found for this experiment")
-        return e,r
-    finally: db.close()
+
+        # First try the normal database path.
+        if e:
+            rows=db.query(ExperimentResult).filter(
+                ExperimentResult.experiment_id==eid
+            ).order_by(ExperimentResult.created_at.desc()).all()
+            r=next((x for x in rows if _is_unified(x)),rows[0] if rows else None)
+            if r:
+                return e,r
+
+        # Lazy recovery from persistent research_inputs. Import locally to
+        # avoid a module-level dependency cycle.
+        try:
+            from app import unified_research
+            unified_research.recover_research_state()
+        except Exception:
+            pass
+
+        # recover_research_state() uses its own DB session, so refresh ours.
+        db.expire_all()
+        e=db.query(Experiment).filter(Experiment.id==eid).first()
+        if e:
+            rows=db.query(ExperimentResult).filter(
+                ExperimentResult.experiment_id==eid
+            ).order_by(ExperimentResult.created_at.desc()).all()
+            r=next((x for x in rows if _is_unified(x)),rows[0] if rows else None)
+            if r:
+                return e,r
+
+        # Last-mile direct disk recovery. This also handles the small race
+        # where another process has written result.json but recovery has not
+        # yet committed its DB transaction.
+        folder=unified_research.ROOT / eid
+        manifest_path=folder / "manifest.json"
+        result_path=folder / "result.json"
+        if manifest_path.is_file() and result_path.is_file():
+            try:
+                manifest=json.loads(manifest_path.read_text("utf-8"))
+                saved=json.loads(result_path.read_text("utf-8"))
+                if not e:
+                    e=unified_research.make_experiment(
+                        db, eid, manifest.get("symbol"), manifest.get("timeframe"),
+                        manifest.get("ea_filename") or "recovered"
+                    )
+                r=db.query(ExperimentResult).filter(
+                    ExperimentResult.experiment_id==eid
+                ).order_by(ExperimentResult.created_at.desc()).first()
+                if not r:
+                    r=ExperimentResult(
+                        id=str(uuid.uuid4()),
+                        experiment_id=eid,
+                        summary=saved.get("summary","EA + Backtest evidence research"),
+                        metrics=json.dumps(saved.get("metrics",{}),ensure_ascii=False,default=str),
+                        evidence=json.dumps(saved.get("evidence",{}),ensure_ascii=False),
+                        limitations=json.dumps(saved.get("limitations",[]),ensure_ascii=False),
+                        conclusion=saved.get("conclusion",""),
+                    )
+                    db.add(r)
+                    db.commit()
+                return e,r
+            except Exception:
+                db.rollback()
+
+        if not e:
+            raise HTTPException(
+                404,
+                "Experiment not found. Upload/run this experiment again, or attach the persistent research disk if its files should still exist."
+            )
+        raise HTTPException(
+            404,
+            "No completed research result found for this experiment. Run POST /api/research/{experiment_id}/run first."
+        )
+    finally:
+        db.close()
 
 def _is_unified(r):
     try:
         engine = json.loads(r.metrics or "{}").get("engine")
-        return engine in {"unified_research_v1", "unified_research_v2", "ea_backtest_research_v1", "ea_backtest_research_v2"}
+        return engine in {"unified_research_v1", "unified_research_v2", "ea_backtest_research_v1", "ea_backtest_research_v2", "ea_backtest_research_v3"}
     except Exception:
         return False
 
@@ -411,7 +488,16 @@ async def config():
 
 @router.get("/research/{experiment_id}/preview")
 async def preview(experiment_id:str):
-    e,r=load_result(experiment_id); title,content=build_post(e,r); return {"status":"preview","experiment_id":experiment_id,"title":title,"content":content}
+    e,r=load_result(experiment_id)
+    title,content=build_post(e,r)
+    return {
+        "status":"preview",
+        "experiment_id":experiment_id,
+        "title":title,
+        "content":content,
+        "result_id":r.id,
+        "research_status":e.status,
+    }
 
 @router.post("/research/{experiment_id}/publish")
 async def publish_research(experiment_id:str, republish:bool=Query(False)):
