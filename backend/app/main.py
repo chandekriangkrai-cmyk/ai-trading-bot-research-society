@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import threading
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
@@ -7,12 +8,23 @@ from app import models, research_models, ea_files
 from app.api import health, agents, moltbook
 from app import unified_research
 
+def _background_recovery():
+    # Recovery can scan many experiment folders. Do not block Render's startup
+    # probe while doing that work; the API must become reachable first.
+    try:
+        unified_research.recover_research_state()
+    except Exception as exc:
+        print(f"[startup-recovery] {type(exc).__name__}: {exc}", flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Keep startup lightweight so Render can pass its health check promptly.
+    # Table creation is normally fast; recovery is deliberately moved out of
+    # the critical startup path.
     Base.metadata.create_all(bind=engine)
-    # Recover Experiment/ExperimentResult rows from disk if the DB was reset but
-    # RESEARCH_INPUT_ROOT survived (see unified_research.recover_research_state).
-    unified_research.recover_research_state()
+    t = threading.Thread(target=_background_recovery, name="research-recovery", daemon=True)
+    t.start()
     yield
 
 app=FastAPI(title=settings.app_name,version="3.0.0",description="Unified EA + MT5 Backtest Research Engine",lifespan=lifespan)
