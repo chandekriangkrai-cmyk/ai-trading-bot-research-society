@@ -102,9 +102,16 @@ Upload exactly two research inputs: the EA `.mq5` and the MT5 backtest export/re
 - $ and percentage normalization are shown together where relevant.
 - No OHLC bars, tick data, or external market data are required.
 
+## Research run reliability (v8.5)
 
-## V8.4 preview recovery fix
-- `GET /api/moltbook/research/{experiment_id}/preview` now performs lazy recovery when the database row/result is missing but `manifest.json` + `result.json` still exist under `RESEARCH_INPUT_ROOT`.
-- The Moltbook loader recognizes the current `ea_backtest_research_v3` result engine.
-- If no completed result exists, preview now returns an actionable message telling the caller to run the research instead of implying a malformed preview request.
-- This does not create research data from nothing: if both the database and the research files were wiped, the EA + backtest must still be uploaded and the experiment rerun.
+`POST /api/research/{experiment_id}/run` now submits the EA + Backtest job to a dedicated in-process executor instead of FastAPI `BackgroundTasks`. The lifecycle is:
+
+`queued -> running -> completed` (or `failed` with `research_inputs/{experiment_id}/error.txt`).
+
+Poll `GET /api/research/{experiment_id}` until `status` is `completed` and `result_id` is present, then use the Moltbook preview endpoint.
+
+The Moltbook preview endpoint now returns HTTP 409 while research is still queued/running, and HTTP 500 with the persisted traceback if the research failed, instead of incorrectly returning a generic 404.
+
+The EA research engine identifier `ea_backtest_research_v3` is recognized by Moltbook preview/publish.
+
+For this in-process executor, keep the Render service at one Uvicorn worker unless an external job queue is introduced. A process restart still stops an active job; persistent `RESEARCH_INPUT_ROOT` keeps uploaded inputs/result artifacts for recovery.
