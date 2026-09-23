@@ -299,9 +299,15 @@ def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, A
     if evidence_gap:
         value = max(value, 0.40)
         relevance = max(relevance, 0.30)
+    # V20: a concrete evidence gap is the primary admission signal.
+    # Relevance/value remain informative scores, but must not veto a post
+    # that already contains a specific claim, observed evidence, and a
+    # well-defined missing validation boundary. Domain/provenance/specificity
+    # guards still run later when the public comment is constructed.
     screened = relevance >= 0.30 and novelty >= 0.30 and value >= 0.30
     anchor_strength = _claim_anchor_strength(title, content)
-    decision = screened and evidence_gap is not None and (anchor_strength >= 2 or bool(evidence_gap))
+    evidence_gap_admission = evidence_gap is not None and novelty >= 0.30
+    decision = evidence_gap_admission and (anchor_strength >= 2 or bool(evidence_gap))
     comment = _evidence_gap_comment(title, content) if decision else None
     if decision and not comment:
         decision = False
@@ -657,6 +663,15 @@ def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
         (r"tool protocol|serving stack|retries.*benchmark|harness decides",
          "agent benchmark serving-stack effect", "benchmark outcomes under serving-stack confounds",
          "retry, tool-call and serving behavior", "whether the gap remains with a matched serving stack and tool protocol"),
+        (r"compile rate|compile failures|compiler-standard|code vulnerability repair|diff_f1|codebleu|big-vul|vulnerable functions",
+         "compile-rate evaluation validity", "whether compile rate measures actual vulnerability repair rather than harness artifacts",
+         "the reported harness-attributed compile failures and ranking reversal", "whether the ranking and repair quality persist with the compiler confound fixed and a change-aware metric evaluated on held-out vulnerable functions"),
+        (r"hazardarena|semantic safety|safe/unsafe twin|risk-sensitive tasks|semantic-to-action|safety option layer",
+         "semantic-safety evaluation", "semantic-to-action safety under matched physical tasks",
+         "the reported safe/unsafe twin-task results", "whether the safety gap persists on held-out asset/task combinations with an independently validated semantic judge"),
+        (r"nsga-ii|electrolyzer|hydrogen storage|fuel cell|grid volatility|renewable energy absorption|hardware capex",
+         "hydrogen-buffer grid optimization", "the claimed reduction in grid volatility and increase in renewable absorption",
+         "the NSGA-II sizing and volatility/absorption metrics", "whether the benefit remains when hardware CAPEX is imposed as an explicit constraint across held-out operating scenarios"),
         (r"llm-as-a-judge|llm labels|cheap labels|off-policy evaluation|doubly-robust|expert ground truth|annotation probabilities|rmse reductions",
          "LLM-label bias in off-policy evaluation", "the claimed efficiency of expert annotation allocation under biased proxy labels",
          "the reported RMSE reductions", "whether the improvement persists on a held-out annotation budget with expert labels reserved for validation"),
@@ -738,7 +753,7 @@ def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
                     "measur", "data", "benchmark", "paper", "simulation", "evidence",
                     "guarantee", "claim", "improve", "increase", "decrease", "error",
                     "accuracy", "performance", "bound", "threshold", "success", "latency", "disturbance", "volume", "liquidity", "odds", "rate",
-                    "evaluation", "budget", "rmse", "bias", "judge", "annotation", "provenance", "build", "verifiability")
+                    "evaluation", "budget", "rmse", "bias", "judge", "annotation", "provenance", "build", "verifiability", "minimiz", "maximize", "constraint", "optimization")
             if not any(c in low for c in cues):
                 return None
             return {"claim": claim, "mechanism": mechanism, "evidence": evidence, "gap": gap}
