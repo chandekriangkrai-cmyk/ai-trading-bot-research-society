@@ -307,7 +307,9 @@ def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, A
         decision = False
 
     reason = "Heuristic research relevance gate"
-    if screened and anchor_strength < 2:
+    if decision:
+        reason = "Evidence-gap admission: concrete claim, evidence, and missing validation found"
+    elif screened and anchor_strength < 2:
         reason = "Claim-anchor gate: insufficiently specific claim for a research comment"
     return {"relevance_score": relevance, "novelty_score": novelty, "research_value_score": value,
             "classification": "research_question" if decision else "other",
@@ -655,6 +657,24 @@ def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
         (r"tool protocol|serving stack|retries.*benchmark|harness decides",
          "agent benchmark serving-stack effect", "benchmark outcomes under serving-stack confounds",
          "retry, tool-call and serving behavior", "whether the gap remains with a matched serving stack and tool protocol"),
+        (r"llm-as-a-judge|llm labels|cheap labels|off-policy evaluation|doubly-robust|expert ground truth|annotation probabilities|rmse reductions",
+         "LLM-label bias in off-policy evaluation", "the claimed efficiency of expert annotation allocation under biased proxy labels",
+         "the reported RMSE reductions", "whether the improvement persists on a held-out annotation budget with expert labels reserved for validation"),
+        (r"0\.23 seconds|7\.80 seconds|first-token logit|structured json|four-option decision|recovery queue",
+         "recovery-decision latency", "the latency advantage of direct four-state selection over structured JSON generation",
+         "the reported 0.23-second versus 7.80-second measurements", "whether the latency gap persists on a held-out restart workload with the action set and hardware fixed"),
+        (r"80 percent accuracy|80% accuracy|acoustic side-channel|waveverif|signal-to-noise|factory floor",
+         "acoustic robot-workflow verification", "movement validation from acoustic side-channel signals",
+         "the reported ~80% baseline accuracy", "whether accuracy remains above a predefined reliability threshold under held-out factory noise and changed microphone conditions"),
+        (r"reproducible build|deterministic build|artifact verification|provenance attestations|verifiability",
+         "systemic build verifiability", "the claimed gap between deterministic output and independently reproducible provenance",
+         "the reported verifiability limitations", "whether an independent verifier can reconstruct the source state, environment, dependencies and instructions from the published metadata alone"),
+        (r"post-quantum|ml-kem|message size|cortexm4|sevenfold|7-fold|edhoc hybrid",
+         "post-quantum IoT overhead", "the deployment cost of hybrid post-quantum key exchange on constrained devices",
+         "the reported message-size increase", "whether the security benefit remains acceptable under a fixed radio-energy and latency budget on held-out constrained devices"),
+        (r"cheaper judge|jev-as-a-judge|0\.36%|three percentage points|99%.*accuracy|escalat",
+         "selective judge escalation", "the claim that confidence-based escalation preserves comparator accuracy",
+         "the reported three-point gap and 99% comparator accuracy", "whether the accuracy retention persists on held-out complex derivation and adversarially wrong-answer cases"),
         (r"65%.*security papers|18-point gap|no variance",
          "agent-security metric variance", "whether the metric can resolve the claimed performance gap",
          "the reported 18-point gap", "whether the metric remains informative after repeated independent runs with uncertainty reported"),
@@ -717,7 +737,8 @@ def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
             cues = ("show", "shows", "found", "result", "experiment", "test", "tested",
                     "measur", "data", "benchmark", "paper", "simulation", "evidence",
                     "guarantee", "claim", "improve", "increase", "decrease", "error",
-                    "accuracy", "performance", "bound", "threshold", "success", "latency", "disturbance", "volume", "liquidity", "odds", "rate")
+                    "accuracy", "performance", "bound", "threshold", "success", "latency", "disturbance", "volume", "liquidity", "odds", "rate",
+                    "evaluation", "budget", "rmse", "bias", "judge", "annotation", "provenance", "build", "verifiability")
             if not any(c in low for c in cues):
                 return None
             return {"claim": claim, "mechanism": mechanism, "evidence": evidence, "gap": gap}
@@ -734,7 +755,7 @@ def _domain_fingerprint(title: str, content: str) -> set[str]:
     groups = {
         "trading": ("backtest", "backtesting", "trading", "forex", "drawdown", "spread", "eurusd", "xauusd", "strategy tester"),
         "graph": ("gnn", "graph neural", "community detection", "message passing", "diffusion", "node", "edge reconstruction", "spatial attention"),
-        "agent_benchmark": ("agent benchmark", "benchmark", "tool timeout", "permission denial", "completion rate", "serving stack", "retry", "tool-call"),
+        "agent_benchmark": ("agent benchmark", "tool timeout", "permission denial", "completion rate", "serving stack", "retry", "tool-call"),
         "agent_security": ("mcp", "authorization", "prompt injection", "hijacked tool", "malicious invocation", "attack success", "threat model", "credential"),
         "market": ("prediction market", "odds", "liquidity", "order flow", "polymarket", "trader", "wallet", "sybil"),
         "robotics": ("robot", "robotic", "teleoperation", "hand pose", "trajectory", "manipulation", "sim-to-real", "microrobotic"),
@@ -768,12 +789,21 @@ def _comment_provenance_safe(title: str, content: str, comment: str) -> bool:
     low_post = f"{title} {content}".lower()
     # The extractor's claim must be represented by at least one meaningful
     # anchor in the original post. This blocks stale/legacy template comments.
-    claim_terms = [x for x in re.findall(r"[a-z0-9]{5,}", gap["claim"].lower().replace("-", " ")) if x not in {"under", "stated", "reported"}]
+    claim_terms = [x for x in re.findall(r"[a-z0-9]{5,}", gap["claim"].lower().replace("-", " ")) if x not in {"under", "stated", "reported", "whether"}]
+    # V19: the extracted claim only needs one meaningful anchor in the post;
+    # the claim is a normalized label, so requiring every normalized word would
+    # create false negatives (for example, "systemic build verifiability").
     if claim_terms and not any(term in low_post for term in claim_terms):
         return False
-    # At least one concrete evidence/gap anchor must also occur in the post.
-    gap_terms = re.findall(r"[a-z0-9]{5,}", f"{gap['evidence']} {gap['gap']}".lower())
-    if not any(term in low_post for term in gap_terms):
+    # Provenance means the *evidence* used to motivate the question is present
+    # in the post. The proposed validation boundary is intentionally new; it
+    # should NOT have to already appear in the source text.
+    evidence_terms = re.findall(r"[a-z0-9]{4,}", gap["evidence"].lower())
+    # Evidence descriptions are normalized labels, so one concrete textual or
+    # numeric anchor is sufficient. The proposed validation gap is deliberately
+    # new and must not be required to already exist in the source post.
+    numeric_anchors = re.findall(r"\d+(?:\.\d+)?%?", gap["evidence"].lower())
+    if evidence_terms and not any(term in low_post for term in evidence_terms) and not any(num in low_post for num in numeric_anchors):
         return False
     return _comment_domain_safe(title, content, comment)
 
