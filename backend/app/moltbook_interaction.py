@@ -252,6 +252,38 @@ Scores must be numbers from 0 to 1. Keep comment <= 500 characters and self-cont
     return out
 
 
+def _claim_anchor_strength(title: str, content: str) -> int:
+    """V15 gate: require concrete subject/claim anchors before commenting.
+
+    0 = generic/no usable anchor; 1 = weak; 2+ = specific enough to question.
+    This intentionally prefers IGNORE over a generic research-sounding reply.
+    """
+    t=(title or "").lower()
+    tokens=_title_anchor_tokens(title)
+    technical_terms=(
+        "agent","agents","model","models","benchmark","evaluation","experiment","evidence",
+        "simulation","simulator","dataset","transformer","qos","dds","satcast","diffusion",
+        "energy","coverage","recharge","latency","throughput","autonomy","perception","lidar",
+        "tracking","security","attack","metric","variance","gradient","inference","reasoning",
+        "parser","compression","cache","prompt","planning","control","robot","robotic","uav",
+        "satellite","aerosol","thermal","verification","reproduc","replication","backtest","trading",
+        "forex","drawdown","spread","slm","llm","microfluidic","tissue","architecture","policy",
+        "authorization","injection","permission","hierarchy","semantic","philology","translation",
+        "distribution","manipulation","cluttered","training",
+    )
+    hits=sum(1 for x in technical_terms if x in t)
+    strong_tokens=[x for x in tokens if len(x)>=5 or any(ch.isdigit() for ch in x)]
+    # Named/technical multi-token titles are specific even when no hand-written
+    # pattern exists. Body terminology can supply one additional anchor.
+    body=(content or "").lower()
+    body_hits=sum(1 for x in technical_terms if x in body)
+    if hits>=2 or (hits>=1 and len(strong_tokens)>=2) or any(ch.isdigit() for ch in t):
+        return 2
+    if strong_tokens and body_hits>=2:
+        return 1
+    return 0
+
+
 def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, Any]:
     relevance = _keyword_relevance(title, content)
     text = content.lower()
@@ -265,12 +297,17 @@ def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, A
     # Candidate screening is intentionally permissive; the LLM remains the final
     # semantic judge. This prevents useful research-method posts from being
     # discarded before the AI sees them.
-    decision = relevance >= 0.30 and novelty >= 0.30 and value >= 0.30
+    screened = relevance >= 0.30 and novelty >= 0.30 and value >= 0.30
+    anchor_strength = _claim_anchor_strength(title, content)
+    decision = screened and anchor_strength >= 2
     comment = _contextual_research_comment(title, content) if decision else None
+    reason = "Heuristic research relevance gate"
+    if screened and anchor_strength < 2:
+        reason = "Claim-anchor gate: insufficiently specific claim for a research comment"
     return {"relevance_score": relevance, "novelty_score": novelty, "research_value_score": value,
             "classification": "research_question" if decision else "other",
             "decision": "comment" if decision else "ignore",
-            "reason": "Heuristic research relevance gate", "comment": comment}
+            "reason": reason, "comment": comment}
 
 
 def _extract_claim_focus(title: str, content: str) -> tuple[str, str]:
@@ -370,6 +407,21 @@ def _extract_claim_focus(title: str, content: str) -> tuple[str, str]:
         (r"session boundary.*unit of work|unit of work.*session",
          "session boundaries versus work units",
          "cross-session traces showing the proposed work unit remains measurable"),
+        (r"multi-agent perception|perception.*summation|summation.*perception",
+         "multi-agent perception fusion",
+         "duplicate-pruning and tracking-error changes on V2V or independently collected multi-agent cases"),
+        (r"spectro-spatial.*transformer|transformer.*satellite signal|satellite signal detection",
+         "spectro-spatial Transformer detection",
+         "detection and characterization accuracy on matched synthetic and real-world RF datasets under interference"),
+        (r"video-rate.*microrobotic|microrobotic.*video-rate|microrobot.*autonomy",
+         "video-rate microrobotic autonomy",
+         "control latency and failure rate under dynamic or biologically relevant disturbances rather than throughput alone"),
+        (r"gradient flows|gradient-flow",
+         "gradient-flow compute-performance trade-off",
+         "whether the claimed performance constraint survives discretization and a change of representation"),
+        (r"training distribution.*sterile|sterile.*training distribution|in-the-wild.*manipulation",
+         "training-distribution effect on manipulation",
+         "held-out cluttered manipulation success under matched simulator-only and in-the-wild training conditions"),
     ]
     for pat, focus, evidence in specific:
         if re.search(pat, lower_title):
@@ -545,7 +597,7 @@ def _contextual_research_comment_core(title: str, content: str) -> str:
         return "What acceptance criterion was fixed before observing the outcome, and what result would have counted as a failure?"
     if focus == "agent validation":
         return "For the agent validation claim, which evaluation cases were fixed before development, and what result would count as a failed improvement?"
-    comment = f"For {focus.lower()}, how was {evidence} used to test the claim, and what independent result would falsify it?"
+    comment = f"For {focus.lower()}, what measurement would directly test {evidence}, and what independent result would falsify the claim?"
     if not _comment_matches_title_domain(title, comment):
         return _title_anchor_comment(title)
     return comment
@@ -589,6 +641,14 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
         except Exception:
             result[k]=heuristic[k]
     result["decision"] = "comment" if str(result.get("decision","ignore")).lower() == "comment" else "ignore"
+    # V15: AI may improve wording, but it cannot bypass the deterministic
+    # claim-anchor gate. Generic AI comments are worse than no comment.
+    if result.get("decision") == "comment" and _claim_anchor_strength(
+        str(result.get("title") or ""), str(result.get("content") or "")
+    ) < 2:
+        result["decision"] = "ignore"
+        result["comment"] = None
+        result["reason"] = "Claim-anchor gate: insufficiently specific claim for a research comment"
     if result.get("comment"):
         result["comment"] = sanitize_public_text(str(result["comment"]))[:500]
     return result
@@ -628,8 +688,20 @@ def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) ->
 
     try:
         ai_map=_ai_json_batch(prepared)
-        merged=[(p, _merge_analysis(heuristics.get(_post_id(p), {}), ai_map.get(_post_id(p))))
-                for p in posts if _post_id(p)]
+        merged=[]
+        for p in posts:
+            pid=_post_id(p)
+            if not pid:
+                continue
+            merged_analysis=_merge_analysis(heuristics.get(pid, {}), ai_map.get(pid))
+            merged_analysis["title"]=str(p.get("title") or "")
+            merged_analysis["content"]=_post_text(p)[:6000]
+            # Re-apply deterministic V15 gate after AI merge.
+            if merged_analysis.get("decision")=="comment" and _claim_anchor_strength(merged_analysis["title"], merged_analysis["content"])<2:
+                merged_analysis["decision"]="ignore"
+                merged_analysis["comment"]=None
+                merged_analysis["reason"]="Claim-anchor gate: insufficiently specific claim for a research comment"
+            merged.append((p, merged_analysis))
         return merged, bool(ai_map), None
     except Exception as exc:
         # Keep the scan useful and, critically, do not retry per post.
@@ -723,7 +795,10 @@ def post_comment(post_id: str, content: str, parent_id: str | None = None) -> di
     return body if isinstance(body,dict) else {"raw":body}
 
 
-def run_cycle(auto_comment: bool = False, max_comments: int = 2, min_relevance: float = 0.30) -> dict[str, Any]:
+def run_cycle(auto_comment: bool = False, max_comments: int = 1, min_relevance: float = 0.30) -> dict[str, Any]:
+    # V15 deliberately allows at most ONE public comment per cycle. This keeps
+    # the agent research-focused and makes accidental burst-commenting impossible.
+    max_comments=1
     scan=discover_and_analyze(limit=int(os.getenv("MOLTBOOK_INTERACTION_FEED_LIMIT","40")),min_relevance=min_relevance)
     posted=0
     outputs=[]
