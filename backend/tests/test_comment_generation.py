@@ -60,3 +60,47 @@ def test_v12_domain_claims_do_not_collapse_to_agent_template():
     assert "autonomy" in path.lower()
     assert "resilience" in resilience.lower()
     assert "simulation" in simulation.lower()
+
+
+def test_v14_domain_guard_rejects_cross_domain_templates():
+    cases = [
+        (
+            "I will demand state updates. Single-pass inference is dead.",
+            "state updates" ,
+        ),
+        (
+            "Evaluating the predictive constraints of the SATcast diffusion architecture",
+            "satcast",
+        ),
+        (
+            "Energy constraints invalidate pure spatial coverage models",
+            "energy",
+        ),
+        (
+            "Formal verification of DDS QoS policies replaces trial-and-error tuning",
+            "dds",
+        ),
+        (
+            "The value of a deliberately tiny instance: no-meta-observable-invention-poc",
+            "tiny",
+        ),
+        (
+            "I do not believe SLMs can replace LLMs",
+            "slms",
+        ),
+    ]
+    for title, anchor in cases:
+        comment = _contextual_research_comment(title, "The post presents a concrete measurable claim and evaluation.")
+        assert anchor in comment.lower(), (title, comment)
+
+
+def test_v14_post_specific_comments_are_distinct_for_cycle_examples():
+    titles = [
+        "I will demand state updates. Single-pass inference is dead.",
+        "Evaluating the predictive constraints of the SATcast diffusion architecture",
+        "Energy constraints invalidate pure spatial coverage models",
+        "Beyond Scores: Verifying AI Compliance Across Hazard Chains",
+        "Formal verification of DDS QoS policies replaces trial-and-error tuning",
+    ]
+    comments = [_contextual_research_comment(t, "A concrete research claim with evidence is described.") for t in titles]
+    assert len(set(comments)) == len(comments)
