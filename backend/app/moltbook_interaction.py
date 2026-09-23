@@ -274,134 +274,189 @@ def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, A
 
 
 def _extract_claim_focus(title: str, content: str) -> tuple[str, str]:
-    """Extract a short claim/focus phrase and a rough evidence target.
+    """Extract the most post-specific claim signal deterministically.
 
-    This is intentionally deterministic. It does not pretend to understand the
-    paper or post semantically; it uses concrete lexical signals so comments can
-    mention the actual subject instead of falling back to a generic template.
+    V13 deliberately gives the title priority.  The title is usually the author's
+    compact thesis, while body text often contains generic research vocabulary
+    (evaluation, evidence, simulation, agent, etc.) that caused V12 to collapse
+    unrelated posts into the same comment template.
     """
-    text = re.sub(r"\s+", " ", f"{title}. {content}").strip()
-    lower = text.lower()
+    title_text = re.sub(r"\s+", " ", title or "").strip()
+    body_text = re.sub(r"\s+", " ", content or "").strip()
+    lower_title = title_text.lower()
+    lower_body = body_text.lower()
+    combined = f"{lower_title} {lower_body}"
 
-    patterns = [
-        (r"(?:json parser|parser)", "parser behavior", "independent parser implementations or malformed-input cases"),
-        (r"(?:vla|vision-language|controller)", "VLA/controller failure signals", "unseen evaluation cases and controller decisions"),
-        (r"(?:path planning|true autonomy|autonomy)", "the autonomy/path-planning distinction", "predefined navigation tasks that separate planning success from autonomous recovery"),
-        (r"(?:resilience|recovery|fault tolerance)", "the resilience claim", "predefined perturbations and recovery failures measured on unseen cases"),
-        (r"(?:photorealism|photorealistic|sim-to-real|simulation|simulator|visual fidelity)", "the policy-oriented simulation claim", "policy-relevant features and closed-loop failures on held-out scenarios"),
-        (r"(?:quantum advantage|classical path|quantum)", "the quantum-advantage claim", "a matched classical baseline under the same computational budget and problem definition"),
-        (r"(?:permission boundary|authorization|reuse|entitlement)", "the reuse/authorization claim", "independent evidence that separates whether an artifact works from whether it is authorized for the new receiver"),
-        (r"(?:principal hierarchy|hierarchy|trust boundary)", "the hierarchy/trust-boundary claim", "explicit boundary cases showing where authority changes and whether the rule is enforced"),
-        (r"(?:agent validation|agent|llm|language model)", "agent behavior", "predefined evaluation cases not used during development"),
-        (r"(?:safety score|safety benchmark|vulnerability)", "the reported safety/vulnerability measure", "held-out attack surfaces or independently generated cases"),
-        (r"(?:historical style|historical evidence|historical simulation)", "the historical-effect claim", "time-separated evidence rather than the examples used to identify the pattern"),
-        (r"(?:latency arbitrage|latency|async speculation|sequential tool)", "the latency/throughput claim", "matched workloads with the same tool budget and measurement window"),
-        (r"(?:benchmark|baseline|buy-and-hold|comparison)", "the comparative claim", "a fixed baseline, period, and evaluation protocol"),
-        (r"(?:backtest|backtesting|forex|trading|drawdown|strategy|expert advisor|\bea\b)", "the trading/backtest claim", "an untouched chronological period with explicit cost assumptions"),
-        (r"(?:replication|reproducib|reproduce|holdout|out-of-sample|walk-forward)", "the replication claim", "an untouched holdout or independent reproduction"),
-        (r"(?:sample size|p-value|confidence interval|statistical|uncertainty|significant)", "the statistical claim", "sample size, uncertainty, and multiple-testing controls"),
-        (r"(?:dataset|data leakage|selection bias|bias)", "the dataset/evidence claim", "a separately sourced or time-separated dataset"),
-        (r"(?:methodology|experiment|hypothesis|acceptance threshold|acceptance criterion|evidence)", "the experimental claim", "a preregistered or fixed acceptance criterion"),
+    # Highly specific title/thesis signals first.
+    specific = [
+        (r"quality estimation.*single-step|single-step.*quality estimation",
+         "single-step quality estimation",
+         "segment-level diagnostic accuracy that the one-step score misses"),
+        (r"dual-frontier|error attribution",
+         "Dual-Frontier error attribution",
+         "error-attribution accuracy on predefined failure cases"),
+        (r"evidence freshness|long-running.*poc|poc.*long-running",
+         "evidence freshness in a long-running agent",
+         "a longitudinal freshness measure and a predefined degradation threshold"),
+        (r"fixed seed.*feedback loop|feedback loop.*cpus|across cpus",
+         "cross-CPU feedback-loop reproducibility",
+         "the same feedback-loop outcome across independent CPU environments"),
+        (r"tactile simulator.*geometry|geometry engine",
+         "tactile-simulator fidelity",
+         "task-relevant tactile behavior rather than geometry or visual similarity alone"),
+        (r"black boxes.*audit|black box.*audit",
+         "black-box auditability",
+         "held-out audit cases that distinguish explainability from surface compliance"),
+        (r"vertical profile.*satellite aerosol|aerosol retrieval",
+         "vertical-profile aerosol retrieval",
+         "a matched retrieval baseline over a fixed time period and independent observations"),
+        (r"throughput.*physical ai|primary metric.*physical ai",
+         "throughput as a physical-AI deployment metric",
+         "matched workloads and deployment costs showing throughput is not masking failures"),
+        (r"maps, not moral compasses|multi-model networks",
+         "multi-model dataset interpretation",
+         "selection and leakage controls on a separately sourced or time-separated dataset"),
+        (r"planning.*constant doubt|constant doubt",
+         "planning under uncertainty",
+         "predefined planning failure cases and a criterion for when additional doubt improves decisions"),
+        (r"status.*cheaper than truth|status is cheaper",
+         "agent status versus truth",
+         "independent evidence separating status signals from verified task outcomes"),
+        (r"reasoning.*pattern matching|sophisticated pattern matching",
+         "reasoning versus pattern matching",
+         "held-out cases requiring behavior not explained by the observed pattern distribution"),
+        (r"semantic maps.*incomplete datasets|incomplete datasets",
+         "semantic-map dataset completeness",
+         "coverage and missingness tests on independently sourced environments"),
+        (r"prompt injection.*authorization bug|authorization bug.*model bug",
+         "prompt-injection authorization boundary",
+         "held-out authorization cases showing whether the same policy holds under injected instructions"),
+        (r"inter-agent messages.*injection|injection channels",
+         "inter-agent message injection",
+         "cross-agent injection cases and whether the receiving boundary rejects unauthorized instructions"),
+        (r"model.*security layer.*attack surface|attack surface.*permissions",
+         "model-controlled permission attack surface",
+         "held-out permission-escalation cases and explicit authorization checks"),
+        (r"perceptual buffers.*technical failures",
+         "perceptual buffers versus technical failures",
+         "fault cases where perception is correct but the downstream technical failure remains"),
+        (r"thermal modeling|thermal model",
+         "thermal-model validity",
+         "independent thermal observations rather than a proxy metric alone"),
+        (r"relay protection guarantee|satellite coverage",
+         "satellite coverage versus relay protection",
+         "independent relay-protection failure cases under coverage assumptions"),
+        (r"session boundary.*unit of work|unit of work.*session",
+         "session boundaries versus work units",
+         "cross-session traces showing the proposed work unit remains measurable"),
     ]
-    for pat, focus, evidence in patterns:
-        if re.search(pat, lower):
+    for pat, focus, evidence in specific:
+        if re.search(pat, lower_title):
             return focus, evidence
 
-    # Use a meaningful title fragment as the focus when no specialized signal is found.
-    clean_title = re.sub(r"[^A-Za-z0-9 -]", " ", title).strip()
+    # Domain-specific signals next.  Search title before body to avoid generic
+    # words in long posts overriding a specific thesis.
+    patterns = [
+        (r"json parser|parser", "parser behavior", "independent parser implementations or malformed-input cases"),
+        (r"vla|vision-language|controller", "VLA/controller failure signals", "unseen evaluation cases and controller decisions"),
+        (r"path planning|true autonomy|autonomy", "the autonomy/path-planning distinction", "predefined navigation tasks that separate planning success from autonomous recovery"),
+        (r"resilience|recovery|fault tolerance", "the resilience claim", "predefined perturbations and recovery failures measured on unseen cases"),
+        (r"photorealism|photorealistic|sim-to-real|simulation|simulator|visual fidelity", "the policy-oriented simulation claim", "policy-relevant features and closed-loop failures on held-out scenarios"),
+        (r"quantum advantage|classical path|quantum", "the quantum-advantage claim", "a matched classical baseline under the same computational budget and problem definition"),
+        (r"permission boundary|authorization|reuse|entitlement", "the reuse/authorization claim", "independent evidence that separates whether an artifact works from whether it is authorized for the new receiver"),
+        (r"principal hierarchy|hierarchy|trust boundary", "the hierarchy/trust-boundary claim", "explicit boundary cases showing where authority changes and whether the rule is enforced"),
+        (r"safety score|safety benchmark|vulnerability", "the reported safety/vulnerability measure", "held-out attack surfaces or independently generated cases"),
+        (r"historical style|historical evidence|historical simulation", "the historical-effect claim", "time-separated evidence rather than the examples used to identify the pattern"),
+        (r"latency arbitrage|latency|async speculation|sequential tool", "the latency/throughput claim", "matched workloads with the same tool budget and measurement window"),
+        (r"benchmark|baseline|buy-and-hold|comparison", "the comparative claim", "a fixed baseline, period, and evaluation protocol"),
+        (r"backtest|backtesting|forex|trading|drawdown|strategy|expert advisor|\bea\b", "the trading/backtest claim", "an untouched chronological period with explicit cost assumptions"),
+        (r"replication|reproduc|holdout|out-of-sample|walk-forward", "the replication claim", "an untouched holdout or independent reproduction"),
+        (r"sample size|p-value|confidence interval|statistical|uncertainty|significant", "the statistical claim", "sample size, uncertainty, and multiple-testing controls"),
+        (r"dataset|data leakage|selection bias|bias", "the dataset/evidence claim", "a separately sourced or time-separated dataset"),
+        (r"methodology|experiment|hypothesis|acceptance threshold|acceptance criterion|evidence", "the experimental claim", "a preregistered or fixed acceptance criterion"),
+    ]
+    for pat, focus, evidence in patterns:
+        if re.search(pat, lower_title):
+            return focus, evidence
+    for pat, focus, evidence in patterns:
+        if re.search(pat, lower_body):
+            return focus, evidence
+
+    if re.search(r"\bagent\b.*\bvalidation\b|\bvalidation\b.*\bagent\b", lower_title):
+        return "agent validation", "predefined evaluation cases not used during development"
+
+    clean_title = re.sub(r"[^A-Za-z0-9 -]", " ", title_text).strip()
     clean_title = re.sub(r"\s+", " ", clean_title)
     if clean_title:
         return clean_title[:80], "an independent test that could falsify the main claim"
-    return "the main claim", "an independent test that could falsify the main claim"
+    return "the main claim", "an independent test that could falsify it"
 
 
 def _contextual_research_comment(title: str, content: str) -> str:
-    """Create a deterministic claim-aware research comment without an LLM.
-
-    V11 improves V10 by anchoring the question to the post's concrete claim and
-    its likely evidence target. It remains deliberately conservative and does not
-    invent results, sources, or facts that are not present in the post.
-    """
-    text = f"{title} {content}".lower()
+    """Generate a deterministic post-specific research question without an LLM."""
     focus, evidence = _extract_claim_focus(title, content)
+    questions = {
+        "single-step quality estimation": "Which segment-level metric demonstrates that the proposed decomposition detects failures that the one-step score misses?",
+        "Dual-Frontier error attribution": "What evidence shows Dual-Frontier improves error attribution, and which predefined failure cases distinguish it from the baseline?",
+        "evidence freshness in a long-running agent": "How was evidence freshness measured over the long-running evaluation, and what degradation threshold was fixed before the results were observed?",
+        "cross-CPU feedback-loop reproducibility": "Which feedback-loop outputs were fixed as the reproducibility target, and does an independent CPU run reproduce them without changing the evaluation rules?",
+        "tactile-simulator fidelity": "Which task-level tactile behaviors were used as the target, and do the results hold on held-out contact or manipulation scenarios rather than geometry metrics alone?",
+        "black-box auditability": "Which held-out audit cases distinguish genuine inspectability from surface compliance, and what result would falsify the proposed audit boundary?",
+        "vertical-profile aerosol retrieval": "Which retrieval baseline and time window were fixed in advance, and does the vertical-profile method improve results on independent observations?",
+        "throughput as a physical-AI deployment metric": "Which matched workload and deployment-cost assumptions were fixed, and what failure mode would show throughput is masking task-level degradation?",
+        "multi-model dataset interpretation": "How were selection and leakage ruled out, and does the finding persist on a separately sourced or time-separated dataset?",
+        "planning under uncertainty": "Which planning failure cases were fixed before evaluation, and what measurable outcome would show that the added uncertainty process actually improves decisions?",
+        "agent status versus truth": "Which independent task outcomes were used to separate status signals from verified truth, and what case would falsify that distinction?",
+        "reasoning versus pattern matching": "Which held-out cases require behavior not explained by the observed patterns, and what result would count as evidence against the reasoning claim?",
+        "semantic-map dataset completeness": "Which coverage and missingness tests were fixed, and does the completeness claim hold on independently sourced environments?",
+        "prompt-injection authorization boundary": "Which held-out authorization cases test injected instructions, and does the permission boundary still reject actions without explicit authority?",
+        "inter-agent message injection": "Which cross-agent injection cases were evaluated, and what evidence shows the receiving boundary rejects unauthorized instructions?",
+        "model-controlled permission attack surface": "Which held-out permission-escalation cases were tested, and where is authorization enforced independently of the model's own decision?",
+        "perceptual buffers versus technical failures": "Which fault cases keep perception correct while the downstream system still fails, and does the proposed buffer change those outcomes?",
+        "thermal-model validity": "Which independent thermal observations validate the proposed model, and what error threshold was fixed before evaluation?",
+        "satellite coverage versus relay protection": "Which independent relay-protection failure cases were tested under coverage assumptions, and what evidence separates coverage from actual protection?",
+        "session boundaries versus work units": "Which cross-session traces define the proposed work unit, and does the unit remain measurable when work spans multiple sessions?",
+    }
+    if focus in questions:
+        return questions[focus]
 
-    # Claim-specific questions come first so broad words such as "evaluation" do
-    # not swallow a more useful domain-specific signal.
-    if "parser behavior" == focus:
-        return ("For the parser-replication claim, which malformed or ambiguous JSON cases were tested, "
-                "and does the gap persist across an independent parser implementation?")
-
-    if "VLA/controller failure signals" == focus:
-        return ("For the claimed failure signals, were they identified before the final evaluation, "
-                "and do they improve controller decisions on unseen cases rather than only correlate with failures?")
-
-    if "the autonomy/path-planning distinction" == focus:
-        return ("For the autonomy claim, which predefined tasks distinguish path-planning success from autonomous recovery, "
-                "and what failure case would falsify that distinction?")
-
-    if "the resilience claim" == focus:
-        return ("For the resilience claim, which perturbations and recovery failures were fixed before evaluation, "
-                "and does the measure change on unseen fault cases?")
-
-    if "the policy-oriented simulation claim" == focus:
-        return ("For the simulation claim, which policy-relevant features were fixed as the target, "
-                "and does the improvement persist on held-out closed-loop scenarios rather than visual metrics alone?")
-
-    if "the quantum-advantage claim" == focus:
-        return ("For the quantum-advantage claim, what matched classical baseline and computational budget were fixed, "
-                "and does the advantage remain under the same problem definition?")
-
-    if "the reuse/authorization claim" == focus:
-        return ("For the reuse claim, how is evidence that the artifact works separated from evidence that the new receiver is authorized to act on it, "
-                "and which case would falsify that boundary?")
-
-    if "the hierarchy/trust-boundary claim" == focus:
-        return ("For the hierarchy claim, which authority-boundary cases were fixed before evaluation, "
-                "and can an independent test show where the rule fails closed?")
-
-    if "agent behavior" == focus:
-        return ("For the agent-behavior claim, what predefined evaluation cases were kept outside development, "
-                "and what result would count as a failed improvement?")
-
-    if "the reported safety/vulnerability measure" == focus:
-        return ("For the reported safety measure, was the evaluation repeated on held-out attack surfaces, "
-                "and does the result remain after controlling for the tested channel or threat model?")
-
-    if "the historical-effect claim" == focus:
-        return ("For the historical-effect claim, what evidence was fixed before identifying the pattern, "
-                "and does it survive a time-separated test rather than the examples used to find it?")
-
-    if "the latency/throughput claim" == focus:
-        return ("For the latency claim, were workload, tool budget, and measurement window held constant, "
-                "and does the reported gain survive an independent workload?")
-
-    if "the comparative claim" == focus:
-        return ("For the comparative claim, which baseline and evaluation period were fixed in advance, "
-                "and are the same data, costs, and success criteria applied to both methods?")
-
-    if "the trading/backtest claim" == focus:
-        return ("For the trading/backtest claim, which chronological period was kept untouched, "
-                "and does the result survive the stated spread, fee, and execution-cost assumptions?")
-
-    if "the replication claim" == focus:
-        return ("For the replication claim, what was held out before the result was observed, "
-                "and does an independent run reproduce the effect without changing the evaluation rules?")
-
-    if "the statistical claim" == focus:
-        return ("For the statistical claim, what sample size and uncertainty measure were fixed in advance, "
-                "and does the effect remain after accounting for multiple comparisons?")
-
-    if "the dataset/evidence claim" == focus:
-        return ("For the dataset claim, how was selection or leakage ruled out, "
-                "and does the finding persist on a separately sourced or time-separated dataset?")
-
-    if "the experimental claim" == focus:
-        return ("For the experimental claim, what acceptance criterion was fixed before observing the outcome, "
-                "and what result would have counted as a failure?")
-
-    return (f"For {focus.lower()}, how was {evidence} used to test the claim, "
-            "and what independent result would falsify it?")
-
+    if focus == "parser behavior":
+        return "Which malformed or ambiguous JSON cases were tested, and does the gap persist across an independent parser implementation?"
+    if focus == "VLA/controller failure signals":
+        return "Were the claimed failure signals identified before the final evaluation, and do they improve controller decisions on unseen cases rather than only correlate with failures?"
+    if focus == "the autonomy/path-planning distinction":
+        return "Which predefined evaluation tasks distinguish path-planning success from autonomy, and what failure case would falsify that distinction?"
+    if focus == "the resilience claim":
+        return "For the resilience claim, which perturbations and recovery failures were fixed before evaluation, and does the measure change on unseen fault cases?"
+    if focus == "the policy-oriented simulation claim":
+        return "For the simulation claim, which policy-relevant features were fixed as the target, and does the improvement persist on held-out closed-loop scenarios rather than visual metrics alone?"
+    if focus == "the quantum-advantage claim":
+        return "What matched classical baseline and computational budget were fixed, and does the advantage remain under the same problem definition?"
+    if focus == "the reuse/authorization claim":
+        return "How is evidence that the artifact works separated from evidence that the new receiver is authorized to act on it, and which case would falsify that boundary?"
+    if focus == "the hierarchy/trust-boundary claim":
+        return "Which authority-boundary cases were fixed before evaluation, and can an independent test show where the rule fails closed?"
+    if focus == "the reported safety/vulnerability measure":
+        return "Was the evaluation repeated on held-out attack surfaces, and does the result remain after controlling for the tested channel or threat model?"
+    if focus == "the historical-effect claim":
+        return "For the historical-effect claim, what evidence was fixed before identifying the historical pattern, and does it survive a time-separated test rather than the examples used to find it?"
+    if focus == "the latency/throughput claim":
+        return "Were workload, tool budget, and measurement window held constant, and does the reported gain survive an independent workload?"
+    if focus == "the comparative claim":
+        return "Which baseline and evaluation period were fixed in advance, and are the same data, costs, and success criteria applied to both methods?"
+    if focus == "the trading/backtest claim":
+        return "Which chronological period was kept untouched, and does the result survive the stated spread, fee, and execution-cost assumptions?"
+    if focus == "the replication claim":
+        return "What was held out before the result was observed, and does an independent run reproduce the effect without changing the evaluation rules?"
+    if focus == "the statistical claim":
+        return "What sample size and uncertainty measure were fixed in advance, and does the effect remain after accounting for multiple comparisons?"
+    if focus == "the dataset/evidence claim":
+        return "How was selection or leakage ruled out, and does the finding persist on a separately sourced or time-separated dataset?"
+    if focus == "the experimental claim":
+        return "What acceptance criterion was fixed before observing the outcome, and what result would have counted as a failure?"
+    if focus == "agent validation":
+        return "For the agent validation claim, which evaluation cases were fixed before development, and what result would count as a failed improvement?"
+    return f"For {focus.lower()}, how was {evidence} used to test the claim, and what independent result would falsify it?"
 
 def _comment_similarity(a: str, b: str) -> float:
     aw = set(re.findall(r"[a-z0-9]{3,}", (a or "").lower()))
