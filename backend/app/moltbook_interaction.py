@@ -307,7 +307,9 @@ def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, A
     screened = relevance >= 0.30 and novelty >= 0.30 and value >= 0.30
     anchor_strength = _claim_anchor_strength(title, content)
     evidence_gap_admission = evidence_gap is not None and novelty >= 0.30
-    decision = evidence_gap_admission and (anchor_strength >= 2 or bool(evidence_gap))
+    # V21: a concrete evidence gap is sufficient for admission; the legacy
+    # title-anchor gate must not veto evidence-rich research posts.
+    decision = evidence_gap_admission
     comment = _evidence_gap_comment(title, content) if decision else None
     if decision and not comment:
         decision = False
@@ -315,6 +317,8 @@ def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, A
     reason = "Heuristic research relevance gate"
     if decision:
         reason = "Evidence-gap admission: concrete claim, evidence, and missing validation found"
+    elif evidence_gap is not None and novelty >= 0.30 and not comment:
+        reason = "Evidence-gap comment guard: source/domain/provenance specificity check failed"
     elif screened and anchor_strength < 2:
         reason = "Claim-anchor gate: insufficiently specific claim for a research comment"
     return {"relevance_score": relevance, "novelty_score": novelty, "research_value_score": value,
@@ -693,6 +697,36 @@ def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
         (r"65%.*security papers|18-point gap|no variance",
          "agent-security metric variance", "whether the metric can resolve the claimed performance gap",
          "the reported 18-point gap", "whether the metric remains informative after repeated independent runs with uncertainty reported"),
+        (r"sysml|uml testing profile|tool-chain|toolchains|tool chains|ordering, timing, and state-based",
+         "SysML verification portability", "behavioral and interface verification across independent tool-chains", "the successful demonstration across two tool-chains",
+         "whether the verification semantics remain equivalent across additional independent tools and SysML constructs rather than only the demonstrated pair"),
+        (r"confidence score|decision record|0\.56|0\.8 threshold|threshold is part of the decision",
+         "auditable decision records", "threshold-dependent decision behavior", "the 0.56 confidence score and 0.8 escalation threshold",
+         "whether independent replay can reconstruct the same branch from the recorded input, options, model version and threshold"),
+        (r"entropic transport|entropy.*transport|barycentric projection|n\^[-−]1|n\^[-−]1/2|semi-discrete",
+         "semi-discrete entropic transport rate", "the dimension-free convergence claim in the semi-discrete regime", "the reported n^-1 squared-error rate and finite-support/subGaussian setup",
+         "whether the rate degrades toward n^-1/2 as the discrete support grows toward the subGaussian regime"),
+        (r"hazardarena|semantic safety|safe/unsafe twin|semantic-to-action|safety option layer",
+         "semantic safety in VLA evaluation", "semantic-to-action safety under matched physical scenarios", "the 2,000+ assets and 40 risk-sensitive safe/unsafe twin tasks",
+         "whether the semantic-safety gap persists on held-out asset/task combinations with an independently validated safety judge"),
+        (r"compile rate|vulnerability repair|compile failures|diff_f1|big-vul|compiler-standard",
+         "compile-rate validity in vulnerability repair", "the relationship between compile success and actual repair quality", "the reported 64% harness/dataset artifact share and 1.8-2.7x compiler-standard effect",
+         "whether model rankings and repair quality remain stable on held-out vulnerable functions after fixing compiler and harness confounds"),
+        (r"hydrogen|nsga-ii|electrolyzer|fuel cell|renewable energy absorption|grid power purchase volatility",
+         "hydrogen-buffer sizing for grid volatility", "the trade-off between renewable absorption and grid-volatility reduction", "the NSGA-II sizing objective over electrolyzer, storage and fuel-cell capacities",
+         "whether the claimed benefit remains when hardware CAPEX and physical footprint are imposed as explicit constraints on held-out load profiles"),
+        (r"success rate|hazard|semantic context|reach, grasp|vla|vision-language-action",
+         "semantic safety beyond task success rate", "the distinction between physical execution success and semantic safety", "the reported success-rate framing and matched safe/unsafe task context",
+         "whether semantic-trigger performance predicts unsafe actions on held-out contextual changes rather than only trajectory completion"),
+        (r"vulnerability scanning|exploitable paths|18,000|17,979|14 minutes|nodezero",
+         "security validation by exploitable paths", "the relationship between scanner findings and exploitable attack paths", "18,000 findings versus 21 verified exploitable paths",
+         "whether exploitable-path reduction remains predictive of real compromise risk under independent environments and configuration drift"),
+        (r"deterministic builds|reproducible build|verifiability|artifact verification|provenance attestations",
+         "systemic build verifiability", "the gap between deterministic outputs and independently reproducible provenance", "the four ecosystem study and the reported metadata/provenance limitations",
+         "whether independent verifiers can reconstruct the same build from registry-provided metadata without maintainer-only state"),
+        (r"tool-call count|40% fewer calls|half the tokens|30% faster|latency tax",
+         "tool-call efficiency in coding agents", "the relationship between reduced tool calls and task performance", "the reported 40% call reduction and half-token usage",
+         "whether the efficiency gain persists on held-out tasks when success quality and tool protocol are held constant"),
         (r"contraction factor.*bounded|bounded.*contraction factor|stochastic connectivity.*contraction",
          "contraction factor", "bounded estimation error", "stochastic-connectivity threshold", 
          "the quantitative contraction/connectivity condition under which the error bound is guaranteed"),
@@ -758,8 +792,67 @@ def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
                 return None
             return {"claim": claim, "mechanism": mechanism, "evidence": evidence, "gap": gap}
 
-    # V17 HARD GATE: no generic title-token fallback. If no concrete
-    # mechanism/evidence/boundary was extracted, ignore the post.
+    # V22 GENERIC EVIDENCE-GAP DETECTOR:
+    # Do not add another domain/template list. Instead, recover research-rich
+    # posts from their own evidence structure: quantitative/observed evidence
+    # + an explicit limitation/uncertainty/boundary + a validation need.
+    # This is intentionally conservative and only runs after all specific rules.
+    sentences = [x.strip() for x in re.split(r"(?<=[.!?])\s+", body) if x.strip()]
+    number_re = re.compile(r"(?<![A-Za-z])[-+]?\d+(?:[.,]\d+)?(?:%|°|\s*(?:AU|GeV|K|Hz|ms|s|years?|months?|days?|kg|cm|km))?", re.I)
+    evidence_cues = (
+        "show", "found", "measured", "estimate", "estimated", "observed",
+        "result", "results", "data", "measurement", "baseline", "experiment",
+        "tested", "test", "calculated", "reported", "model", "comparison",
+        "probability", "accuracy", "latency", "yield", "rate", "error",
+        "agreement", "bias", "performance"
+    )
+    boundary_cues = (
+        "however", "but", "although", "uncertain", "uncertainty", "limitation",
+        "bias", "biased", "does not prove", "cannot establish", "not enough",
+        "not yet", "no complete", "incomplete", "requires", "need longer",
+        "needs longer", "future work", "open question", "caveat", "depends on",
+        "sensitive to", "may not", "could not", "without"
+    )
+    validation_cues = (
+        "validate", "validation", "independent", "replicate", "replication",
+        "held-out", "holdout", "longer baseline", "additional data", "further",
+        "future", "test", "measure", "compare", "cross-check", "verify"
+    )
+    evidence_sentences = [
+        x for x in sentences
+        if number_re.search(x) and any(c in x.lower() for c in evidence_cues)
+    ]
+    boundary_sentences = [
+        x for x in sentences
+        if any(c in x.lower() for c in boundary_cues)
+    ]
+    validation_present = any(c in low for c in validation_cues)
+
+    # Require multiple independent anchors. A single number or a vague caveat
+    # is not enough to manufacture a research question.
+    numeric_count = len(number_re.findall(body))
+    if evidence_sentences and boundary_sentences and numeric_count >= 2:
+        evidence = re.sub(r"\s+", " ", evidence_sentences[0]).strip()[:220]
+        boundary = re.sub(r"\s+", " ", boundary_sentences[0]).strip()[:220]
+        claim = re.sub(r"\s+", " ", title).strip()[:140]
+
+        # The missing boundary is deliberately new; the source only needs to
+        # establish why that validation matters. If the post already describes
+        # a validation attempt, ask whether it generalizes beyond that boundary.
+        if validation_present:
+            gap = (
+                "whether the reported result survives an independent validation "
+                "beyond the limitation described in the post"
+            )
+        else:
+            gap = (
+                "whether the reported result survives an independent validation "
+                "that directly addresses the stated limitation and its boundary"
+            )
+        mechanism = f"the central claim against the stated limitation ({boundary[:120]})"
+        return {"claim": claim, "mechanism": mechanism, "evidence": evidence, "gap": gap}
+
+    # V22 remains fail-closed: no evidence + boundary pair, no comment.
     return None
 
 
@@ -835,6 +928,19 @@ def _evidence_gap_comment(title: str, content: str) -> str | None:
     # Keep public comments compact and ensure at least one exact anchor from the
     # extracted claim appears in the final text.
     if not any(tok in comment.lower() for tok in re.findall(r"[a-z0-9_-]{4,}", gap["claim"].lower())):
+        return None
+    # V21 anchor-density guard: require at least two concrete source anchors
+    # in the final public question. This prevents generic wording from passing
+    # merely because the normalized claim label has one source token.
+    low_post = f"{title} {content}".lower()
+    anchor_candidates = []
+    for source in (gap["claim"], gap["mechanism"], gap["evidence"]):
+        anchor_candidates.extend(re.findall(r"[a-z0-9]{5,}", source.lower()))
+    anchor_candidates = [x for x in anchor_candidates if x not in {"reported", "stated", "whether", "using", "under", "claim", "evidence"}]
+    concrete_hits = {x for x in anchor_candidates if x in low_post}
+    numeric_hits = set(re.findall(r"\d+(?:\.\d+)?%?", gap["evidence"].lower()))
+    concrete_hits.update(x for x in numeric_hits if x in low_post)
+    if len(concrete_hits) < 2:
         return None
     comment = sanitize_public_text(comment)[:500]
     if not _comment_provenance_safe(title, content, comment):
