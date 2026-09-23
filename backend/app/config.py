@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_name: str = "AI Trading Bot Research Society API"
-    app_version: str = "0.1.0"
+    app_version: str = "27.0"
     environment: str = "development"
 
     database_url: str = "sqlite:///./research_society.db"

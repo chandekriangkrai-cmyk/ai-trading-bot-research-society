@@ -136,12 +136,7 @@ def _self_name() -> str:
 
 
 def _ai_json_batch(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Analyze many posts in ONE LLM request.
-
-    Returns a map keyed by post_id. This is intentionally fail-closed: on a
-    provider error (especially HTTP 429) callers keep the deterministic
-    heuristic result instead of retrying every post and burning quota.
-    """
+    """Call the configured LLM once for a batch and parse its structured result."""
     if not AI_KEY or not items:
         return {}
 
@@ -155,13 +150,17 @@ benchmark design, simulation validity, reproducibility, evidence quality, statis
 design can provide transferable research methods for an AI trading research society. Prefer posts with a concrete
 claim, measurement, benchmark, experiment, limitation, or falsifiable question. Ignore purely social, promotional,
 poetic, political, or generic opinion posts.
-Return ONLY a JSON array. One object per input post, preserving the exact post_id.
+For comments, write the final comment yourself. Make it sound like a researcher replying to this specific author,
+not a template. Do NOT begin with "For ", "You report", "The post", or "How would you validate this claim".
+Mention one concrete anchor from the post and ask one specific research question about replication, boundary
+conditions, measurement validity, controls, or falsification. Never invent facts.
+Return ONLY a JSON object with key "results" whose value is an array. One object per input post, preserving exact post_id.
 Each object must contain: post_id, relevance_score, novelty_score, research_value_score,
 classification, decision (comment|ignore), reason, comment.
 Scores must be numbers from 0 to 1. Keep comment <= 500 characters and self-contained.
 """
     user_text = json.dumps({"posts": items, "topics": TOPICS}, ensure_ascii=False)
-    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "3000"))
+    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "5000"))
 
     if AI_PROVIDER == "openrouter":
         body = json.dumps({
@@ -189,68 +188,81 @@ Scores must be numbers from 0 to 1. Keep comment <= 500 characters and self-cont
             "max_output_tokens": max_tokens,
         }).encode("utf-8")
         endpoint = f"{AI_BASE}/responses"
-        request_headers = {
-            "Authorization": f"Bearer {AI_KEY}",
-            "Content-Type": "application/json",
-        }
+        request_headers = {"Authorization": f"Bearer {AI_KEY}", "Content-Type": "application/json"}
 
     request = urllib.request.Request(endpoint, data=body, headers=request_headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=AI_TIMEOUT) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
-        # Never retry here. OpenRouter documents low free-tier limits and
-        # failed attempts can still count toward the daily allowance.
         detail = ""
-        try:
-            detail = e.read().decode("utf-8", "replace")[:1000]
-        except Exception:
-            pass
+        try: detail = e.read().decode("utf-8", "replace")[:1000]
+        except Exception: pass
         raise RuntimeError(f"{AI_PROVIDER.upper()} AI interaction batch failed HTTP {e.code}: {detail}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"{AI_PROVIDER.upper()} AI interaction batch failed: {e}") from e
 
+    finish_reason = None
     if AI_PROVIDER == "openrouter":
         choices = data.get("choices") or []
         text = ""
         if choices and isinstance(choices[0], dict):
+            finish_reason = choices[0].get("finish_reason")
             message = choices[0].get("message") or {}
             content = message.get("content", "")
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                text = "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
+            if isinstance(content, str): text = content
+            elif isinstance(content, list): text = "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
     else:
         text = data.get("output_text") or ""
         if not text:
             chunks=[]
             for item in data.get("output", []) or []:
                 for c in item.get("content", []) or []:
-                    if isinstance(c, dict) and c.get("text"):
-                        chunks.append(str(c["text"]))
+                    if isinstance(c, dict) and c.get("text"): chunks.append(str(c["text"]))
             text="\n".join(chunks)
 
-    # Be tolerant of markdown fences or a leading/trailing explanation.
-    m=re.search(r"\[.*\]", text, re.S)
-    if not m:
-        return {}
-    try:
-        parsed=json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(parsed, list):
-        return {}
+    def _parse_payload(raw: str):
+        raw=(raw or "").strip()
+        if not raw: return None
+        candidates=[raw]
+        candidates.extend(re.findall(r"```(?:json)?\s*(.*?)```", raw, re.S|re.I))
+        for opener, closer in (("{","}"),("[","]")):
+            pos=raw.find(opener)
+            while pos >= 0:
+                depth=0; in_str=False; esc=False
+                for i in range(pos, len(raw)):
+                    ch=raw[i]
+                    if in_str:
+                        if esc: esc=False
+                        elif ch=="\\": esc=True
+                        elif ch=='"': in_str=False
+                        continue
+                    if ch=='"': in_str=True
+                    elif ch==opener: depth += 1
+                    elif ch==closer:
+                        depth -= 1
+                        if depth==0:
+                            candidates.append(raw[pos:i+1]); break
+                pos=raw.find(opener, pos+1)
+        for candidate in candidates:
+            try: obj=json.loads(candidate.strip())
+            except Exception: continue
+            if isinstance(obj, dict) and isinstance(obj.get("results"), list): return obj["results"]
+            if isinstance(obj, list): return obj
+        return None
 
+    parsed=_parse_payload(text)
+    if parsed is None:
+        raise ValueError(f"AI response parse failed; finish_reason={finish_reason!r}; response_chars={len(text)}")
     out: dict[str, dict[str, Any]] = {}
     valid_ids={str(x.get("post_id")) for x in items if x.get("post_id")}
     for row in parsed:
-        if not isinstance(row, dict):
-            continue
+        if not isinstance(row, dict): continue
         pid=str(row.get("post_id") or "")
-        if pid and pid in valid_ids:
-            out[pid]=row
+        if pid and pid in valid_ids: out[pid]=row
+    if not out:
+        raise ValueError(f"AI response contained no valid post results; finish_reason={finish_reason!r}")
     return out
-
 
 def _claim_anchor_strength(title: str, content: str) -> int:
     """V15 gate: require concrete subject/claim anchors before commenting.
@@ -1119,33 +1131,46 @@ def _recent_outbound_comments(db, limit: int = 30) -> list[str]:
     return [str(row[0]) for row in rows if row and row[0]]
 
 
+def _ai_comment_safe(title: str, content: str, comment: str) -> bool:
+    """Allow AI wording without forcing it through the legacy template composer."""
+    if not comment: return False
+    c=sanitize_public_text(comment).strip()
+    if len(c) < 35 or len(c) > 500: return False
+    if re.match(r"(?i)^\s*(?:for\b|you report\b|the post\b|how would you validate this claim\b)", c): return False
+    if "http://" in c.lower() or "https://" in c.lower(): return False
+    if not _comment_domain_safe(title, content, c): return False
+    generic={"about","agent","agents","claim","comment","does","effect","evidence","how","model","models","post","research","result","results","same","system","systems","test","testing","tested","whether","what","would","with","under","using","validation","validate","reported","report","measurement","question"}
+    post_tokens=set(re.findall(r"[a-z][a-z0-9._-]{4,}", f"{title} {content}".lower()))
+    comment_tokens=set(re.findall(r"[a-z][a-z0-9._-]{4,}", c.lower()))
+    shared={x for x in post_tokens & comment_tokens if x not in generic}
+    nums=re.findall(r"\d+(?:\.\d+)?%?", f"{title} {content}")
+    return len(shared) >= 2 or (len(shared) >= 1 and any(n in c for n in nums))
+
 def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dict[str, Any]:
-    if not ai:
-        return heuristic
+    if not ai: return heuristic
     result={**heuristic, **ai}
     for k in ("relevance_score","novelty_score","research_value_score"):
-        try:
-            result[k]=max(0.0,min(1.0,float(result.get(k, heuristic[k]))))
-        except Exception:
-            result[k]=heuristic[k]
-    result["decision"] = "comment" if str(result.get("decision","ignore")).lower() == "comment" else "ignore"
-    # V15: AI may improve wording, but it cannot bypass the deterministic
-    # claim-anchor gate. Generic AI comments are worse than no comment.
-    title = str(result.get("title") or "")
-    content = str(result.get("content") or "")
-    # V16 is evidence-gap first: AI may score/classify, but it cannot select a
-    # generic comment. The deterministic extractor must find a concrete gap.
-    v18_comment = _evidence_gap_comment(title, content)
-    if result.get("decision") == "comment" and not v18_comment:
-        result["decision"] = "ignore"
-        result["comment"] = None
-        result["reason"] = "V18 provenance/domain gate: no source-grounded comment"
-    elif result.get("decision") == "comment":
-        result["comment"] = v18_comment
-    else:
-        result["comment"] = None
+        try: result[k]=max(0.0,min(1.0,float(result.get(k, heuristic[k]))))
+        except Exception: result[k]=heuristic[k]
+    result["decision"]="comment" if str(result.get("decision","ignore")).lower()=="comment" else "ignore"
+    title=str(result.get("title") or heuristic.get("title") or "")
+    content=str(result.get("content") or heuristic.get("content") or "")
+    if result["decision"] != "comment":
+        result["comment"]=None; result["comment_source"]="none"; return result
+    ai_comment=sanitize_public_text(str(ai.get("comment") or "")).strip()
+    if _ai_comment_safe(title, content, ai_comment):
+        result["comment"]=ai_comment
+        result["comment_source"]="ai"
+        result["reason"]=(str(ai.get("reason") or "AI research decision")+"; V27 AI comment accepted").strip()
+        return result
+    fallback=_evidence_gap_comment(title, content)
+    if fallback:
+        result["comment"]=fallback; result["comment_source"]="deterministic_fallback"
+        result["reason"]=(str(result.get("reason") or "")+"; V27 AI comment rejected, deterministic fallback used").strip()
+        return result
+    result["decision"]="ignore"; result["comment"]=None; result["comment_source"]="none"
+    result["reason"]="AI selected comment but it failed V27 source/domain guard and no safe fallback exists"
     return result
-
 
 def analyze_post(post: dict[str, Any], recent_texts: list[str]) -> dict[str, Any]:
     """Legacy single-post helper retained for compatibility; no provider call."""
@@ -1155,55 +1180,34 @@ def analyze_post(post: dict[str, Any], recent_texts: list[str]) -> dict[str, Any
     return _heuristic_decision(title, content, novelty)
 
 
-def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) -> tuple[list[dict[str, Any]], bool, str | None]:
-    """Build heuristics for all posts, then optionally make one batch AI call."""
-    prepared=[]
-    heuristics={}
+def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) -> tuple[list[dict[str, Any]], bool, str | None, dict[str, Any]]:
+    prepared=[]; heuristics={}
     for post in posts:
         pid=_post_id(post)
-        if not pid:
-            continue
-        title=str(post.get("title") or "")
-        content=_post_text(post)
-        novelty=_novelty(f"{title}\n{content}", recent_texts)
-        heuristic=_heuristic_decision(title, content, novelty)
+        if not pid: continue
+        title=str(post.get("title") or ""); content=_post_text(post)
+        heuristic=_heuristic_decision(title, content, _novelty(f"{title}\n{content}", recent_texts))
+        heuristic["title"]=title; heuristic["content"]=content[:6000]
         heuristics[pid]=heuristic
-        prepared.append({
-            "post_id": pid,
-            "author": _author_name(post),
-            "title": title,
-            "content": content[:6000],
-            "heuristic": heuristic,
-        })
-
+        prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:6000],"heuristic":heuristic})
+    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None}
     if not prepared or not AI_KEY:
-        return [(p, heuristics.get(_post_id(p), {})) for p in posts if _post_id(p)], False, None
-
+        return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,None,meta
+    meta["attempted"]=True
     try:
         ai_map=_ai_json_batch(prepared)
+        meta["succeeded"]=True; meta["valid_results"]=len(ai_map)
         merged=[]
         for p in posts:
             pid=_post_id(p)
-            if not pid:
-                continue
-            merged_analysis=_merge_analysis(heuristics.get(pid, {}), ai_map.get(pid))
-            merged_analysis["title"]=str(p.get("title") or "")
-            merged_analysis["content"]=_post_text(p)[:6000]
-            # Re-apply deterministic V16 evidence-gap gate after AI merge.
-            v18_comment = _evidence_gap_comment(merged_analysis["title"], merged_analysis["content"])
-            if merged_analysis.get("decision")=="comment" and not v18_comment:
-                merged_analysis["decision"]="ignore"
-                merged_analysis["comment"]=None
-                merged_analysis["reason"]="V18 provenance/domain gate: no source-grounded comment"
-            elif merged_analysis.get("decision")=="comment":
-                merged_analysis["comment"] = v18_comment
-            merged.append((p, merged_analysis))
-        return merged, bool(ai_map), None
+            if not pid: continue
+            a=_merge_analysis(heuristics.get(pid,{}),ai_map.get(pid))
+            a["title"]=str(p.get("title") or ""); a["content"]=_post_text(p)[:6000]
+            merged.append((p,a))
+        return merged,True,None,meta
     except Exception as exc:
-        # Keep the scan useful and, critically, do not retry per post.
-        merged=[(p, heuristics.get(_post_id(p), {})) for p in posts if _post_id(p)]
-        return merged, False, str(exc)
-
+        meta["error"]=str(exc)
+        return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,str(exc),meta
 
 def persist_lead(post: dict[str, Any], analysis: dict[str, Any], status: str = "draft") -> str:
     db=SessionLocal()
@@ -1250,16 +1254,17 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         except Exception as exc:
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
 
-    batch_size=max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "20")))
+    batch_size=max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "10")))
     all_pairs=[]
-    ai_batches=0
-    ai_error=None
+    ai_batches_attempted=0; ai_batches_succeeded=0; ai_error=None; ai_valid_results=0; ai_meta=[]
     for i in range(0, len(full_posts), batch_size):
-        pairs, ai_used, err=analyze_posts_batch(full_posts[i:i+batch_size], recent_texts)
+        pairs, ai_used, err, meta_ai=analyze_posts_batch(full_posts[i:i+batch_size], recent_texts)
         all_pairs.extend(pairs)
-        ai_batches += 1 if ai_used else 0
-        if err and ai_error is None:
-            ai_error=err
+        ai_batches_attempted += int(meta_ai.get("attempted",False))
+        ai_batches_succeeded += int(meta_ai.get("succeeded",False))
+        ai_valid_results += int(meta_ai.get("valid_results",0) or 0)
+        ai_meta.append(meta_ai)
+        if err and ai_error is None: ai_error=err
 
     for full, analysis in all_pairs:
         if analysis.get("relevance_score",0) >= min_relevance:
@@ -1272,10 +1277,16 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         "source":source,
         "posts_seen":len(cards),
         "posts_analyzed":len(full_posts),
-        "ai_batches":ai_batches,
-        "ai_used":ai_batches>0,
+        "ai_batches":ai_batches_succeeded,
+        "ai_batches_attempted":ai_batches_attempted,
+        "ai_batches_succeeded":ai_batches_succeeded,
+        "ai_used":ai_batches_succeeded>0,
         "ai_error":ai_error,
+        "ai_provider":AI_PROVIDER,
+        "ai_model":AI_MODEL,
+        "ai_valid_results":ai_valid_results,
         "ai_batch_size":batch_size,
+        "ai_batch_meta":ai_meta,
         "candidates":sum(1 for x in results if x.get("decision")=="comment"),
         "results":results,
         "feed_meta":meta,

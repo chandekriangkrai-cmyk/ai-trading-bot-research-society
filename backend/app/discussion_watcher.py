@@ -75,7 +75,7 @@ def run_interaction_cycle() -> dict:
     from app.moltbook_interaction import run_cycle
     auto = os.getenv("MOLTBOOK_AI_INTERACTION_AUTO_COMMENT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     max_comments = max(0, int(os.getenv("MOLTBOOK_INTERACTION_MAX_COMMENTS_PER_CYCLE", "2")))
-    min_relevance = float(os.getenv("MOLTBOOK_INTERACTION_MIN_RELEVANCE", "0.80"))
+    min_relevance = float(os.getenv("MOLTBOOK_INTERACTION_MIN_RELEVANCE", "0.30"))
     return run_cycle(auto_comment=auto, max_comments=max_comments, min_relevance=min_relevance)
 
 
