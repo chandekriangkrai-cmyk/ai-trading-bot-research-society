@@ -442,6 +442,9 @@ _OP_PHRASES = [
     ("plus", "+", False, 110),
     ("increase", "+", False, 100),
     ("increases", "+", False, 100),
+    ("gains", "+", False, 120),
+    ("gain", "+", False, 120),
+    ("gained", "+", False, 120),
     ("sum of", "+", False, 110),
     ("total", "+", False, 90),
 ]
