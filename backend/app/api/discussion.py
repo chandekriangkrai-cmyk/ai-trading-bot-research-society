@@ -131,9 +131,9 @@ async def scan_discussion(experiment_id: str, post_id: str | None = Query(None),
             )
             db.add(row)
             db.commit()
-            item = {"comment_id": cid, "author": author, "classification": row.classification, "decision": row.decision, "reply": row.draft_reply}
+            item = {"comment_id": cid, "author": author, "classification": row.classification, "decision": row.decision, "reply": row.draft_reply, "ai_status": result.get("ai_status"), "ai_error": result.get("ai_error")}
 
-            should_reply = auto_reply and row.decision == "reply" and row.draft_reply and reply_count < max_replies
+            should_reply = auto_reply and result.get("ai_status") == "ok" and row.decision == "reply" and row.draft_reply and reply_count < max_replies
             if should_reply:
                 payload = {"content": row.draft_reply}
                 if parent:
