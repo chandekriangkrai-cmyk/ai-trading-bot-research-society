@@ -135,19 +135,29 @@ def _self_name() -> str:
     return str(a.get("name") or a.get("username") or "")
 
 
-def _ai_json(payload: dict[str, Any]) -> dict[str, Any]:
-    if not AI_KEY:
+def _ai_json_batch(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Analyze many posts in ONE LLM request.
+
+    Returns a map keyed by post_id. This is intentionally fail-closed: on a
+    provider error (especially HTTP 429) callers keep the deterministic
+    heuristic result instead of retrying every post and burning quota.
+    """
+    if not AI_KEY or not items:
         return {}
+
     system = """You are the research interaction brain for an AI trading research agent on Moltbook.
 Be skeptical, concise, and evidence-driven. Decide whether a public comment adds research value.
 Do not flatter, spam, promote, give trading signals, or invent evidence. Do not reveal proprietary EA
 source code, exact indicators, thresholds, parameters, entry/exit rules, secrets, credentials, or private data.
 Prefer one precise question, falsifiable challenge, replication idea, or evidence comparison.
 If the post is not substantively related to trading/backtesting/quantitative/AI research, ignore it.
-Return JSON only with: relevance_score, novelty_score, research_value_score, classification,
-decision (comment|ignore), reason, comment. Keep comment <= 500 characters and self-contained."""
-    user_text = json.dumps(payload, ensure_ascii=False)
-    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "700"))
+Return ONLY a JSON array. One object per input post, preserving the exact post_id.
+Each object must contain: post_id, relevance_score, novelty_score, research_value_score,
+classification, decision (comment|ignore), reason, comment.
+Scores must be numbers from 0 to 1. Keep comment <= 500 characters and self-contained.
+"""
+    user_text = json.dumps({"posts": items, "topics": TOPICS}, ensure_ascii=False)
+    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "3000"))
 
     if AI_PROVIDER == "openrouter":
         body = json.dumps({
@@ -184,8 +194,17 @@ decision (comment|ignore), reason, comment. Keep comment <= 500 characters and s
     try:
         with urllib.request.urlopen(request, timeout=AI_TIMEOUT) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
-    except (urllib.error.HTTPError, urllib.error.URLError) as e:
-        raise RuntimeError(f"{AI_PROVIDER.upper()} AI interaction request failed: {e}") from e
+    except urllib.error.HTTPError as e:
+        # Never retry here. OpenRouter documents low free-tier limits and
+        # failed attempts can still count toward the daily allowance.
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:1000]
+        except Exception:
+            pass
+        raise RuntimeError(f"{AI_PROVIDER.upper()} AI interaction batch failed HTTP {e.code}: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"{AI_PROVIDER.upper()} AI interaction batch failed: {e}") from e
 
     if AI_PROVIDER == "openrouter":
         choices = data.get("choices") or []
@@ -207,13 +226,26 @@ decision (comment|ignore), reason, comment. Keep comment <= 500 characters and s
                         chunks.append(str(c["text"]))
             text="\n".join(chunks)
 
-    m=re.search(r"\{.*\}", text, re.S)
+    # Be tolerant of markdown fences or a leading/trailing explanation.
+    m=re.search(r"\[.*\]", text, re.S)
     if not m:
         return {}
     try:
-        return json.loads(m.group(0))
+        parsed=json.loads(m.group(0))
     except json.JSONDecodeError:
         return {}
+    if not isinstance(parsed, list):
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    valid_ids={str(x.get("post_id")) for x in items if x.get("post_id")}
+    for row in parsed:
+        if not isinstance(row, dict):
+            continue
+        pid=str(row.get("post_id") or "")
+        if pid and pid in valid_ids:
+            out[pid]=row
+    return out
 
 
 def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, Any]:
@@ -231,21 +263,62 @@ def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, A
             "decision": "comment" if decision else "ignore", "reason": "Heuristic research relevance gate", "comment": comment}
 
 
+def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dict[str, Any]:
+    if not ai:
+        return heuristic
+    result={**heuristic, **ai}
+    for k in ("relevance_score","novelty_score","research_value_score"):
+        try:
+            result[k]=max(0.0,min(1.0,float(result.get(k, heuristic[k]))))
+        except Exception:
+            result[k]=heuristic[k]
+    result["decision"] = "comment" if str(result.get("decision","ignore")).lower() == "comment" else "ignore"
+    if result.get("comment"):
+        result["comment"] = sanitize_public_text(str(result["comment"]))[:500]
+    return result
+
+
 def analyze_post(post: dict[str, Any], recent_texts: list[str]) -> dict[str, Any]:
+    """Legacy single-post helper retained for compatibility; no provider call."""
     title=str(post.get("title") or "")
     content=_post_text(post)
     novelty=_novelty(f"{title}\n{content}", recent_texts)
-    heuristic=_heuristic_decision(title, content, novelty)
-    if AI_KEY:
-        ai=_ai_json({"post": {"id": _post_id(post), "author": _author_name(post), "title": title, "content": content[:12000]},
-                     "heuristic": heuristic, "topics": TOPICS})
-        if ai:
-            result={**heuristic, **ai}
-            for k in ("relevance_score","novelty_score","research_value_score"):
-                try: result[k]=max(0.0,min(1.0,float(result.get(k, heuristic[k]))))
-                except Exception: result[k]=heuristic[k]
-            return result
-    return heuristic
+    return _heuristic_decision(title, content, novelty)
+
+
+def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) -> tuple[list[dict[str, Any]], bool, str | None]:
+    """Build heuristics for all posts, then optionally make one batch AI call."""
+    prepared=[]
+    heuristics={}
+    for post in posts:
+        pid=_post_id(post)
+        if not pid:
+            continue
+        title=str(post.get("title") or "")
+        content=_post_text(post)
+        novelty=_novelty(f"{title}\n{content}", recent_texts)
+        heuristic=_heuristic_decision(title, content, novelty)
+        heuristics[pid]=heuristic
+        prepared.append({
+            "post_id": pid,
+            "author": _author_name(post),
+            "title": title,
+            "content": content[:6000],
+            "heuristic": heuristic,
+        })
+
+    if not prepared or not AI_KEY:
+        return [(p, heuristics.get(_post_id(p), {})) for p in posts if _post_id(p)], False, None
+
+    try:
+        ai_map=_ai_json_batch(prepared)
+        merged=[(p, _merge_analysis(heuristics.get(_post_id(p), {}), ai_map.get(_post_id(p))))
+                for p in posts if _post_id(p)]
+        return merged, bool(ai_map), None
+    except Exception as exc:
+        # Keep the scan useful and, critically, do not retry per post.
+        merged=[(p, heuristics.get(_post_id(p), {})) for p in posts if _post_id(p)]
+        return merged, False, str(exc)
 
 
 def persist_lead(post: dict[str, Any], analysis: dict[str, Any], status: str = "draft") -> str:
@@ -280,22 +353,49 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.80) -> dict[s
     try:
         recent_texts=[x.content for x in db.query(MoltbookInteractionLead).order_by(MoltbookInteractionLead.discovered_at.desc()).limit(50).all()]
     finally: db.close()
+
+    # Fetch full posts first; this is Moltbook traffic, not AI traffic.
+    full_posts=[]
     results=[]
     for card in cards:
         pid=_post_id(card)
         if not pid or (me and _author_name(card).lower()==me.lower()):
             continue
         try:
-            full=fetch_full_post(pid)
+            full_posts.append(fetch_full_post(pid))
         except Exception as exc:
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
-            continue
-        analysis=analyze_post(full,recent_texts)
+
+    batch_size=max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "20")))
+    all_pairs=[]
+    ai_batches=0
+    ai_error=None
+    for i in range(0, len(full_posts), batch_size):
+        pairs, ai_used, err=analyze_posts_batch(full_posts[i:i+batch_size], recent_texts)
+        all_pairs.extend(pairs)
+        ai_batches += 1 if ai_used else 0
+        if err and ai_error is None:
+            ai_error=err
+
+    for full, analysis in all_pairs:
         if analysis.get("relevance_score",0) >= min_relevance:
             lead_status="candidate" if analysis.get("decision")=="comment" else "screened"
             lead_id=persist_lead(full,analysis,lead_status)
-            results.append({"post_id":pid,"lead_id":lead_id,"title":full.get("title"),"author":_author_name(full),**analysis})
-    return {"status":"scanned","source":source,"posts_seen":len(cards),"candidates":sum(1 for x in results if x.get("decision")=="comment"),"results":results,"feed_meta":meta}
+            results.append({"post_id":_post_id(full),"lead_id":lead_id,"title":full.get("title"),"author":_author_name(full),**analysis})
+
+    return {
+        "status":"scanned",
+        "source":source,
+        "posts_seen":len(cards),
+        "posts_analyzed":len(full_posts),
+        "ai_batches":ai_batches,
+        "ai_used":ai_batches>0,
+        "ai_error":ai_error,
+        "ai_batch_size":batch_size,
+        "candidates":sum(1 for x in results if x.get("decision")=="comment"),
+        "results":results,
+        "feed_meta":meta,
+    }
 
 
 def post_comment(post_id: str, content: str, parent_id: str | None = None) -> dict[str, Any]:
