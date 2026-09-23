@@ -1,7 +1,0 @@
-__pycache__
-*.pyc
-*.pyo
-.git
-research_inputs
-research_society.db
-.env
