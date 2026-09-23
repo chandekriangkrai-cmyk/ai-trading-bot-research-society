@@ -286,6 +286,12 @@ def _extract_claim_focus(title: str, content: str) -> tuple[str, str]:
     patterns = [
         (r"(?:json parser|parser)", "parser behavior", "independent parser implementations or malformed-input cases"),
         (r"(?:vla|vision-language|controller)", "VLA/controller failure signals", "unseen evaluation cases and controller decisions"),
+        (r"(?:path planning|true autonomy|autonomy)", "the autonomy/path-planning distinction", "predefined navigation tasks that separate planning success from autonomous recovery"),
+        (r"(?:resilience|recovery|fault tolerance)", "the resilience claim", "predefined perturbations and recovery failures measured on unseen cases"),
+        (r"(?:photorealism|photorealistic|sim-to-real|simulation|simulator|visual fidelity)", "the policy-oriented simulation claim", "policy-relevant features and closed-loop failures on held-out scenarios"),
+        (r"(?:quantum advantage|classical path|quantum)", "the quantum-advantage claim", "a matched classical baseline under the same computational budget and problem definition"),
+        (r"(?:permission boundary|authorization|reuse|entitlement)", "the reuse/authorization claim", "independent evidence that separates whether an artifact works from whether it is authorized for the new receiver"),
+        (r"(?:principal hierarchy|hierarchy|trust boundary)", "the hierarchy/trust-boundary claim", "explicit boundary cases showing where authority changes and whether the rule is enforced"),
         (r"(?:agent validation|agent|llm|language model)", "agent behavior", "predefined evaluation cases not used during development"),
         (r"(?:safety score|safety benchmark|vulnerability)", "the reported safety/vulnerability measure", "held-out attack surfaces or independently generated cases"),
         (r"(?:historical style|historical evidence|historical simulation)", "the historical-effect claim", "time-separated evidence rather than the examples used to identify the pattern"),
@@ -328,6 +334,30 @@ def _contextual_research_comment(title: str, content: str) -> str:
     if "VLA/controller failure signals" == focus:
         return ("For the claimed failure signals, were they identified before the final evaluation, "
                 "and do they improve controller decisions on unseen cases rather than only correlate with failures?")
+
+    if "the autonomy/path-planning distinction" == focus:
+        return ("For the autonomy claim, which predefined tasks distinguish path-planning success from autonomous recovery, "
+                "and what failure case would falsify that distinction?")
+
+    if "the resilience claim" == focus:
+        return ("For the resilience claim, which perturbations and recovery failures were fixed before evaluation, "
+                "and does the measure change on unseen fault cases?")
+
+    if "the policy-oriented simulation claim" == focus:
+        return ("For the simulation claim, which policy-relevant features were fixed as the target, "
+                "and does the improvement persist on held-out closed-loop scenarios rather than visual metrics alone?")
+
+    if "the quantum-advantage claim" == focus:
+        return ("For the quantum-advantage claim, what matched classical baseline and computational budget were fixed, "
+                "and does the advantage remain under the same problem definition?")
+
+    if "the reuse/authorization claim" == focus:
+        return ("For the reuse claim, how is evidence that the artifact works separated from evidence that the new receiver is authorized to act on it, "
+                "and which case would falsify that boundary?")
+
+    if "the hierarchy/trust-boundary claim" == focus:
+        return ("For the hierarchy claim, which authority-boundary cases were fixed before evaluation, "
+                "and can an independent test show where the rule fails closed?")
 
     if "agent behavior" == focus:
         return ("For the agent-behavior claim, what predefined evaluation cases were kept outside development, "
