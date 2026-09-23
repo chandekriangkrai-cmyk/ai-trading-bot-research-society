@@ -14,10 +14,14 @@ from app.database import SessionLocal
 from app.public_safety import sanitize_public_text
 from app.research_models import MoltbookInteraction, MoltbookInteractionLead
 
-AI_BASE = os.getenv("RESEARCH_AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-AI_KEY = os.getenv("RESEARCH_AI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
-AI_MODEL = os.getenv("RESEARCH_AI_MODEL", "gpt-5.6-luna")
+AI_PROVIDER = os.getenv("RESEARCH_AI_PROVIDER", "gemini").strip().lower()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+OPENAI_BASE = os.getenv("RESEARCH_AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+OPENAI_KEY = os.getenv("RESEARCH_AI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("RESEARCH_AI_MODEL", "gpt-5.6-luna")
 AI_TIMEOUT = float(os.getenv("RESEARCH_AI_TIMEOUT_SECONDS", "45"))
+
 
 TOPICS = tuple(x.strip().lower() for x in os.getenv(
     "MOLTBOOK_INTERACTION_TOPICS",
@@ -120,32 +124,85 @@ def _self_name() -> str:
     return str(a.get("name") or a.get("username") or "")
 
 
-def _ai_json(payload: dict[str, Any]) -> dict[str, Any]:
-    if not AI_KEY:
+def _extract_gemini_text(data: dict[str, Any]) -> str:
+    chunks: list[str] = []
+    for candidate in data.get("candidates", []) or []:
+        content = candidate.get("content", {}) if isinstance(candidate, dict) else {}
+        for part in content.get("parts", []) or []:
+            if isinstance(part, dict) and part.get("text"):
+                chunks.append(str(part["text"]))
+    return "\n".join(chunks).strip()
+
+
+def _parse_ai_json(text: str) -> dict[str, Any]:
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
         return {}
-    system = """You are the research interaction brain for an AI trading research agent on Moltbook.
-Be skeptical, concise, and evidence-driven. Decide whether a public comment adds research value.
-Do not flatter, spam, promote, give trading signals, or invent evidence. Do not reveal proprietary EA
-source code, exact indicators, thresholds, parameters, entry/exit rules, secrets, credentials, or private data.
-Prefer one precise question, falsifiable challenge, replication idea, or evidence comparison.
-If the post is not substantively related to trading/backtesting/quantitative/AI research, ignore it.
-Return JSON only with: relevance_score, novelty_score, research_value_score, classification,
-decision (comment|ignore), reason, comment. Keep comment <= 500 characters and self-contained."""
+    try:
+        value = json.loads(m.group(0))
+        return value if isinstance(value, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _ai_json_gemini(payload: dict[str, Any], system: str) -> dict[str, Any]:
+    if not GEMINI_API_KEY:
+        return {}
     body = json.dumps({
-        "model": AI_MODEL,
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": json.dumps(payload, ensure_ascii=False)}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "relevance_score": {"type": "NUMBER"},
+                    "novelty_score": {"type": "NUMBER"},
+                    "research_value_score": {"type": "NUMBER"},
+                    "classification": {"type": "STRING"},
+                    "decision": {"type": "STRING", "enum": ["comment", "ignore"]},
+                    "reason": {"type": "STRING"},
+                    "comment": {"type": "STRING"},
+                },
+                "required": ["relevance_score", "novelty_score", "research_value_score", "classification", "decision", "reason", "comment"],
+            },
+            "maxOutputTokens": int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "700")),
+        },
+    }).encode("utf-8")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=AI_TIMEOUT) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        detail = ""
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                detail = e.read().decode("utf-8", "replace")[:1000]
+            except Exception:
+                detail = ""
+        raise RuntimeError(f"Gemini AI interaction request failed: {e}; {detail}") from e
+    return _parse_ai_json(_extract_gemini_text(data))
+
+
+def _ai_json_openai(payload: dict[str, Any], system: str) -> dict[str, Any]:
+    if not OPENAI_KEY:
+        return {}
+    body = json.dumps({
+        "model": OPENAI_MODEL,
         "input": [
             {"role": "system", "content": [{"type": "input_text", "text": system}]},
             {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]},
         ],
         "max_output_tokens": int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "700")),
     }).encode("utf-8")
-    request = urllib.request.Request(f"{AI_BASE}/responses", data=body,
-        headers={"Authorization": f"Bearer {AI_KEY}", "Content-Type": "application/json"}, method="POST")
+    request = urllib.request.Request(f"{OPENAI_BASE}/responses", data=body,
+        headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=AI_TIMEOUT) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
     except (urllib.error.HTTPError, urllib.error.URLError) as e:
-        raise RuntimeError(f"Research AI interaction request failed: {e}") from e
+        raise RuntimeError(f"OpenAI AI interaction request failed: {e}") from e
     text = data.get("output_text") or ""
     if not text:
         chunks=[]
@@ -154,13 +211,23 @@ decision (comment|ignore), reason, comment. Keep comment <= 500 characters and s
                 if isinstance(c, dict) and c.get("text"):
                     chunks.append(str(c["text"]))
         text="\n".join(chunks)
-    m=re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return {}
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return {}
+    return _parse_ai_json(text)
+
+
+def _ai_json(payload: dict[str, Any]) -> dict[str, Any]:
+    system = """You are the research interaction brain for an AI trading research agent on Moltbook.
+Be skeptical, concise, and evidence-driven. Decide whether a public comment adds research value.
+Do not flatter, spam, promote, give trading signals, or invent evidence. Do not reveal proprietary EA
+source code, exact indicators, thresholds, parameters, entry/exit rules, secrets, credentials, or private data.
+Prefer one precise question, falsifiable challenge, replication idea, or evidence comparison.
+If the post is not substantively related to trading/backtesting/quantitative/AI research, ignore it.
+Return JSON only with: relevance_score, novelty_score, research_value_score, classification,
+decision (comment|ignore), reason, comment. Keep comment <= 500 characters and self-contained."""
+    if AI_PROVIDER == "gemini":
+        return _ai_json_gemini(payload, system)
+    if AI_PROVIDER == "openai":
+        return _ai_json_openai(payload, system)
+    raise RuntimeError(f"Unsupported RESEARCH_AI_PROVIDER: {AI_PROVIDER}")
 
 
 def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, Any]:
