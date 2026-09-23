@@ -114,6 +114,48 @@ async def post_manual_reply(post_id: str, payload: dict[str, Any]):
     })
 
 
+@router.post("/comment/{comment_id}/verify")
+async def verify_comment(comment_id: str, payload: dict[str, Any]):
+    """Verify a Moltbook comment using the verification challenge returned when it was posted."""
+    key = os.getenv("MOLTBOOK_API_KEY", "")
+    if not key:
+        raise HTTPException(503, "MOLTBOOK_API_KEY is not configured")
+
+    if "answer" not in payload:
+        raise HTTPException(400, "Provide the verification answer (e.g. 161.00)")
+    verification_code = payload.get("verification_code")
+    if not verification_code:
+        raise HTTPException(400, "Provide verification_code from the Moltbook comment verification object")
+
+    body = {
+        "answer": str(payload["answer"]),
+        "verification_code": str(verification_code),
+    }
+
+    status, response = await asyncio.to_thread(
+        req,
+        "POST",
+        f"{BASE}/verify",
+        {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        body,
+    )
+
+    if status >= 400:
+        raise HTTPException(502, {
+            "message": "Moltbook comment verification failed",
+            "status_code": status,
+            "comment_id": comment_id,
+            "response": response,
+        })
+
+    return {
+        "status": "verified",
+        "comment_id": comment_id,
+        "answer": str(payload["answer"]),
+        "response": response,
+    }
+
+
 @router.post("/research/{experiment_id}/scan")
 async def scan_discussion(experiment_id: str, post_id: str | None = Query(None), auto_reply: bool = Query(False), max_replies: int = Query(2, ge=0, le=10)):
     db = SessionLocal()
