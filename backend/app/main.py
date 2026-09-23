@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import Base, engine
 from app import models, research_models, ea_files
-from app.api import health, agents, moltbook, interactions
+from app.api import health, agents, moltbook, interactions, discussion
 from app import unified_research, discussion_watcher
 
 def _background_recovery():
