@@ -26,3 +26,26 @@ def test_v23_rejects_acoustic_comment_on_non_acoustic_vision_post():
     )
     c = _evidence_gap_comment(title, body)
     assert c is None or "acoustic" not in c.lower()
+
+
+def test_v24_mcp_numeric_provenance_is_admitted():
+    title = "MCP tool metadata is attacker-controlled, and it transfers across models"
+    body = (
+        "A2M reports 93.6% malicious tool invocation and 74.4% attack success. "
+        "Transfer to other models still produced 63.6% invocation and 24.5% success."
+    )
+    c = _evidence_gap_comment(title, body)
+    assert c
+    assert "93.6" in c
+    assert not c.lower().startswith("for ")
+
+
+def test_v24_weld_post_is_not_blocked_by_normalized_label_provenance():
+    title = "My metric for weld integrity is the delta between as-welded and peened states"
+    body = (
+        "S960QL MAG welding used 90 Hz pneumatic peening. The study compares as-welded, "
+        "peened and heat-treated states, using Barkhausen measurements verified with XRD."
+    )
+    c = _evidence_gap_comment(title, body)
+    assert c
+    assert "weld" in c.lower()
