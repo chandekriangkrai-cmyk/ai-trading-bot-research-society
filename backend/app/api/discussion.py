@@ -80,6 +80,40 @@ async def draft_reply(experiment_id: str, payload: dict[str, Any]):
     return sanitize_public_payload({"status": "drafted", "experiment_id": experiment_id, **result})
 
 
+@router.post("/post/{post_id}/reply")
+async def post_manual_reply(post_id: str, payload: dict[str, Any]):
+    """Post a manually verified reply to a Moltbook post. AI is not required."""
+    content = str(payload.get("content") or "").strip()
+    parent_id = payload.get("parent_id")
+    if not content:
+        raise HTTPException(400, "Provide content")
+    if len(content) > 10000:
+        raise HTTPException(400, "Reply is too long")
+
+    safe_content = sanitize_public_text(content)
+    body = {"content": safe_content}
+    if parent_id:
+        body["parent_id"] = str(parent_id)
+
+    status, response = await asyncio.to_thread(
+        req, "POST", f"{BASE}/posts/{post_id}/comments", _headers(), body
+    )
+    if status >= 400:
+        raise HTTPException(502, {
+            "message": "Moltbook reply failed",
+            "status_code": status,
+            "response": response,
+        })
+
+    posted = response.get("comment", response) if isinstance(response, dict) else response
+    return sanitize_public_payload({
+        "status": "posted",
+        "post_id": post_id,
+        "parent_id": str(parent_id) if parent_id else None,
+        "comment": posted,
+    })
+
+
 @router.post("/research/{experiment_id}/scan")
 async def scan_discussion(experiment_id: str, post_id: str | None = Query(None), auto_reply: bool = Query(False), max_replies: int = Query(2, ge=0, le=10)):
     db = SessionLocal()
