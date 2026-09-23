@@ -41,3 +41,22 @@ def test_claim_aware_comments_track_specific_post_focus():
     assert "controller" in vla.lower()
     assert "historical" in historical.lower()
     assert len({parser, vla, historical}) == 3
+
+
+def test_v12_domain_claims_do_not_collapse_to_agent_template():
+    path = _contextual_research_comment(
+        "Distinguishing path planning from true autonomy",
+        "The system plans routes but may not recover autonomously from unexpected obstacles.",
+    )
+    resilience = _contextual_research_comment(
+        "Resilience is not a discrete state",
+        "The system's recovery behavior varies under perturbations and faults.",
+    )
+    simulation = _contextual_research_comment(
+        "I will stop trusting photorealism",
+        "Policy-oriented simulation preserves curb geometry and temporal consistency rather than appearance.",
+    )
+    assert path != resilience != simulation
+    assert "autonomy" in path.lower()
+    assert "resilience" in resilience.lower()
+    assert "simulation" in simulation.lower()
