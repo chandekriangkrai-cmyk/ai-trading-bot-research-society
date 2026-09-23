@@ -112,10 +112,48 @@ def _heuristic_classify(text: str) -> str:
     return "other"
 
 
+def _heuristic_reply(comment_text: str, context: dict[str, Any]) -> dict[str, Any]:
+    classification = _heuristic_classify(comment_text)
+    if classification == "casual":
+        return {"classification": classification, "decision": "ignore", "reason": "Casual comment; no substantive research discussion detected.", "reply": None}
+    if classification == "other":
+        return {"classification": classification, "decision": "ignore", "reason": "No clear research question or challenge detected.", "reply": None}
+
+    reply = (
+        "That is a useful research question. I do not want to infer or invent missing performance figures. "
+        "The realized-performance observation should be reported from the verified backtest, and any benchmark comparison "
+        "should use the same instrument, period, starting point, and clearly defined return methodology. "
+        "The research record should be updated once those figures are verified."
+    )
+    return {
+        "classification": classification,
+        "decision": "reply",
+        "reason": "Substantive research discussion detected; deterministic fallback used.",
+        "reply": reply,
+    }
+
+
 def generate_reply(experiment_id: str, comment_text: str, author: str = "unknown", thread_context: str = "") -> dict[str, Any]:
-    context = _result_context(experiment_id)
+    try:
+        context = _result_context(experiment_id)
+    except Exception as exc:
+        return {
+            "classification": "other",
+            "decision": "ignore",
+            "reason": "Research context is unavailable; no reply generated.",
+            "reply": None,
+            "ai_status": "context_error",
+            "ai_error": str(exc)[:1200],
+        }
+
     if len(comment_text.strip()) < 8:
-        return {"classification": "other", "decision": "ignore", "reason": "Comment is too short to support substantive research discussion.", "reply": None}
+        return {
+            "classification": "other",
+            "decision": "ignore",
+            "reason": "Comment is too short to support substantive research discussion.",
+            "reply": None,
+            "ai_status": "not_needed",
+        }
 
     if AI_KEY:
         payload = {
@@ -132,33 +170,30 @@ def generate_reply(experiment_id: str, comment_text: str, author: str = "unknown
                 "next_research_question": "optional question for a future experiment",
             },
         }
-        raw = _post_json(f"{AI_BASE}/responses", payload)
         try:
-            # Allow the model to return a JSON object even though Responses output is text.
-            match = re.search(r"\{.*\}", raw, re.S)
-            data = json.loads(match.group(0) if match else raw)
-        except Exception:
-            data = {"classification": "research_question", "decision": "reply", "reason": "AI produced a prose research response.", "reply": raw}
-        data.setdefault("classification", "research_question")
-        data.setdefault("decision", "reply")
-        data.setdefault("reason", "AI research assessment")
-        data["reply"] = str(data.get("reply") or "").strip() or None
-        return data
+            raw = _post_json(f"{AI_BASE}/responses", payload)
+            try:
+                match = re.search(r"\{.*\}", raw, re.S)
+                data = json.loads(match.group(0) if match else raw)
+            except Exception:
+                data = {
+                    "classification": "research_question",
+                    "decision": "reply",
+                    "reason": "AI produced a prose research response.",
+                    "reply": raw,
+                }
+            data.setdefault("classification", "research_question")
+            data.setdefault("decision", "reply")
+            data.setdefault("reason", "AI research assessment")
+            data["reply"] = str(data.get("reply") or "").strip() or None
+            data["ai_status"] = "ok"
+            return data
+        except Exception as exc:
+            fallback = _heuristic_reply(comment_text, context)
+            fallback["ai_status"] = "fallback"
+            fallback["ai_error"] = str(exc)[:1200]
+            return fallback
 
-    classification = _heuristic_classify(comment_text)
-    if classification == "casual":
-        return {"classification": classification, "decision": "ignore", "reason": "Casual comment; no substantive research question detected.", "reply": None}
-    if classification == "other":
-        return {"classification": classification, "decision": "ignore", "reason": "No clear research question or challenge detected.", "reply": None}
-
-    findings = context.get("findings", [])[:3]
-    evidence_bits = []
-    for f in findings:
-        if isinstance(f, dict):
-            evidence_bits.append(str(f.get("question") or "an observed pattern"))
-    reply = (
-        "That is a useful challenge. The current evidence supports an observed pattern, but not a causal explanation. "
-        "I would separate the observation from competing explanations and test the strongest alternative with an independent backtest. "
-        + ("The current research specifically examines " + "; ".join(evidence_bits[:2]) + "." if evidence_bits else "The current result set does not contain enough evidence to distinguish the mechanisms.")
-    )
-    return {"classification": classification, "decision": "reply", "reason": "Substantive research discussion detected.", "reply": reply}
+    fallback = _heuristic_reply(comment_text, context)
+    fallback["ai_status"] = "not_configured"
+    return fallback
