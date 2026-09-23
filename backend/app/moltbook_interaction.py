@@ -273,46 +273,104 @@ def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, A
             "reason": "Heuristic research relevance gate", "comment": comment}
 
 
-def _contextual_research_comment(title: str, content: str) -> str:
-    """Create a deterministic, post-specific research comment without an LLM.
+def _extract_claim_focus(title: str, content: str) -> tuple[str, str]:
+    """Extract a short claim/focus phrase and a rough evidence target.
 
-    This is deliberately conservative: it asks one evidence-oriented question
-    tied to signals actually present in the post. It exists so the agent remains
-    useful while Gemini/OpenAI credentials are unavailable, without repeating a
-    single canned sentence across unrelated posts.
+    This is intentionally deterministic. It does not pretend to understand the
+    paper or post semantically; it uses concrete lexical signals so comments can
+    mention the actual subject instead of falling back to a generic template.
+    """
+    text = re.sub(r"\s+", " ", f"{title}. {content}").strip()
+    lower = text.lower()
+
+    patterns = [
+        (r"(?:json parser|parser)", "parser behavior", "independent parser implementations or malformed-input cases"),
+        (r"(?:vla|vision-language|controller)", "VLA/controller failure signals", "unseen evaluation cases and controller decisions"),
+        (r"(?:agent validation|agent|llm|language model)", "agent behavior", "predefined evaluation cases not used during development"),
+        (r"(?:safety score|safety benchmark|vulnerability)", "the reported safety/vulnerability measure", "held-out attack surfaces or independently generated cases"),
+        (r"(?:historical style|historical evidence|historical simulation)", "the historical-effect claim", "time-separated evidence rather than the examples used to identify the pattern"),
+        (r"(?:latency arbitrage|latency|async speculation|sequential tool)", "the latency/throughput claim", "matched workloads with the same tool budget and measurement window"),
+        (r"(?:benchmark|baseline|buy-and-hold|comparison)", "the comparative claim", "a fixed baseline, period, and evaluation protocol"),
+        (r"(?:backtest|backtesting|forex|trading|drawdown|strategy|expert advisor|\bea\b)", "the trading/backtest claim", "an untouched chronological period with explicit cost assumptions"),
+        (r"(?:replication|reproducib|reproduce|holdout|out-of-sample|walk-forward)", "the replication claim", "an untouched holdout or independent reproduction"),
+        (r"(?:sample size|p-value|confidence interval|statistical|uncertainty|significant)", "the statistical claim", "sample size, uncertainty, and multiple-testing controls"),
+        (r"(?:dataset|data leakage|selection bias|bias)", "the dataset/evidence claim", "a separately sourced or time-separated dataset"),
+        (r"(?:methodology|experiment|hypothesis|acceptance threshold|acceptance criterion|evidence)", "the experimental claim", "a preregistered or fixed acceptance criterion"),
+    ]
+    for pat, focus, evidence in patterns:
+        if re.search(pat, lower):
+            return focus, evidence
+
+    # Use a meaningful title fragment as the focus when no specialized signal is found.
+    clean_title = re.sub(r"[^A-Za-z0-9 -]", " ", title).strip()
+    clean_title = re.sub(r"\s+", " ", clean_title)
+    if clean_title:
+        return clean_title[:80], "an independent test that could falsify the main claim"
+    return "the main claim", "an independent test that could falsify the main claim"
+
+
+def _contextual_research_comment(title: str, content: str) -> str:
+    """Create a deterministic claim-aware research comment without an LLM.
+
+    V11 improves V10 by anchoring the question to the post's concrete claim and
+    its likely evidence target. It remains deliberately conservative and does not
+    invent results, sources, or facts that are not present in the post.
     """
     text = f"{title} {content}".lower()
+    focus, evidence = _extract_claim_focus(title, content)
 
-    if any(k in text for k in ("sample size", "sample", "n=", "statistical", "significant", "p-value", "confidence interval")):
-        return ("What sample size and uncertainty measure support the reported effect, "
-                "and does it remain material when the confidence interval or multiple-testing risk is considered?")
+    # Claim-specific questions come first so broad words such as "evaluation" do
+    # not swallow a more useful domain-specific signal.
+    if "parser behavior" == focus:
+        return ("For the parser-replication claim, which malformed or ambiguous JSON cases were tested, "
+                "and does the gap persist across an independent parser implementation?")
 
-    if any(k in text for k in ("benchmark", "baseline", "buy-and-hold", "comparison", "compare", "control")):
-        return ("What baseline and evaluation period are you using for the comparison, "
+    if "VLA/controller failure signals" == focus:
+        return ("For the claimed failure signals, were they identified before the final evaluation, "
+                "and do they improve controller decisions on unseen cases rather than only correlate with failures?")
+
+    if "agent behavior" == focus:
+        return ("For the agent-behavior claim, what predefined evaluation cases were kept outside development, "
+                "and what result would count as a failed improvement?")
+
+    if "the reported safety/vulnerability measure" == focus:
+        return ("For the reported safety measure, was the evaluation repeated on held-out attack surfaces, "
+                "and does the result remain after controlling for the tested channel or threat model?")
+
+    if "the historical-effect claim" == focus:
+        return ("For the historical-effect claim, what evidence was fixed before identifying the pattern, "
+                "and does it survive a time-separated test rather than the examples used to find it?")
+
+    if "the latency/throughput claim" == focus:
+        return ("For the latency claim, were workload, tool budget, and measurement window held constant, "
+                "and does the reported gain survive an independent workload?")
+
+    if "the comparative claim" == focus:
+        return ("For the comparative claim, which baseline and evaluation period were fixed in advance, "
                 "and are the same data, costs, and success criteria applied to both methods?")
 
-    if any(k in text for k in ("replication", "reproduce", "reproducib", "independent", "holdout", "out-of-sample", "walk-forward")):
-        return ("Can the result be reproduced on an untouched chronological holdout, "
-                "and were the evaluation rules fixed before that data was examined?")
+    if "the trading/backtest claim" == focus:
+        return ("For the trading/backtest claim, which chronological period was kept untouched, "
+                "and does the result survive the stated spread, fee, and execution-cost assumptions?")
 
-    if any(k in text for k in ("agent", "llm", "model", "ai", "evaluation", "eval", "validation")):
-        return ("What predefined evaluation criteria distinguish a real improvement from a change in behavior, "
-                "and were those criteria tested on cases the system had not seen during development?")
+    if "the replication claim" == focus:
+        return ("For the replication claim, what was held out before the result was observed, "
+                "and does an independent run reproduce the effect without changing the evaluation rules?")
 
-    if any(k in text for k in ("dataset", "data leakage", "leakage", "selection bias", "bias", "dataset")):
-        return ("How did you check for selection or data leakage, and does the finding persist on a separately sourced or time-separated dataset?")
+    if "the statistical claim" == focus:
+        return ("For the statistical claim, what sample size and uncertainty measure were fixed in advance, "
+                "and does the effect remain after accounting for multiple comparisons?")
 
-    if any(k in text for k in ("trading", "backtest", "backtesting", "forex", "ea", "expert advisor", "strategy", "return", "profit", "drawdown")):
-        return ("What out-of-sample period and transaction-cost assumptions were fixed before evaluating this result, "
-                "and does the conclusion survive those assumptions?")
+    if "the dataset/evidence claim" == focus:
+        return ("For the dataset claim, how was selection or leakage ruled out, "
+                "and does the finding persist on a separately sourced or time-separated dataset?")
 
-    if any(k in text for k in ("risk", "drawdown", "volatility", "sharpe", "loss", "tail")):
-        return ("Which risk measure is decisive for the claim, and does the result remain consistent across different market or stress periods rather than only the aggregate sample?")
+    if "the experimental claim" == focus:
+        return ("For the experimental claim, what acceptance criterion was fixed before observing the outcome, "
+                "and what result would have counted as a failure?")
 
-    if any(k in text for k in ("method", "methodology", "experiment", "hypothesis", "threshold", "acceptance", "criterion", "evidence")):
-        return ("What acceptance criterion was fixed before observing the outcome, and what result would have counted as a failure of the hypothesis?")
-
-    return ("What concrete measurement would falsify the main claim, and has that test been run on data or cases kept separate from the evidence used to develop it?")
+    return (f"For {focus.lower()}, how was {evidence} used to test the claim, "
+            "and what independent result would falsify it?")
 
 
 def _comment_similarity(a: str, b: str) -> float:
