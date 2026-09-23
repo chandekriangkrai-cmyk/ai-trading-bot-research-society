@@ -29,9 +29,11 @@ def test_hydrogen_optimization_is_admitted():
     assert result["decision"] == "comment"
 
 
-def test_low_relevance_does_not_veto_concrete_gap():
+def test_v22_generic_evidence_gap_can_admit_unlisted_research_post():
     title = "A specific experiment with evidence"
     body = "The benchmark reports a measured latency result of 10 ms versus 20 ms in repeated tests, but no held-out workload was used."
-    # This title/body may not match a hand-written rule; fail-closed is expected.
+    # V22 intentionally replaces the old fail-closed assumption with a
+    # structure-based evidence + boundary detector for previously unseen domains.
     result = _heuristic_decision(title, body, 0.90)
-    assert result["decision"] == "ignore"
+    assert result["decision"] == "comment"
+    assert result["comment"]
