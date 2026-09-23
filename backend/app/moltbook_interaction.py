@@ -36,7 +36,7 @@ AI_TIMEOUT = float(os.getenv("RESEARCH_AI_TIMEOUT_SECONDS", "45"))
 
 TOPICS = tuple(x.strip().lower() for x in os.getenv(
     "MOLTBOOK_INTERACTION_TOPICS",
-    "trading,backtest,backtesting,forex,quant,quantitative,research,ea,expert advisor,risk,robustness,walk-forward,out-of-sample,replication"
+    "trading,backtest,backtesting,forex,quant,quantitative,research,ai,agent,agents,benchmark,benchmarking,evaluation,experiment,methodology,reproducibility,replication,simulation,evidence,dataset,model,inference,verification,robustness,walk-forward,out-of-sample,risk,drawdown,spread,ea,expert advisor"
 ).split(",") if x.strip())
 
 
@@ -150,7 +150,11 @@ Be skeptical, concise, and evidence-driven. Decide whether a public comment adds
 Do not flatter, spam, promote, give trading signals, or invent evidence. Do not reveal proprietary EA
 source code, exact indicators, thresholds, parameters, entry/exit rules, secrets, credentials, or private data.
 Prefer one precise question, falsifiable challenge, replication idea, or evidence comparison.
-If the post is not substantively related to trading/backtesting/quantitative/AI research, ignore it.
+A post may be relevant even when it is not directly about trading: research methodology, AI/agent evaluation,
+benchmark design, simulation validity, reproducibility, evidence quality, statistical inference, or experimental
+design can provide transferable research methods for an AI trading research society. Prefer posts with a concrete
+claim, measurement, benchmark, experiment, limitation, or falsifiable question. Ignore purely social, promotional,
+poetic, political, or generic opinion posts.
 Return ONLY a JSON array. One object per input post, preserving the exact post_id.
 Each object must contain: post_id, relevance_score, novelty_score, research_value_score,
 classification, decision (comment|ignore), reason, comment.
@@ -248,19 +252,778 @@ Scores must be numbers from 0 to 1. Keep comment <= 500 characters and self-cont
     return out
 
 
+def _claim_anchor_strength(title: str, content: str) -> int:
+    """V15 gate: require concrete subject/claim anchors before commenting.
+
+    0 = generic/no usable anchor; 1 = weak; 2+ = specific enough to question.
+    This intentionally prefers IGNORE over a generic research-sounding reply.
+    """
+    t=(title or "").lower()
+    tokens=_title_anchor_tokens(title)
+    technical_terms=(
+        "agent","agents","model","models","benchmark","evaluation","experiment","evidence",
+        "simulation","simulator","dataset","transformer","qos","dds","satcast","diffusion",
+        "energy","coverage","recharge","latency","throughput","autonomy","perception","lidar",
+        "tracking","security","attack","metric","variance","gradient","inference","reasoning",
+        "parser","compression","cache","prompt","planning","control","robot","robotic","uav",
+        "satellite","aerosol","thermal","verification","reproduc","replication","backtest","trading",
+        "forex","drawdown","spread","slm","llm","microfluidic","tissue","architecture","policy",
+        "authorization","injection","permission","hierarchy","semantic","philology","translation",
+        "distribution","manipulation","cluttered","training",
+    )
+    hits=sum(1 for x in technical_terms if x in t)
+    strong_tokens=[x for x in tokens if len(x)>=5 or any(ch.isdigit() for ch in x)]
+    # Named/technical multi-token titles are specific even when no hand-written
+    # pattern exists. Body terminology can supply one additional anchor.
+    body=(content or "").lower()
+    body_hits=sum(1 for x in technical_terms if x in body)
+    if hits>=2 or (hits>=1 and len(strong_tokens)>=2) or any(ch.isdigit() for ch in t):
+        return 2
+    if strong_tokens and body_hits>=2:
+        return 1
+    return 0
+
+
 def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, Any]:
     relevance = _keyword_relevance(title, content)
     text = content.lower()
-    value_terms=("evidence", "sample", "backtest", "out-of-sample", "oos", "replicate", "robust", "drawdown", "spread", "walk-forward", "hypothesis")
+    value_terms=(
+        "evidence", "sample", "backtest", "out-of-sample", "oos", "replicate", "replication",
+        "reproducib", "robust", "benchmark", "evaluation", "experiment", "methodology",
+        "simulation", "dataset", "hypothesis", "statistical", "measurement", "verification",
+        "drawdown", "spread", "walk-forward"
+    )
     value = min(1.0, sum(1 for x in value_terms if x in text) / 5)
-    decision = relevance >= 0.5 and novelty >= 0.45 and value >= 0.4
-    comment = None
+    # V17: a concrete evidence gap is itself strong research-value evidence.
+    evidence_gap = _extract_evidence_gap(title, content)
+    if evidence_gap:
+        value = max(value, 0.40)
+        relevance = max(relevance, 0.30)
+    # V20: a concrete evidence gap is the primary admission signal.
+    # Relevance/value remain informative scores, but must not veto a post
+    # that already contains a specific claim, observed evidence, and a
+    # well-defined missing validation boundary. Domain/provenance/specificity
+    # guards still run later when the public comment is constructed.
+    screened = relevance >= 0.30 and novelty >= 0.30 and value >= 0.30
+    anchor_strength = _claim_anchor_strength(title, content)
+    evidence_gap_admission = evidence_gap is not None and novelty >= 0.30
+    # V21: a concrete evidence gap is sufficient for admission; the legacy
+    # title-anchor gate must not veto evidence-rich research posts.
+    decision = evidence_gap_admission
+    comment = _evidence_gap_comment(title, content) if decision else None
+    if decision and not comment:
+        decision = False
+
+    reason = "Heuristic research relevance gate"
     if decision:
-        comment = ("Interesting result. What is the sample size and does the effect survive a chronological "
-                   "holdout or independent replication? I would separate the observed association from any causal explanation.")
+        reason = "Evidence-gap admission: concrete claim, evidence, and missing validation found"
+    elif evidence_gap is not None and novelty >= 0.30 and not comment:
+        reason = "Evidence-gap comment guard: source/domain/provenance specificity check failed"
+    elif screened and anchor_strength < 2:
+        reason = "Claim-anchor gate: insufficiently specific claim for a research comment"
     return {"relevance_score": relevance, "novelty_score": novelty, "research_value_score": value,
             "classification": "research_question" if decision else "other",
-            "decision": "comment" if decision else "ignore", "reason": "Heuristic research relevance gate", "comment": comment}
+            "decision": "comment" if decision else "ignore",
+            "reason": reason, "comment": comment}
+
+
+def _extract_claim_focus(title: str, content: str) -> tuple[str, str]:
+    """Extract the most post-specific claim signal deterministically.
+
+    V13 deliberately gives the title priority.  The title is usually the author's
+    compact thesis, while body text often contains generic research vocabulary
+    (evaluation, evidence, simulation, agent, etc.) that caused V12 to collapse
+    unrelated posts into the same comment template.
+    """
+    title_text = re.sub(r"\s+", " ", title or "").strip()
+    body_text = re.sub(r"\s+", " ", content or "").strip()
+    lower_title = title_text.lower()
+    lower_body = body_text.lower()
+    combined = f"{lower_title} {lower_body}"
+
+    # Highly specific title/thesis signals first.
+    specific = [
+        (r"state updates.*single-pass inference|single-pass inference.*state updates",
+         "state updates versus single-pass inference",
+         "diagnostic error reduction from iterative state updates on held-out cases"),
+        (r"satcast diffusion architecture|predictive constraints of the satcast",
+         "SATcast predictive constraints",
+         "prediction error under the architecture's stated constraints on held-out cases"),
+        (r"energy constraints.*spatial coverage|spatial coverage.*energy constraints",
+         "energy-constrained spatial coverage",
+         "coverage achieved under fixed energy, route-length, and recharge constraints"),
+        (r"ai compliance.*hazard chains|compliance.*hazard chains",
+         "AI compliance across hazard chains",
+         "held-out hazard-chain cases spanning the tested compliance boundaries"),
+        (r"dds qos|qos policies",
+         "DDS QoS policy verification",
+         "formal verification outcomes versus trial-and-error tuning failures"),
+        (r"deliberately tiny instance|tiny instance|no-meta-observable-invention",
+         "deliberately tiny instance",
+         "whether the tiny-instance result survives a separately constructed instance without meta-observable leakage"),
+        (r"slms.*replace llms|llms.*replace slms",
+         "SLM versus LLM replacement",
+         "a predefined task-level acceptance criterion under matched cost and capability constraints"),
+        (r"quality estimation.*single-step|single-step.*quality estimation",
+         "single-step quality estimation",
+         "segment-level diagnostic accuracy that the one-step score misses"),
+        (r"dual-frontier|error attribution",
+         "Dual-Frontier error attribution",
+         "error-attribution accuracy on predefined failure cases"),
+        (r"evidence freshness|long-running.*poc|poc.*long-running",
+         "evidence freshness in a long-running agent",
+         "a longitudinal freshness measure and a predefined degradation threshold"),
+        (r"fixed seed.*feedback loop|feedback loop.*cpus|across cpus",
+         "cross-CPU feedback-loop reproducibility",
+         "the same feedback-loop outcome across independent CPU environments"),
+        (r"tactile simulator.*geometry|geometry engine",
+         "tactile-simulator fidelity",
+         "task-relevant tactile behavior rather than geometry or visual similarity alone"),
+        (r"black boxes.*audit|black box.*audit",
+         "black-box auditability",
+         "held-out audit cases that distinguish explainability from surface compliance"),
+        (r"vertical profile.*satellite aerosol|aerosol retrieval",
+         "vertical-profile aerosol retrieval",
+         "a matched retrieval baseline over a fixed time period and independent observations"),
+        (r"throughput.*physical ai|primary metric.*physical ai",
+         "throughput as a physical-AI deployment metric",
+         "matched workloads and deployment costs showing throughput is not masking failures"),
+        (r"maps, not moral compasses|multi-model networks",
+         "multi-model dataset interpretation",
+         "selection and leakage controls on a separately sourced or time-separated dataset"),
+        (r"planning.*constant doubt|constant doubt",
+         "planning under uncertainty",
+         "predefined planning failure cases and a criterion for when additional doubt improves decisions"),
+        (r"status.*cheaper than truth|status is cheaper",
+         "agent status versus truth",
+         "independent evidence separating status signals from verified task outcomes"),
+        (r"reasoning.*pattern matching|sophisticated pattern matching",
+         "reasoning versus pattern matching",
+         "held-out cases requiring behavior not explained by the observed pattern distribution"),
+        (r"semantic maps.*incomplete datasets|incomplete datasets",
+         "semantic-map dataset completeness",
+         "coverage and missingness tests on independently sourced environments"),
+        (r"prompt injection.*authorization bug|authorization bug.*model bug",
+         "prompt-injection authorization boundary",
+         "held-out authorization cases showing whether the same policy holds under injected instructions"),
+        (r"inter-agent messages.*injection|injection channels",
+         "inter-agent message injection",
+         "cross-agent injection cases and whether the receiving boundary rejects unauthorized instructions"),
+        (r"model.*security layer.*attack surface|attack surface.*permissions",
+         "model-controlled permission attack surface",
+         "held-out permission-escalation cases and explicit authorization checks"),
+        (r"perceptual buffers.*technical failures",
+         "perceptual buffers versus technical failures",
+         "fault cases where perception is correct but the downstream technical failure remains"),
+        (r"thermal modeling|thermal model",
+         "thermal-model validity",
+         "independent thermal observations rather than a proxy metric alone"),
+        (r"relay protection guarantee|satellite coverage",
+         "satellite coverage versus relay protection",
+         "independent relay-protection failure cases under coverage assumptions"),
+        (r"session boundary.*unit of work|unit of work.*session",
+         "session boundaries versus work units",
+         "cross-session traces showing the proposed work unit remains measurable"),
+        (r"multi-agent perception|perception.*summation|summation.*perception",
+         "multi-agent perception fusion",
+         "duplicate-pruning and tracking-error changes on V2V or independently collected multi-agent cases"),
+        (r"spectro-spatial.*transformer|transformer.*satellite signal|satellite signal detection",
+         "spectro-spatial Transformer detection",
+         "detection and characterization accuracy on matched synthetic and real-world RF datasets under interference"),
+        (r"video-rate.*microrobotic|microrobotic.*video-rate|microrobot.*autonomy",
+         "video-rate microrobotic autonomy",
+         "control latency and failure rate under dynamic or biologically relevant disturbances rather than throughput alone"),
+        (r"gradient flows|gradient-flow",
+         "gradient-flow compute-performance trade-off",
+         "whether the claimed performance constraint survives discretization and a change of representation"),
+        (r"training distribution.*sterile|sterile.*training distribution|in-the-wild.*manipulation",
+         "training-distribution effect on manipulation",
+         "held-out cluttered manipulation success under matched simulator-only and in-the-wild training conditions"),
+    ]
+    for pat, focus, evidence in specific:
+        if re.search(pat, lower_title):
+            return focus, evidence
+
+    # Domain-specific signals next.  Search title before body to avoid generic
+    # words in long posts overriding a specific thesis.
+    patterns = [
+        (r"json parser|parser", "parser behavior", "independent parser implementations or malformed-input cases"),
+        (r"vla|vision-language|controller", "VLA/controller failure signals", "unseen evaluation cases and controller decisions"),
+        (r"path planning|true autonomy|autonomy", "the autonomy/path-planning distinction", "predefined navigation tasks that separate planning success from autonomous recovery"),
+        (r"resilience|recovery|fault tolerance", "the resilience claim", "predefined perturbations and recovery failures measured on unseen cases"),
+        (r"photorealism|photorealistic|sim-to-real|simulation|simulator|visual fidelity", "the policy-oriented simulation claim", "policy-relevant features and closed-loop failures on held-out scenarios"),
+        (r"quantum advantage|classical path|quantum", "the quantum-advantage claim", "a matched classical baseline under the same computational budget and problem definition"),
+        (r"permission boundary|authorization|reuse|entitlement", "the reuse/authorization claim", "independent evidence that separates whether an artifact works from whether it is authorized for the new receiver"),
+        (r"principal hierarchy|hierarchy|trust boundary", "the hierarchy/trust-boundary claim", "explicit boundary cases showing where authority changes and whether the rule is enforced"),
+        (r"safety score|safety benchmark|vulnerability", "the reported safety/vulnerability measure", "held-out attack surfaces or independently generated cases"),
+        (r"historical style|historical evidence|historical simulation", "the historical-effect claim", "time-separated evidence rather than the examples used to identify the pattern"),
+        (r"latency arbitrage|latency|async speculation|sequential tool", "the latency/throughput claim", "matched workloads with the same tool budget and measurement window"),
+        (r"benchmark|baseline|buy-and-hold|comparison", "the comparative claim", "a fixed baseline, period, and evaluation protocol"),
+        (r"backtest|backtesting|forex|trading|drawdown|strategy|expert advisor|\bea\b", "the trading/backtest claim", "an untouched chronological period with explicit cost assumptions"),
+        (r"replication|reproduc|holdout|out-of-sample|walk-forward", "the replication claim", "an untouched holdout or independent reproduction"),
+        (r"sample size|p-value|confidence interval|statistical|uncertainty|significant", "the statistical claim", "sample size, uncertainty, and multiple-testing controls"),
+        (r"dataset|data leakage|selection bias|bias", "the dataset/evidence claim", "a separately sourced or time-separated dataset"),
+        (r"methodology|experiment|hypothesis|acceptance threshold|acceptance criterion|evidence", "the experimental claim", "a preregistered or fixed acceptance criterion"),
+    ]
+    for pat, focus, evidence in patterns:
+        if re.search(pat, lower_title):
+            return focus, evidence
+    for pat, focus, evidence in patterns:
+        if re.search(pat, lower_body):
+            return focus, evidence
+
+    if re.search(r"\bagent\b.*\bvalidation\b|\bvalidation\b.*\bagent\b", lower_title):
+        return "agent validation", "predefined evaluation cases not used during development"
+
+    clean_title = re.sub(r"[^A-Za-z0-9 -]", " ", title_text).strip()
+    clean_title = re.sub(r"\s+", " ", clean_title)
+    if clean_title:
+        return clean_title[:80], "an independent test that could falsify the main claim"
+    return "the main claim", "an independent test that could falsify it"
+
+
+def _title_anchor_tokens(title: str) -> list[str]:
+    """Return meaningful title anchors used as a domain-mismatch guard."""
+    stop={
+        "your","you","will","the","a","an","is","are","was","were","just","not",
+        "from","to","of","for","and","or","in","on","with","without","can","does",
+        "do","i","my","this","that","these","those","when","how","what","why","beyond",
+        "through","primary","rough","single","step","one","new","real","true","still",
+    }
+    raw=re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", title or "")
+    return [x.lower() for x in raw if x.lower() not in stop]
+
+
+def _title_anchor_comment(title: str) -> str:
+    """Fallback that stays anchored to the author's actual title thesis."""
+    t=re.sub(r"\s+", " ", title or "").strip()
+    low=t.lower()
+    # Common thesis forms. Keep the question falsifiable without pretending to
+    # know evidence that is not present in the post.
+    m=re.match(r"(?:i will|we will) (?:stop|start|avoid|demand|use) (.+?)(?:[.!?]|$)", t, re.I)
+    if m:
+        subject=m.group(1).strip()
+        return f"What measurable outcome would show that {subject} changes the claimed failure, and what result would falsify that change?"
+    m=re.match(r"(?:can|does|will) (.+?) (?:fix|replace|solve|invalidate) (.+?)[.!?]*$", t, re.I)
+    if m:
+        a,b=m.group(1).strip(),m.group(2).strip()
+        return f"What controlled test distinguishes {a} from {b}, and what result would show the proposed change does not hold?"
+    m=re.match(r"(.+?) (?:is|are|was|were) (?:not|just) (.+?)[.!?]*$", t, re.I)
+    if m:
+        a,b=m.group(1).strip(),m.group(2).strip()
+        return f"What measurement distinguishes {a} from {b}, and which held-out case would falsify that distinction?"
+    m=re.match(r"(?:evaluating|evaluation of) (.+)$", t, re.I)
+    if m:
+        subject=m.group(1).rstrip(".?!")
+        return f"Which measurable constraint of {subject} is being tested, and what held-out result would count as a failure?"
+    if re.search(r"\b(replace|replacement)\b", low):
+        return f"What acceptance criterion would demonstrate the claimed replacement in '{t}', and what result would count as failure?"
+    if re.search(r"\b(invalidate|invalidates|invalidated)\b", low):
+        return f"Which controlled comparison supports the claim in '{t}', and what result would falsify it?"
+    if re.search(r"\bbenchmark\b", low):
+        return f"What baseline benchmark is being compared in '{t}', and what same-period result would falsify the claimed difference?"
+    if re.search(r"photorealism|photorealistic|simulator|simulation", low):
+        return f"What held-out simulation result would show the photorealism claim in '{t}' matters for task performance rather than appearance alone?"
+    if re.search(r"\b(primary metric|metric)\b", low):
+        return f"How is the metric in '{t}' operationalized, and what competing outcome would show it is insufficient?"
+    clean=t.rstrip(".?!")
+    return f"For '{clean}', what evidence directly tests the central claim, and which independent result would falsify it?"
+
+
+def _comment_matches_title_domain(title: str, comment: str) -> bool:
+    """Reject comments that lose the concrete subject of the title."""
+    tokens=_title_anchor_tokens(title)
+    if not tokens:
+        return True
+    c=(comment or "").lower()
+    # Acronyms/product names are especially strong anchors.
+    strong=[x for x in tokens if len(x) >= 5 or any(ch.isdigit() for ch in x)]
+    if not strong:
+        strong=tokens
+    return any(x in c for x in strong)
+
+
+def _contextual_research_comment_core(title: str, content: str) -> str:
+    """Generate the deterministic research question before the V14 domain guard."""
+    focus, evidence = _extract_claim_focus(title, content)
+    questions = {
+        "state updates versus single-pass inference": "Which diagnostic failures improve when state updates are added, and does that improvement persist on held-out cases against the single-pass baseline?",
+        "SATcast predictive constraints": "Which predictive constraint is measured for SATcast, and does the claimed improvement persist on held-out forecasts under the same problem definition?",
+        "energy-constrained spatial coverage": "Which energy, route-length, and recharge constraints were fixed, and does the coverage claim persist on held-out scenarios under the same budget?",
+        "AI compliance across hazard chains": "Which held-out hazard-chain cases were fixed before evaluation, and does compliance remain consistent across each tested boundary rather than only the easiest channel?",
+        "DDS QoS policy verification": "Which DDS QoS violations or tuning failures were prevented by formal verification, and does that advantage persist on independently specified policies?",
+        "deliberately tiny instance": "What does the tiny instance isolate, and does the result survive on a separately constructed instance without relying on meta-observable information?",
+        "SLM versus LLM replacement": "Which task-level acceptance criterion was fixed before comparison, and does the SLM meet it under matched cost, latency, and capability constraints?",
+        "single-step quality estimation": "Which segment-level metric demonstrates that the proposed decomposition detects failures that the one-step score misses?",
+        "Dual-Frontier error attribution": "What evidence shows Dual-Frontier improves error attribution, and which predefined failure cases distinguish it from the baseline?",
+        "evidence freshness in a long-running agent": "How was evidence freshness measured over the long-running evaluation, and what degradation threshold was fixed before the results were observed?",
+        "cross-CPU feedback-loop reproducibility": "Which feedback-loop outputs were fixed as the reproducibility target, and does an independent CPU run reproduce them without changing the evaluation rules?",
+        "tactile-simulator fidelity": "Which task-level tactile behaviors were used as the target, and do the results hold on held-out contact or manipulation scenarios rather than geometry metrics alone?",
+        "black-box auditability": "Which held-out audit cases distinguish genuine inspectability from surface compliance, and what result would falsify the proposed audit boundary?",
+        "vertical-profile aerosol retrieval": "Which retrieval baseline and time window were fixed in advance, and does the vertical-profile method improve results on independent observations?",
+        "throughput as a physical-AI deployment metric": "Which matched workload and deployment-cost assumptions were fixed, and what failure mode would show throughput is masking task-level degradation?",
+        "multi-model dataset interpretation": "How were selection and leakage ruled out, and does the finding persist on a separately sourced or time-separated dataset?",
+        "planning under uncertainty": "Which planning failure cases were fixed before evaluation, and what measurable outcome would show that the added uncertainty process actually improves decisions?",
+        "agent status versus truth": "Which independent task outcomes were used to separate status signals from verified truth, and what case would falsify that distinction?",
+        "reasoning versus pattern matching": "Which held-out cases require behavior not explained by the observed patterns, and what result would count as evidence against the reasoning claim?",
+        "semantic-map dataset completeness": "Which coverage and missingness tests were fixed, and does the completeness claim hold on independently sourced environments?",
+        "prompt-injection authorization boundary": "Which held-out authorization cases test injected instructions, and does the permission boundary still reject actions without explicit authority?",
+        "inter-agent message injection": "Which cross-agent injection cases were evaluated, and what evidence shows the receiving boundary rejects unauthorized instructions?",
+        "model-controlled permission attack surface": "Which held-out permission-escalation cases were tested, and where is authorization enforced independently of the model's own decision?",
+        "perceptual buffers versus technical failures": "Which fault cases keep perception correct while the downstream system still fails, and does the proposed buffer change those outcomes?",
+        "thermal-model validity": "Which independent thermal observations validate the proposed model, and what error threshold was fixed before evaluation?",
+        "satellite coverage versus relay protection": "Which independent relay-protection failure cases were tested under coverage assumptions, and what evidence separates coverage from actual protection?",
+        "session boundaries versus work units": "Which cross-session traces define the proposed work unit, and does the unit remain measurable when work spans multiple sessions?",
+    }
+    if focus in questions:
+        return questions[focus]
+
+    if focus == "parser behavior":
+        return "Which malformed or ambiguous JSON cases were tested, and does the gap persist across an independent parser implementation?"
+    if focus == "VLA/controller failure signals":
+        return "Were the claimed failure signals identified before the final evaluation, and do they improve controller decisions on unseen cases rather than only correlate with failures?"
+    if focus == "the autonomy/path-planning distinction":
+        return "Which predefined evaluation tasks distinguish path-planning success from autonomy, and what failure case would falsify that distinction?"
+    if focus == "the resilience claim":
+        return "For the resilience claim, which perturbations and recovery failures were fixed before evaluation, and does the measure change on unseen fault cases?"
+    if focus == "the policy-oriented simulation claim":
+        return "For the simulation claim, which policy-relevant features were fixed as the target, and does the improvement persist on held-out closed-loop scenarios rather than visual metrics alone?"
+    if focus == "the quantum-advantage claim":
+        return "What matched classical baseline and computational budget were fixed, and does the advantage remain under the same problem definition?"
+    if focus == "the reuse/authorization claim":
+        return "How is evidence that the artifact works separated from evidence that the new receiver is authorized to act on it, and which case would falsify that boundary?"
+    if focus == "the hierarchy/trust-boundary claim":
+        return "Which authority-boundary cases were fixed before evaluation, and can an independent test show where the rule fails closed?"
+    if focus == "the reported safety/vulnerability measure":
+        return "Was the evaluation repeated on held-out attack surfaces, and does the result remain after controlling for the tested channel or threat model?"
+    if focus == "the historical-effect claim":
+        return "For the historical-effect claim, what evidence was fixed before identifying the historical pattern, and does it survive a time-separated test rather than the examples used to find it?"
+    if focus == "the latency/throughput claim":
+        return "Were workload, tool budget, and measurement window held constant, and does the reported gain survive an independent workload?"
+    if focus == "the comparative claim":
+        return "Which baseline and evaluation period were fixed in advance, and are the same data, costs, and success criteria applied to both methods?"
+    if focus == "the trading/backtest claim":
+        return "Which chronological period was kept untouched, and does the result survive the stated spread, fee, and execution-cost assumptions?"
+    if focus == "the replication claim":
+        return "What was held out before the result was observed, and does an independent run reproduce the effect without changing the evaluation rules?"
+    if focus == "the statistical claim":
+        return "What sample size and uncertainty measure were fixed in advance, and does the effect remain after accounting for multiple comparisons?"
+    if focus == "the dataset/evidence claim":
+        return "How was selection or leakage ruled out, and does the finding persist on a separately sourced or time-separated dataset?"
+    if focus == "the experimental claim":
+        return "What acceptance criterion was fixed before observing the outcome, and what result would have counted as a failure?"
+    if focus == "agent validation":
+        return "For the agent validation claim, which evaluation cases were fixed before development, and what result would count as a failed improvement?"
+    comment = f"For {focus.lower()}, what measurement would directly test {evidence}, and what independent result would falsify the claim?"
+    if not _comment_matches_title_domain(title, comment):
+        return _title_anchor_comment(title)
+    return comment
+
+
+def _contextual_research_comment(title: str, content: str) -> str:
+    """V14: generate a claim-aware comment and enforce title-domain anchoring."""
+    comment=_contextual_research_comment_core(title, content)
+    if _comment_matches_title_domain(title, comment):
+        return comment
+    low_title=(title or "").lower()
+    low_content=(content or "").lower()
+    if "photorealism" in low_title and "simulation" in low_content:
+        return "What held-out simulation result would show the photorealism claim matters for task performance rather than appearance alone?"
+    return _title_anchor_comment(title)
+
+
+
+def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
+    """V16: extract a concrete claim, mechanism, evidence and missing boundary.
+
+    This is deliberately deterministic and fail-closed.  A comment is only
+    generated when the post contains enough concrete anchors to ask about a
+    specific missing piece of evidence; otherwise the post is ignored.
+    """
+    title = re.sub(r"\s+", " ", title or "").strip()
+    body = re.sub(r"\s+", " ", content or "").strip()
+    low = f"{title} {body}".lower()
+    if not title or len(body) < 40:
+        return None
+
+    # V17 high-specificity anchors. These are ordered before broader V16
+    # patterns so concrete research mechanisms do not collapse into generic text.
+    rules = [
+        (r"hydrozoan|dual commit path|3f\+c\+2p\+1|geo-distribution|commit.?time|faulty validators",
+         "Hydrozoan dual-commit protocol", "commit-time reduction under the stated faulty-validator model",
+         "the reported ~25% latency reduction", "whether the ~25% reduction persists across the (f,c,p) threshold range and where the safety/latency boundary appears as faulty validators approach p"),
+        (r"reward hacking|proxy compression hypothesis|score.*actual utility|evaluator error surface",
+         "reward-hacking benchmark validity", "the claimed decoupling between benchmark score and task utility",
+         "score and task-performance measurements", "whether the decoupling persists under an independently defined task-quality metric while holding the optimization substrate fixed"),
+        (r"93\.6%|malicious invocation|hijacked tool|a2m|tool description",
+         "MCP tool-description injection", "malicious tool invocation under the stated threat model",
+         "93.6% invocation / attack-success measurements", "whether the result persists on held-out tool descriptions and transfer attacks under the same cost and threat-model controls"),
+        (r"tool timeout|permission denials?|completion rate|drops tool failures|every attempted run",
+         "agent benchmark denominator", "completion rate after counting tool failures", "tool timeouts and permission-denial outcomes",
+         "whether the reported completion rate changes when every attempted run, including timeout and permission-denial failures, remains in the denominator"),
+        (r"prediction market|polymarket|odds.*liquidity|liquidity.*odds|order-flow|order flow|sybil risk",
+         "prediction-market price concentration", "whether extreme odds reflect genuine information or liquidity capture", "odds, volume and liquidity measurements",
+         "whether the extreme price persists after controlling for order-flow concentration, counter-liquidity and independent trader activity"),
+        (r"tool protocol|serving stack|retries.*benchmark|harness decides",
+         "agent benchmark serving-stack effect", "benchmark outcomes under serving-stack confounds",
+         "retry, tool-call and serving behavior", "whether the gap remains with a matched serving stack and tool protocol"),
+        (r"compile rate|compile failures|compiler-standard|code vulnerability repair|diff_f1|codebleu|big-vul|vulnerable functions",
+         "compile-rate evaluation validity", "whether compile rate measures actual vulnerability repair rather than harness artifacts",
+         "the reported harness-attributed compile failures and ranking reversal", "whether the ranking and repair quality persist with the compiler confound fixed and a change-aware metric evaluated on held-out vulnerable functions"),
+        (r"18(?:\.\d+)?-point|18(?:\.\d+)? percentage points|65\.3%|259 agentic-security papers|variance estimate nor repeated runs",
+         "agent-security attack-success measurement validity", "whether reported attack-success differences are statistically resolvable",
+         "the 18.2-point detection floor, 65.3% without variance/repeated runs, and the 259-paper review",
+         "whether the reported ranking differences persist under repeated independent runs with uncertainty and judge-agreement controls"),
+        (r"s960ql|barkhausen|xrd sin 2|90 hz pneumatic|peened state|residual stress",
+         "weld residual-stress intervention", "whether peening changes the residual-stress state rather than only the proxy signal",
+         "the as-welded/peened/heat-treated comparison with Barkhausen and XRD verification",
+         "whether the intervention effect replicates across independent joints and measurement methods under the same welding conditions"),
+        (r"hazardarena|semantic safety|safe/unsafe twin|risk-sensitive tasks|semantic-to-action|safety option layer",
+         "semantic-safety evaluation", "semantic-to-action safety under matched physical tasks",
+         "the reported safe/unsafe twin-task results", "whether the safety gap persists on held-out asset/task combinations with an independently validated semantic judge"),
+        (r"nsga-ii|electrolyzer|hydrogen storage|fuel cell|grid volatility|renewable energy absorption|hardware capex",
+         "hydrogen-buffer grid optimization", "the claimed reduction in grid volatility and increase in renewable absorption",
+         "the NSGA-II sizing and volatility/absorption metrics", "whether the benefit remains when hardware CAPEX is imposed as an explicit constraint across held-out operating scenarios"),
+        (r"llm-as-a-judge|llm labels|cheap labels|off-policy evaluation|doubly-robust|expert ground truth|annotation probabilities|rmse reductions",
+         "LLM-label bias in off-policy evaluation", "the claimed efficiency of expert annotation allocation under biased proxy labels",
+         "the reported RMSE reductions", "whether the improvement persists on a held-out annotation budget with expert labels reserved for validation"),
+        (r"0\.23 seconds|7\.80 seconds|first-token logit|structured json|four-option decision|recovery queue",
+         "recovery-decision latency", "the latency advantage of direct four-state selection over structured JSON generation",
+         "the reported 0.23-second versus 7.80-second measurements", "whether the latency gap persists on a held-out restart workload with the action set and hardware fixed"),
+        (r"(?:80 percent accuracy|80% accuracy).*?(?:acoustic|waveverif|side-channel)|(?:acoustic|waveverif|side-channel).*?(?:80 percent accuracy|80% accuracy)|acoustic side-channel|waveverif",
+         "acoustic robot-workflow verification", "movement validation from acoustic side-channel signals",
+         "the reported ~80% baseline accuracy", "whether accuracy remains above a predefined reliability threshold under held-out factory noise and changed microphone conditions"),
+        (r"reproducible build|deterministic build|artifact verification|provenance attestations|verifiability",
+         "systemic build verifiability", "the claimed gap between deterministic output and independently reproducible provenance",
+         "the reported verifiability limitations", "whether an independent verifier can reconstruct the source state, environment, dependencies and instructions from the published metadata alone"),
+        (r"post-quantum|ml-kem|message size|cortexm4|sevenfold|7-fold|edhoc hybrid",
+         "post-quantum IoT overhead", "the deployment cost of hybrid post-quantum key exchange on constrained devices",
+         "the reported message-size increase", "whether the security benefit remains acceptable under a fixed radio-energy and latency budget on held-out constrained devices"),
+        (r"cheaper judge|jev-as-a-judge|0\.36%|three percentage points|99%.*accuracy|escalat",
+         "selective judge escalation", "the claim that confidence-based escalation preserves comparator accuracy",
+         "the reported three-point gap and 99% comparator accuracy", "whether the accuracy retention persists on held-out complex derivation and adversarially wrong-answer cases"),
+        (r"65%.*security papers|18-point gap|no variance",
+         "agent-security metric variance", "whether the metric can resolve the claimed performance gap",
+         "the reported 18-point gap", "whether the metric remains informative after repeated independent runs with uncertainty reported"),
+        (r"sysml|uml testing profile|tool-chain|toolchains|tool chains|ordering, timing, and state-based",
+         "SysML verification portability", "behavioral and interface verification across independent tool-chains", "the successful demonstration across two tool-chains",
+         "whether the verification semantics remain equivalent across additional independent tools and SysML constructs rather than only the demonstrated pair"),
+        (r"confidence score|decision record|0\.56|0\.8 threshold|threshold is part of the decision",
+         "auditable decision records", "threshold-dependent decision behavior", "the 0.56 confidence score and 0.8 escalation threshold",
+         "whether independent replay can reconstruct the same branch from the recorded input, options, model version and threshold"),
+        (r"entropic transport|entropy.*transport|barycentric projection|n\^[-−]1|n\^[-−]1/2|semi-discrete",
+         "semi-discrete entropic transport rate", "the dimension-free convergence claim in the semi-discrete regime", "the reported n^-1 squared-error rate and finite-support/subGaussian setup",
+         "whether the rate degrades toward n^-1/2 as the discrete support grows toward the subGaussian regime"),
+        (r"hazardarena|semantic safety|safe/unsafe twin|semantic-to-action|safety option layer",
+         "semantic safety in VLA evaluation", "semantic-to-action safety under matched physical scenarios", "the 2,000+ assets and 40 risk-sensitive safe/unsafe twin tasks",
+         "whether the semantic-safety gap persists on held-out asset/task combinations with an independently validated safety judge"),
+        (r"compile rate|vulnerability repair|compile failures|diff_f1|big-vul|compiler-standard",
+         "compile-rate validity in vulnerability repair", "the relationship between compile success and actual repair quality", "the reported 64% harness/dataset artifact share and 1.8-2.7x compiler-standard effect",
+         "whether model rankings and repair quality remain stable on held-out vulnerable functions after fixing compiler and harness confounds"),
+        (r"hydrogen|nsga-ii|electrolyzer|fuel cell|renewable energy absorption|grid power purchase volatility",
+         "hydrogen-buffer sizing for grid volatility", "the trade-off between renewable absorption and grid-volatility reduction", "the NSGA-II sizing objective over electrolyzer, storage and fuel-cell capacities",
+         "whether the claimed benefit remains when hardware CAPEX and physical footprint are imposed as explicit constraints on held-out load profiles"),
+        (r"success rate|hazard|semantic context|reach, grasp|vla|vision-language-action",
+         "semantic safety beyond task success rate", "the distinction between physical execution success and semantic safety", "the reported success-rate framing and matched safe/unsafe task context",
+         "whether semantic-trigger performance predicts unsafe actions on held-out contextual changes rather than only trajectory completion"),
+        (r"vulnerability scanning|exploitable paths|18,000|17,979|14 minutes|nodezero",
+         "security validation by exploitable paths", "the relationship between scanner findings and exploitable attack paths", "18,000 findings versus 21 verified exploitable paths",
+         "whether exploitable-path reduction remains predictive of real compromise risk under independent environments and configuration drift"),
+        (r"deterministic builds|reproducible build|verifiability|artifact verification|provenance attestations",
+         "systemic build verifiability", "the gap between deterministic outputs and independently reproducible provenance", "the four ecosystem study and the reported metadata/provenance limitations",
+         "whether independent verifiers can reconstruct the same build from registry-provided metadata without maintainer-only state"),
+        (r"tool-call count|40% fewer calls|half the tokens|30% faster|latency tax",
+         "tool-call efficiency in coding agents", "the relationship between reduced tool calls and task performance", "the reported 40% call reduction and half-token usage",
+         "whether the efficiency gain persists on held-out tasks when success quality and tool protocol are held constant"),
+        (r"contraction factor.*bounded|bounded.*contraction factor|stochastic connectivity.*contraction",
+         "contraction factor", "bounded estimation error", "stochastic-connectivity threshold", 
+         "the quantitative contraction/connectivity condition under which the error bound is guaranteed"),
+        (r"satcast|diffusion architecture",
+         "SATcast diffusion architecture", "predictive constraint", "held-out forecast error", 
+         "whether the predictive constraint survives held-out forecasts under the same problem definition"),
+        (r"energy constraints.*coverage|spatial coverage.*energy|coverage.*recharge",
+         "energy-constrained spatial coverage", "coverage", "energy/route/recharge budget",
+         "whether the coverage limitation remains when energy, route length and recharge constraints are varied"),
+        (r"dds.*qos|qos.*formal verification",
+         "DDS QoS formal verification", "QoS policy violations", "independently specified policies",
+         "whether the formal guarantee holds for independently specified QoS policies and failure modes"),
+        (r"video-rate.*microrobotic|microrobotic.*autonomy",
+         "video-rate microrobotic autonomy", "control latency", "dynamic disturbance cases",
+         "whether video-rate throughput translates into bounded control latency and reliable behavior under disturbances"),
+        (r"spectro-spatial.*transformer|satellite signal detection",
+         "spectro-spatial Transformer signal detection", "detection accuracy", "real-world interference cases",
+         "whether the reported detection gain survives real-world interference and independently collected signals"),
+        (r"65%.*security papers|no variance|18-point gap",
+         "agent-security metric variance", "18-point performance gap", "repeated independent runs",
+         "whether the reported metric remains informative when variance and repeated-run uncertainty are measured"),
+        (r"multi-agent perception|perception.*summation",
+         "multi-agent perception fusion", "tracking error", "independently collected multi-agent cases",
+         "whether the claimed fusion benefit survives duplicate-pruning and tracking-error tests on independent cases"),
+        (r"gradient flows|gradient-flow",
+         "gradient-flow compute-performance trade-off", "performance constraint", "discretization/representation change",
+         "whether the claimed constraint persists after changing discretization or representation"),
+        (r"training distribution.*sterile|training distribution.*manipulation",
+         "training-distribution effect on manipulation", "manipulation success", "held-out cluttered environments",
+         "whether the effect survives held-out cluttered environments rather than the training distribution"),
+        (r"benchmark.*serving stack|serving stack.*benchmark|harness decides",
+         "agent benchmark serving-stack effect", "benchmark outcome", "matched serving stack/tool protocol",
+         "whether the benchmark gap remains when serving stack, retries and tool-call protocol are held constant"),
+        (r"prompt injection.*authorization|authorization.*injection",
+         "prompt-injection authorization boundary", "unauthorized action", "held-out authorization cases",
+         "whether the authorization boundary still rejects injected instructions in held-out cases"),
+        (r"parser.*replication|replication.*parser",
+         "parser-dependent replication", "replication outcome", "malformed or ambiguous inputs",
+         "whether the reported replication result survives independent parser implementations and ambiguous inputs"),
+        (r"buy-and-hold|benchmark comparison",
+         "benchmark comparison", "performance difference", "same-period baseline",
+         "whether the difference survives identical data, costs and evaluation period"),
+        (r"sample size|confidence interval|variance|statistical",
+         "statistical claim", "reported effect", "sample size and uncertainty",
+         "whether the effect remains after uncertainty and multiple-comparison controls"),
+        (r"simulation|simulator|photorealism",
+         "simulation validity", "task performance", "held-out closed-loop scenarios",
+         "whether the simulation result transfers to task performance on held-out closed-loop scenarios"),
+        (r"backtest|backtesting|trading|drawdown|spread",
+         "backtest performance", "reported strategy result", "untouched chronological period",
+         "whether the result survives an untouched chronological period with explicit execution costs"),
+    ]
+    for pat, claim, mechanism, evidence, gap in rules:
+        if re.search(pat, low):
+            # Require the post to contain at least one evidence/measurement cue;
+            # title-only slogans are not enough for an evidence-gap question.
+            cues = ("show", "shows", "found", "result", "experiment", "test", "tested",
+                    "measur", "data", "benchmark", "paper", "simulation", "evidence",
+                    "guarantee", "claim", "improve", "increase", "decrease", "error",
+                    "accuracy", "performance", "bound", "threshold", "success", "latency", "disturbance", "volume", "liquidity", "odds", "rate",
+                    "evaluation", "budget", "rmse", "bias", "judge", "annotation", "provenance", "build", "verifiability", "minimiz", "maximize", "constraint", "optimization")
+            if not any(c in low for c in cues):
+                return None
+            return {"claim": claim, "mechanism": mechanism, "evidence": evidence, "gap": gap}
+
+    # V23 GENERIC EVIDENCE-GAP DETECTOR:
+    # Bind evidence to a nearby limitation instead of taking the first numeric
+    # sentence and the first caveat anywhere in the post. This prevents
+    # unrelated domains/paragraphs from being fused into one question.
+    sentences = [x.strip() for x in re.split(r"(?<=[.!?])\s+", body) if x.strip()]
+    number_re = re.compile(r"(?<![A-Za-z])[-+]?\d+(?:[.,]\d+)?(?:%|°|\s*(?:AU|GeV|K|Hz|ms|s|years?|months?|days?|kg|cm|km))?", re.I)
+    evidence_cues = (
+        "show", "found", "measured", "estimate", "estimated", "observed",
+        "result", "results", "data", "measurement", "baseline", "experiment",
+        "tested", "test", "calculated", "reported", "model", "comparison",
+        "probability", "accuracy", "latency", "yield", "rate", "error",
+        "agreement", "bias", "performance"
+    )
+    boundary_cues = (
+        "however", "but", "although", "uncertain", "uncertainty", "limitation",
+        "bias", "biased", "does not prove", "cannot establish", "not enough",
+        "not yet", "no complete", "incomplete", "requires", "need longer",
+        "needs longer", "future work", "open question", "caveat", "depends on",
+        "sensitive to", "may not", "could not", "without"
+    )
+    validation_cues = (
+        "validate", "validation", "independent", "replicate", "replication",
+        "held-out", "holdout", "longer baseline", "additional data", "further",
+        "future", "test", "measure", "compare", "cross-check", "verify"
+    )
+    indexed = [(i, x, x.lower()) for i, x in enumerate(sentences)]
+    evidence_sentences = [(i,x,l) for i,x,l in indexed if number_re.search(x) and any(c in l for c in evidence_cues)]
+    boundary_sentences = [(i,x,l) for i,x,l in indexed if any(c in l for c in boundary_cues)]
+    validation_present = any(c in low for c in validation_cues)
+
+    # Find the closest evidence/limitation pair, preferring lexical linkage.
+    pair = None
+    best_key = None
+    for ei, ex, el in evidence_sentences:
+        ewords = set(re.findall(r"[a-z]{5,}", el))
+        for bi, bx, bl in boundary_sentences:
+            distance = abs(ei-bi)
+            if distance > 2:
+                continue
+            bwords = set(re.findall(r"[a-z]{5,}", bl))
+            overlap = len(ewords & bwords)
+            # A nearby explicit caveat is useful even with little lexical overlap;
+            # a distant caveat is not allowed to manufacture a relationship.
+            key = (0 if overlap else 1, distance, -overlap)
+            if best_key is None or key < best_key:
+                best_key = key
+                pair = (ex, bx, overlap)
+
+    numeric_count = len(number_re.findall(body))
+    if pair and numeric_count >= 2:
+        evidence, boundary, overlap = pair
+        # Require either lexical linkage or an explicit contrast marker.
+        if overlap == 0 and not any(c in boundary.lower() for c in ("however", "but", "although", "limitation", "uncertain", "cannot", "not yet", "requires")):
+            return None
+        evidence = re.sub(r"\s+", " ", evidence).strip()[:220]
+        boundary = re.sub(r"\s+", " ", boundary).strip()[:220]
+        claim = re.sub(r"\s+", " ", title).strip()[:140]
+        if validation_present:
+            gap = "an independent validation beyond the limitation described in the post"
+        else:
+            gap = "a validation that directly tests the stated limitation on held-out or independent cases"
+        mechanism = f"the claim in light of the limitation ({boundary[:120]})"
+        return {"claim": claim, "mechanism": mechanism, "evidence": evidence, "gap": gap}
+
+    # V24: evidence-first fallback. A post can be research-ready even when it
+    # does not use our limitation vocabulary, especially when the author gives
+    # hard measurements and ends with an explicit unresolved question. Bind the
+    # question to the nearest quantitative/evaluation evidence rather than
+    # inventing a new domain-specific pattern.
+    question_sentences = [(i,x,l) for i,x,l in indexed if "?" in x and len(x) >= 25]
+    if question_sentences and evidence_sentences:
+        best = None
+        for qi, qx, ql in question_sentences:
+            for ei, ex, el in evidence_sentences:
+                distance = abs(qi-ei)
+                if distance > 4:
+                    continue
+                qwords = set(re.findall(r"[a-z]{5,}", ql))
+                ewords = set(re.findall(r"[a-z]{5,}", el))
+                overlap = len(qwords & ewords)
+                key=(distance,-overlap)
+                if best is None or key < best[0]:
+                    best=(key,qx,ex,overlap)
+        if best:
+            _, qx, ex, overlap = best
+            if overlap >= 1 or abs(question_sentences[0][0]-evidence_sentences[0][0]) <= 1:
+                claim = re.sub(r"\s+", " ", title).strip()[:140]
+                evidence = re.sub(r"\s+", " ", ex).strip()[:220]
+                gap = re.sub(r"\s+", " ", qx).strip()[:240]
+                return {"claim": claim, "mechanism": "the unresolved question stated by the author",
+                        "evidence": evidence, "gap": gap}
+
+    return None
+
+
+def _domain_fingerprint(title: str, content: str) -> set[str]:
+    """V18: derive coarse research domains from the actual post text."""
+    low = f"{title} {content}".lower()
+    domains = set()
+    groups = {
+        "trading": ("backtest", "backtesting", "trading", "forex", "drawdown", "spread", "eurusd", "xauusd", "strategy tester"),
+        "graph": ("gnn", "graph neural", "community detection", "message passing", "diffusion", "node", "edge reconstruction", "spatial attention"),
+        "agent_benchmark": ("agent benchmark", "tool timeout", "permission denial", "completion rate", "serving stack", "retry", "tool-call"),
+        "agent_security": ("mcp", "authorization", "prompt injection", "hijacked tool", "malicious invocation", "attack success", "threat model", "credential"),
+        "market": ("prediction market", "odds", "liquidity", "order flow", "polymarket", "trader", "wallet", "sybil"),
+        "robotics": ("robot", "robotic", "teleoperation", "hand pose", "trajectory", "manipulation", "sim-to-real", "microrobotic"),
+        "speech": ("diarization", "speaker", "transcription", "speech", "audio", "voice"),
+    }
+    for domain, cues in groups.items():
+        if sum(1 for cue in cues if cue in low) >= 1:
+            domains.add(domain)
+    return domains
+
+
+def _comment_domain_safe(title: str, content: str, comment: str) -> bool:
+    """V18 hard guard: generated comments may not introduce a foreign domain."""
+    post_domains = _domain_fingerprint(title, content)
+    comment_domains = _domain_fingerprint("", comment)
+    if not comment_domains:
+        return True
+    if not post_domains:
+        return False
+    # A comment is safe when every detected domain in it is grounded in the post.
+    return comment_domains.issubset(post_domains)
+
+
+def _comment_provenance_safe(title: str, content: str, comment: str) -> bool:
+    """V24 source-grounding guard based on anchors actually shared by post/comment."""
+    if not comment:
+        return False
+    gap = _extract_evidence_gap(title, content)
+    if not gap:
+        return False
+    low_post = f"{title} {content}".lower()
+    low_comment = comment.lower()
+    generic = {
+        "agent","agents","model","models","system","performance","research","result",
+        "claim","evaluation","validation","effect","accuracy","behavior","metric","tool",
+        "post","reports","reported","question","evidence","open","whether","what","would",
+        "result","stated","using","under","same","independent","testing","tested"
+    }
+    post_tokens = set(re.findall(r"[a-z][a-z0-9._-]{4,}", low_post))
+    comment_tokens = set(re.findall(r"[a-z][a-z0-9._-]{4,}", low_comment))
+    shared = {x for x in post_tokens & comment_tokens if x not in generic}
+
+    # Hard quantitative evidence gets an additional numeric anchor check.
+    evidence = gap.get("evidence", "").lower()
+    nums = re.findall(r"\d+(?:\.\d+)?%?", evidence)
+    numeric_hit = any(n in low_post and n in low_comment for n in nums)
+
+    # Two shared concrete anchors is the default. One named/technical anchor
+    # plus a grounded numeric value is also sufficient. This is deliberately
+    # less brittle than requiring normalized claim labels to appear verbatim.
+    if len(shared) >= 2:
+        return _comment_domain_safe(title, content, comment)
+    if len(shared) >= 1 and numeric_hit:
+        return _comment_domain_safe(title, content, comment)
+    return False
+
+def _evidence_gap_comment(title: str, content: str) -> str | None:
+    """Turn a grounded evidence gap into a natural, non-template question."""
+    gap = _extract_evidence_gap(title, content)
+    if not gap:
+        return None
+
+    claim = gap["claim"].strip().rstrip(".")
+    evidence = gap["evidence"].strip().rstrip(".")
+    mechanism = gap["mechanism"].strip().rstrip(".")
+    missing = gap["gap"].strip().rstrip(".")
+
+    # Several sentence shapes make the public interaction read like a research
+    # exchange rather than a mail-merge template. They deliberately avoid the
+    # old "For X, what evidence would directly test..." construction.
+    mechanism_text = re.sub(r"^(?:the claim that|whether)\s+", "", mechanism, flags=re.I).strip()
+    candidates = [
+        f"The post reports {evidence}. The key open question is {missing}. What result would distinguish {claim} from {mechanism_text}?",
+        f"You report {evidence}, but {mechanism_text}. Has {missing} been tested, and what result would count against {claim}?",
+        f"The main uncertainty is {missing}. What would falsify {claim}, given {evidence} and the stated limitation?",
+        f"The reported result is {evidence}. Would {missing} be enough to separate {claim} from {mechanism_text}?",
+    ]
+    # Prefer the evidence-rich natural form; fall back if it exceeds the public limit.
+    comment = candidates[0] if len(candidates[0]) <= 500 else candidates[1]
+    comment = sanitize_public_text(comment)[:500]
+
+    forbidden = (
+        r"^\s*for\b",
+        r"what evidence would directly test",
+        r"does the claim hold when testing",
+        r"^\s*for statistical claim\b",
+        r"^\s*for simulation validity\b",
+    )
+    if any(re.search(p, comment, re.I) for p in forbidden):
+        return None
+
+    # Require two concrete anchors from the actual post and source-grounded
+    # provenance/domain checks. This is the final semantic firewall.
+    low_post = f"{title} {content}".lower()
+    anchor_candidates=[]
+    for source in (gap["claim"], gap["mechanism"], gap["evidence"]):
+        anchor_candidates.extend(re.findall(r"[a-z0-9]{5,}", source.lower()))
+    stop={"reported","stated","whether","using","under","claim","evidence","result","current","setup","limitation"}
+    concrete={x for x in anchor_candidates if x not in stop and x in low_post}
+    concrete.update(x for x in re.findall(r"\d+(?:\.\d+)?%?", gap["evidence"]) if x in low_post)
+    if len(concrete) < 2:
+        return None
+    if not _comment_provenance_safe(title, content, comment):
+        return None
+    return comment
+
+
+def _comment_similarity(a: str, b: str) -> float:
+    aw = set(re.findall(r"[a-z0-9]{3,}", (a or "").lower()))
+    bw = set(re.findall(r"[a-z0-9]{3,}", (b or "").lower()))
+    if not aw or not bw:
+        return 0.0
+    return len(aw & bw) / max(1, len(aw | bw))
+
+
+def _recent_outbound_comments(db, limit: int = 30) -> list[str]:
+    rows = (db.query(MoltbookInteraction.content)
+            .filter(MoltbookInteraction.direction == "outbound")
+            .order_by(MoltbookInteraction.created_at.desc())
+            .limit(limit).all())
+    return [str(row[0]) for row in rows if row and row[0]]
 
 
 def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dict[str, Any]:
@@ -273,8 +1036,21 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
         except Exception:
             result[k]=heuristic[k]
     result["decision"] = "comment" if str(result.get("decision","ignore")).lower() == "comment" else "ignore"
-    if result.get("comment"):
-        result["comment"] = sanitize_public_text(str(result["comment"]))[:500]
+    # V15: AI may improve wording, but it cannot bypass the deterministic
+    # claim-anchor gate. Generic AI comments are worse than no comment.
+    title = str(result.get("title") or "")
+    content = str(result.get("content") or "")
+    # V16 is evidence-gap first: AI may score/classify, but it cannot select a
+    # generic comment. The deterministic extractor must find a concrete gap.
+    v18_comment = _evidence_gap_comment(title, content)
+    if result.get("decision") == "comment" and not v18_comment:
+        result["decision"] = "ignore"
+        result["comment"] = None
+        result["reason"] = "V18 provenance/domain gate: no source-grounded comment"
+    elif result.get("decision") == "comment":
+        result["comment"] = v18_comment
+    else:
+        result["comment"] = None
     return result
 
 
@@ -312,8 +1088,23 @@ def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) ->
 
     try:
         ai_map=_ai_json_batch(prepared)
-        merged=[(p, _merge_analysis(heuristics.get(_post_id(p), {}), ai_map.get(_post_id(p))))
-                for p in posts if _post_id(p)]
+        merged=[]
+        for p in posts:
+            pid=_post_id(p)
+            if not pid:
+                continue
+            merged_analysis=_merge_analysis(heuristics.get(pid, {}), ai_map.get(pid))
+            merged_analysis["title"]=str(p.get("title") or "")
+            merged_analysis["content"]=_post_text(p)[:6000]
+            # Re-apply deterministic V16 evidence-gap gate after AI merge.
+            v18_comment = _evidence_gap_comment(merged_analysis["title"], merged_analysis["content"])
+            if merged_analysis.get("decision")=="comment" and not v18_comment:
+                merged_analysis["decision"]="ignore"
+                merged_analysis["comment"]=None
+                merged_analysis["reason"]="V18 provenance/domain gate: no source-grounded comment"
+            elif merged_analysis.get("decision")=="comment":
+                merged_analysis["comment"] = v18_comment
+            merged.append((p, merged_analysis))
         return merged, bool(ai_map), None
     except Exception as exc:
         # Keep the scan useful and, critically, do not retry per post.
@@ -345,7 +1136,7 @@ def persist_lead(post: dict[str, Any], analysis: dict[str, Any], status: str = "
     finally: db.close()
 
 
-def discover_and_analyze(limit: int = 40, min_relevance: float = 0.80) -> dict[str, Any]:
+def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[str, Any]:
     source, cards, meta=discover_feed(limit=limit)
     me=_self_name()
     recent_texts=[]
@@ -407,7 +1198,10 @@ def post_comment(post_id: str, content: str, parent_id: str | None = None) -> di
     return body if isinstance(body,dict) else {"raw":body}
 
 
-def run_cycle(auto_comment: bool = False, max_comments: int = 2, min_relevance: float = 0.80) -> dict[str, Any]:
+def run_cycle(auto_comment: bool = False, max_comments: int = 1, min_relevance: float = 0.30) -> dict[str, Any]:
+    # V15 deliberately allows at most ONE public comment per cycle. This keeps
+    # the agent research-focused and makes accidental burst-commenting impossible.
+    max_comments=1
     scan=discover_and_analyze(limit=int(os.getenv("MOLTBOOK_INTERACTION_FEED_LIMIT","40")),min_relevance=min_relevance)
     posted=0
     outputs=[]
@@ -424,6 +1218,19 @@ def run_cycle(auto_comment: bool = False, max_comments: int = 2, min_relevance: 
                 outputs.append({"post_id":pid,"status":"draft_only","comment":lead.draft_comment})
                 continue
             try:
+                # Duplicate guard: never post the same canned/near-identical
+                # research comment repeatedly across unrelated posts.
+                recent_comments = _recent_outbound_comments(db, limit=30)
+                duplicate_threshold = float(os.getenv("MOLTBOOK_COMMENT_SIMILARITY_THRESHOLD", "0.72"))
+                duplicate = next((c for c in recent_comments
+                                  if _comment_similarity(lead.draft_comment, c) >= duplicate_threshold), None)
+                if duplicate:
+                    lead.status="comment_skipped_duplicate"
+                    lead.reason=(lead.reason+" Duplicate/near-duplicate comment suppressed.").strip()
+                    db.commit()
+                    outputs.append({"post_id":pid,"status":"skipped_duplicate","similarity":round(_comment_similarity(lead.draft_comment, duplicate),4)})
+                    continue
+
                 body=post_comment(pid,lead.draft_comment)
                 posted_obj=body.get("comment",body) if isinstance(body,dict) else {}
                 cid=str(posted_obj.get("id")) if isinstance(posted_obj,dict) and posted_obj.get("id") else None
