@@ -14,14 +14,25 @@ from app.database import SessionLocal
 from app.public_safety import sanitize_public_text
 from app.research_models import MoltbookInteraction, MoltbookInteractionLead
 
-AI_PROVIDER = os.getenv("RESEARCH_AI_PROVIDER", "gemini").strip().lower()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-OPENAI_BASE = os.getenv("RESEARCH_AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-OPENAI_KEY = os.getenv("RESEARCH_AI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("RESEARCH_AI_MODEL", "gpt-5.6-luna")
+# Explicit provider selection. Render's AI_PROVIDER/AI_MODEL now control the
+# provider used by the Moltbook interaction brain.
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower()
+AI_KEY = (
+    os.getenv("OPENROUTER_API_KEY", "") if AI_PROVIDER == "openrouter"
+    else (os.getenv("GEMINI_API_KEY", "") if AI_PROVIDER == "gemini"
+          else (os.getenv("RESEARCH_AI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")))
+)
+AI_MODEL = os.getenv("AI_MODEL", "").strip() or (
+    os.getenv("GEMINI_MODEL", "") if AI_PROVIDER == "gemini"
+    else (os.getenv("OPENROUTER_MODEL", "openrouter/free") if AI_PROVIDER == "openrouter"
+          else (os.getenv("RESEARCH_AI_MODEL", "gpt-5.6-luna") or os.getenv("OPENAI_MODEL", "gpt-5.6-luna")))
+)
+AI_BASE = os.getenv("RESEARCH_AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+if AI_PROVIDER == "openrouter":
+    AI_BASE = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+elif AI_PROVIDER == "gemini":
+    AI_BASE = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
 AI_TIMEOUT = float(os.getenv("RESEARCH_AI_TIMEOUT_SECONDS", "45"))
-
 
 TOPICS = tuple(x.strip().lower() for x in os.getenv(
     "MOLTBOOK_INTERACTION_TOPICS",
@@ -124,97 +135,9 @@ def _self_name() -> str:
     return str(a.get("name") or a.get("username") or "")
 
 
-def _extract_gemini_text(data: dict[str, Any]) -> str:
-    chunks: list[str] = []
-    for candidate in data.get("candidates", []) or []:
-        content = candidate.get("content", {}) if isinstance(candidate, dict) else {}
-        for part in content.get("parts", []) or []:
-            if isinstance(part, dict) and part.get("text"):
-                chunks.append(str(part["text"]))
-    return "\n".join(chunks).strip()
-
-
-def _parse_ai_json(text: str) -> dict[str, Any]:
-    m = re.search(r"\{.*\}", text or "", re.S)
-    if not m:
-        return {}
-    try:
-        value = json.loads(m.group(0))
-        return value if isinstance(value, dict) else {}
-    except json.JSONDecodeError:
-        return {}
-
-
-def _ai_json_gemini(payload: dict[str, Any], system: str) -> dict[str, Any]:
-    if not GEMINI_API_KEY:
-        return {}
-    body = json.dumps({
-        "systemInstruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": json.dumps(payload, ensure_ascii=False)}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "relevance_score": {"type": "NUMBER"},
-                    "novelty_score": {"type": "NUMBER"},
-                    "research_value_score": {"type": "NUMBER"},
-                    "classification": {"type": "STRING"},
-                    "decision": {"type": "STRING", "enum": ["comment", "ignore"]},
-                    "reason": {"type": "STRING"},
-                    "comment": {"type": "STRING"},
-                },
-                "required": ["relevance_score", "novelty_score", "research_value_score", "classification", "decision", "reason", "comment"],
-            },
-            "maxOutputTokens": int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "700")),
-        },
-    }).encode("utf-8")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=AI_TIMEOUT) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-    except (urllib.error.HTTPError, urllib.error.URLError) as e:
-        detail = ""
-        if isinstance(e, urllib.error.HTTPError):
-            try:
-                detail = e.read().decode("utf-8", "replace")[:1000]
-            except Exception:
-                detail = ""
-        raise RuntimeError(f"Gemini AI interaction request failed: {e}; {detail}") from e
-    return _parse_ai_json(_extract_gemini_text(data))
-
-
-def _ai_json_openai(payload: dict[str, Any], system: str) -> dict[str, Any]:
-    if not OPENAI_KEY:
-        return {}
-    body = json.dumps({
-        "model": OPENAI_MODEL,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": system}]},
-            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]},
-        ],
-        "max_output_tokens": int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "700")),
-    }).encode("utf-8")
-    request = urllib.request.Request(f"{OPENAI_BASE}/responses", data=body,
-        headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=AI_TIMEOUT) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-    except (urllib.error.HTTPError, urllib.error.URLError) as e:
-        raise RuntimeError(f"OpenAI AI interaction request failed: {e}") from e
-    text = data.get("output_text") or ""
-    if not text:
-        chunks=[]
-        for item in data.get("output", []) or []:
-            for c in item.get("content", []) or []:
-                if isinstance(c, dict) and c.get("text"):
-                    chunks.append(str(c["text"]))
-        text="\n".join(chunks)
-    return _parse_ai_json(text)
-
-
 def _ai_json(payload: dict[str, Any]) -> dict[str, Any]:
+    if not AI_KEY:
+        return {}
     system = """You are the research interaction brain for an AI trading research agent on Moltbook.
 Be skeptical, concise, and evidence-driven. Decide whether a public comment adds research value.
 Do not flatter, spam, promote, give trading signals, or invent evidence. Do not reveal proprietary EA
@@ -223,11 +146,74 @@ Prefer one precise question, falsifiable challenge, replication idea, or evidenc
 If the post is not substantively related to trading/backtesting/quantitative/AI research, ignore it.
 Return JSON only with: relevance_score, novelty_score, research_value_score, classification,
 decision (comment|ignore), reason, comment. Keep comment <= 500 characters and self-contained."""
-    if AI_PROVIDER == "gemini":
-        return _ai_json_gemini(payload, system)
-    if AI_PROVIDER == "openai":
-        return _ai_json_openai(payload, system)
-    raise RuntimeError(f"Unsupported RESEARCH_AI_PROVIDER: {AI_PROVIDER}")
+    user_text = json.dumps(payload, ensure_ascii=False)
+    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "700"))
+
+    if AI_PROVIDER == "openrouter":
+        body = json.dumps({
+            "model": AI_MODEL or "openrouter/free",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_text},
+            ],
+            "max_tokens": max_tokens,
+        }).encode("utf-8")
+        endpoint = f"{AI_BASE}/chat/completions"
+        request_headers = {
+            "Authorization": f"Bearer {AI_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://ai-trading-bot-research-society-1.onrender.com"),
+            "X-Title": os.getenv("OPENROUTER_APP_NAME", "AI Trading Bot Research Society"),
+        }
+    else:
+        body = json.dumps({
+            "model": AI_MODEL,
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": system}]},
+                {"role": "user", "content": [{"type": "input_text", "text": user_text}]},
+            ],
+            "max_output_tokens": max_tokens,
+        }).encode("utf-8")
+        endpoint = f"{AI_BASE}/responses"
+        request_headers = {
+            "Authorization": f"Bearer {AI_KEY}",
+            "Content-Type": "application/json",
+        }
+
+    request = urllib.request.Request(endpoint, data=body, headers=request_headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=AI_TIMEOUT) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        raise RuntimeError(f"{AI_PROVIDER.upper()} AI interaction request failed: {e}") from e
+
+    if AI_PROVIDER == "openrouter":
+        choices = data.get("choices") or []
+        text = ""
+        if choices and isinstance(choices[0], dict):
+            message = choices[0].get("message") or {}
+            content = message.get("content", "")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
+    else:
+        text = data.get("output_text") or ""
+        if not text:
+            chunks=[]
+            for item in data.get("output", []) or []:
+                for c in item.get("content", []) or []:
+                    if isinstance(c, dict) and c.get("text"):
+                        chunks.append(str(c["text"]))
+            text="\n".join(chunks)
+
+    m=re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return {}
 
 
 def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, Any]:
@@ -250,7 +236,7 @@ def analyze_post(post: dict[str, Any], recent_texts: list[str]) -> dict[str, Any
     content=_post_text(post)
     novelty=_novelty(f"{title}\n{content}", recent_texts)
     heuristic=_heuristic_decision(title, content, novelty)
-    if GEMINI_API_KEY:
+    if AI_KEY:
         ai=_ai_json({"post": {"id": _post_id(post), "author": _author_name(post), "title": title, "content": content[:12000]},
                      "heuristic": heuristic, "topics": TOPICS})
         if ai:
