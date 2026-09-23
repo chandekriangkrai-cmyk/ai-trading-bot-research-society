@@ -36,7 +36,7 @@ AI_TIMEOUT = float(os.getenv("RESEARCH_AI_TIMEOUT_SECONDS", "45"))
 
 TOPICS = tuple(x.strip().lower() for x in os.getenv(
     "MOLTBOOK_INTERACTION_TOPICS",
-    "trading,backtest,backtesting,forex,quant,quantitative,research,ea,expert advisor,risk,robustness,walk-forward,out-of-sample,replication"
+    "trading,backtest,backtesting,forex,quant,quantitative,research,ai,agent,agents,benchmark,benchmarking,evaluation,experiment,methodology,reproducibility,replication,simulation,evidence,dataset,model,inference,verification,robustness,walk-forward,out-of-sample,risk,drawdown,spread,ea,expert advisor"
 ).split(",") if x.strip())
 
 
@@ -150,7 +150,11 @@ Be skeptical, concise, and evidence-driven. Decide whether a public comment adds
 Do not flatter, spam, promote, give trading signals, or invent evidence. Do not reveal proprietary EA
 source code, exact indicators, thresholds, parameters, entry/exit rules, secrets, credentials, or private data.
 Prefer one precise question, falsifiable challenge, replication idea, or evidence comparison.
-If the post is not substantively related to trading/backtesting/quantitative/AI research, ignore it.
+A post may be relevant even when it is not directly about trading: research methodology, AI/agent evaluation,
+benchmark design, simulation validity, reproducibility, evidence quality, statistical inference, or experimental
+design can provide transferable research methods for an AI trading research society. Prefer posts with a concrete
+claim, measurement, benchmark, experiment, limitation, or falsifiable question. Ignore purely social, promotional,
+poetic, political, or generic opinion posts.
 Return ONLY a JSON array. One object per input post, preserving the exact post_id.
 Each object must contain: post_id, relevance_score, novelty_score, research_value_score,
 classification, decision (comment|ignore), reason, comment.
@@ -251,9 +255,17 @@ Scores must be numbers from 0 to 1. Keep comment <= 500 characters and self-cont
 def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, Any]:
     relevance = _keyword_relevance(title, content)
     text = content.lower()
-    value_terms=("evidence", "sample", "backtest", "out-of-sample", "oos", "replicate", "robust", "drawdown", "spread", "walk-forward", "hypothesis")
+    value_terms=(
+        "evidence", "sample", "backtest", "out-of-sample", "oos", "replicate", "replication",
+        "reproducib", "robust", "benchmark", "evaluation", "experiment", "methodology",
+        "simulation", "dataset", "hypothesis", "statistical", "measurement", "verification",
+        "drawdown", "spread", "walk-forward"
+    )
     value = min(1.0, sum(1 for x in value_terms if x in text) / 5)
-    decision = relevance >= 0.5 and novelty >= 0.45 and value >= 0.4
+    # Candidate screening is intentionally permissive; the LLM remains the final
+    # semantic judge. This prevents useful research-method posts from being
+    # discarded before the AI sees them.
+    decision = relevance >= 0.30 and novelty >= 0.30 and value >= 0.30
     comment = None
     if decision:
         comment = ("Interesting result. What is the sample size and does the effect survive a chronological "
@@ -345,7 +357,7 @@ def persist_lead(post: dict[str, Any], analysis: dict[str, Any], status: str = "
     finally: db.close()
 
 
-def discover_and_analyze(limit: int = 40, min_relevance: float = 0.80) -> dict[str, Any]:
+def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[str, Any]:
     source, cards, meta=discover_feed(limit=limit)
     me=_self_name()
     recent_texts=[]
@@ -407,7 +419,7 @@ def post_comment(post_id: str, content: str, parent_id: str | None = None) -> di
     return body if isinstance(body,dict) else {"raw":body}
 
 
-def run_cycle(auto_comment: bool = False, max_comments: int = 2, min_relevance: float = 0.80) -> dict[str, Any]:
+def run_cycle(auto_comment: bool = False, max_comments: int = 2, min_relevance: float = 0.30) -> dict[str, Any]:
     scan=discover_and_analyze(limit=int(os.getenv("MOLTBOOK_INTERACTION_FEED_LIMIT","40")),min_relevance=min_relevance)
     posted=0
     outputs=[]
