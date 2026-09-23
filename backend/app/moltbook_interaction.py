@@ -266,13 +266,69 @@ def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, A
     # semantic judge. This prevents useful research-method posts from being
     # discarded before the AI sees them.
     decision = relevance >= 0.30 and novelty >= 0.30 and value >= 0.30
-    comment = None
-    if decision:
-        comment = ("Interesting result. What is the sample size and does the effect survive a chronological "
-                   "holdout or independent replication? I would separate the observed association from any causal explanation.")
+    comment = _contextual_research_comment(title, content) if decision else None
     return {"relevance_score": relevance, "novelty_score": novelty, "research_value_score": value,
             "classification": "research_question" if decision else "other",
-            "decision": "comment" if decision else "ignore", "reason": "Heuristic research relevance gate", "comment": comment}
+            "decision": "comment" if decision else "ignore",
+            "reason": "Heuristic research relevance gate", "comment": comment}
+
+
+def _contextual_research_comment(title: str, content: str) -> str:
+    """Create a deterministic, post-specific research comment without an LLM.
+
+    This is deliberately conservative: it asks one evidence-oriented question
+    tied to signals actually present in the post. It exists so the agent remains
+    useful while Gemini/OpenAI credentials are unavailable, without repeating a
+    single canned sentence across unrelated posts.
+    """
+    text = f"{title} {content}".lower()
+
+    if any(k in text for k in ("sample size", "sample", "n=", "statistical", "significant", "p-value", "confidence interval")):
+        return ("What sample size and uncertainty measure support the reported effect, "
+                "and does it remain material when the confidence interval or multiple-testing risk is considered?")
+
+    if any(k in text for k in ("benchmark", "baseline", "buy-and-hold", "comparison", "compare", "control")):
+        return ("What baseline and evaluation period are you using for the comparison, "
+                "and are the same data, costs, and success criteria applied to both methods?")
+
+    if any(k in text for k in ("replication", "reproduce", "reproducib", "independent", "holdout", "out-of-sample", "walk-forward")):
+        return ("Can the result be reproduced on an untouched chronological holdout, "
+                "and were the evaluation rules fixed before that data was examined?")
+
+    if any(k in text for k in ("agent", "llm", "model", "ai", "evaluation", "eval", "validation")):
+        return ("What predefined evaluation criteria distinguish a real improvement from a change in behavior, "
+                "and were those criteria tested on cases the system had not seen during development?")
+
+    if any(k in text for k in ("dataset", "data leakage", "leakage", "selection bias", "bias", "dataset")):
+        return ("How did you check for selection or data leakage, and does the finding persist on a separately sourced or time-separated dataset?")
+
+    if any(k in text for k in ("trading", "backtest", "backtesting", "forex", "ea", "expert advisor", "strategy", "return", "profit", "drawdown")):
+        return ("What out-of-sample period and transaction-cost assumptions were fixed before evaluating this result, "
+                "and does the conclusion survive those assumptions?")
+
+    if any(k in text for k in ("risk", "drawdown", "volatility", "sharpe", "loss", "tail")):
+        return ("Which risk measure is decisive for the claim, and does the result remain consistent across different market or stress periods rather than only the aggregate sample?")
+
+    if any(k in text for k in ("method", "methodology", "experiment", "hypothesis", "threshold", "acceptance", "criterion", "evidence")):
+        return ("What acceptance criterion was fixed before observing the outcome, and what result would have counted as a failure of the hypothesis?")
+
+    return ("What concrete measurement would falsify the main claim, and has that test been run on data or cases kept separate from the evidence used to develop it?")
+
+
+def _comment_similarity(a: str, b: str) -> float:
+    aw = set(re.findall(r"[a-z0-9]{3,}", (a or "").lower()))
+    bw = set(re.findall(r"[a-z0-9]{3,}", (b or "").lower()))
+    if not aw or not bw:
+        return 0.0
+    return len(aw & bw) / max(1, len(aw | bw))
+
+
+def _recent_outbound_comments(db, limit: int = 30) -> list[str]:
+    rows = (db.query(MoltbookInteraction.content)
+            .filter(MoltbookInteraction.direction == "outbound")
+            .order_by(MoltbookInteraction.created_at.desc())
+            .limit(limit).all())
+    return [str(row[0]) for row in rows if row and row[0]]
 
 
 def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dict[str, Any]:
@@ -436,6 +492,19 @@ def run_cycle(auto_comment: bool = False, max_comments: int = 2, min_relevance: 
                 outputs.append({"post_id":pid,"status":"draft_only","comment":lead.draft_comment})
                 continue
             try:
+                # Duplicate guard: never post the same canned/near-identical
+                # research comment repeatedly across unrelated posts.
+                recent_comments = _recent_outbound_comments(db, limit=30)
+                duplicate_threshold = float(os.getenv("MOLTBOOK_COMMENT_SIMILARITY_THRESHOLD", "0.72"))
+                duplicate = next((c for c in recent_comments
+                                  if _comment_similarity(lead.draft_comment, c) >= duplicate_threshold), None)
+                if duplicate:
+                    lead.status="comment_skipped_duplicate"
+                    lead.reason=(lead.reason+" Duplicate/near-duplicate comment suppressed.").strip()
+                    db.commit()
+                    outputs.append({"post_id":pid,"status":"skipped_duplicate","similarity":round(_comment_similarity(lead.draft_comment, duplicate),4)})
+                    continue
+
                 body=post_comment(pid,lead.draft_comment)
                 posted_obj=body.get("comment",body) if isinstance(body,dict) else {}
                 cid=str(posted_obj.get("id")) if isinstance(posted_obj,dict) and posted_obj.get("id") else None
