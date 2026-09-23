@@ -22,7 +22,7 @@ async def scan(limit: int = Query(20, ge=1, le=100), min_relevance: float = Quer
 
 
 @router.post("/cycle")
-async def cycle(auto_comment: bool | None = None, max_comments: int = Query(2, ge=0, le=10), min_relevance: float = Query(0.30, ge=0, le=1)):
+async def cycle(auto_comment: bool | None = None, max_comments: int = Query(1, ge=0, le=1), min_relevance: float = Query(0.30, ge=0, le=1)):
     enabled = _auto_enabled() if auto_comment is None else auto_comment
     try:
         return await __import__("asyncio").to_thread(run_cycle, enabled, max_comments, min_relevance)
