@@ -83,3 +83,17 @@ async def publish_lead(lead_id: str):
         db.commit()
         return {"status":"posted","lead_id":lead_id,"post_id":post_id,"comment_id":cid,"response":body}
     finally: db.close()
+
+
+@router.get("/diagnostics")
+def diagnostics():
+    from app.moltbook_interaction import AI_PROVIDER, AI_MODEL, AI_KEY, AI_BASE
+    return {
+        "ai_provider": AI_PROVIDER,
+        "ai_model": AI_MODEL,
+        "ai_base": AI_BASE,
+        "ai_key_configured": bool(AI_KEY),
+        "batch_size": int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "10")),
+        "min_relevance": float(os.getenv("MOLTBOOK_INTERACTION_MIN_RELEVANCE", "0.30")),
+        "max_output_tokens": int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "5000")),
+    }
