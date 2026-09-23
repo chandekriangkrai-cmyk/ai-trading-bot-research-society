@@ -250,7 +250,7 @@ def analyze_post(post: dict[str, Any], recent_texts: list[str]) -> dict[str, Any
     content=_post_text(post)
     novelty=_novelty(f"{title}\n{content}", recent_texts)
     heuristic=_heuristic_decision(title, content, novelty)
-    if AI_KEY:
+    if GEMINI_API_KEY:
         ai=_ai_json({"post": {"id": _post_id(post), "author": _author_name(post), "title": title, "content": content[:12000]},
                      "heuristic": heuristic, "topics": TOPICS})
         if ai:
