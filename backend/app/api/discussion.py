@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from app.database import SessionLocal
 from app.research_models import Experiment, MoltbookPostLink, ResearchDiscussion
-from app.api.moltbook import BASE, TIMEOUT, req
+from app.api.moltbook import BASE, TIMEOUT, req, _solve_challenge
 from app.research_discussion import generate_reply
 from app.public_safety import sanitize_public_text, sanitize_public_payload
 
@@ -112,6 +112,115 @@ async def post_manual_reply(post_id: str, payload: dict[str, Any]):
         "parent_id": str(parent_id) if parent_id else None,
         "comment": posted,
     })
+
+
+@router.post("/post/{post_id}/reply-auto-verify")
+async def post_reply_auto_verify(post_id: str, payload: dict[str, Any]):
+    """Post a Moltbook comment and immediately solve/submit its verification challenge.
+
+    The verification secret is kept server-side and is never returned in the API
+    response. If Moltbook does not return a fresh challenge (for example because
+    it deduplicated an identical comment), the response reports that condition
+    instead of attempting a blind verification.
+    """
+    content = str(payload.get("content") or "").strip()
+    parent_id = payload.get("parent_id")
+    if not content:
+        raise HTTPException(400, "Provide content")
+    if len(content) > 10000:
+        raise HTTPException(400, "Reply is too long")
+
+    safe_content = sanitize_public_text(content)
+    body = {"content": safe_content}
+    if parent_id:
+        body["parent_id"] = str(parent_id)
+
+    status, response = await asyncio.to_thread(
+        req, "POST", f"{BASE}/posts/{post_id}/comments", _headers(), body
+    )
+    if status >= 400:
+        raise HTTPException(502, {
+            "message": "Moltbook reply failed",
+            "status_code": status,
+            "response": response,
+        })
+
+    posted = response.get("comment", response) if isinstance(response, dict) else response
+    if not isinstance(posted, dict):
+        return {"status": "posted_pending_verification", "post_id": post_id, "comment": posted, "verification": {"attempted": False, "verified": False, "reason": "Unexpected Moltbook response shape"}}
+
+    comment_id = posted.get("id")
+    verification = posted.get("verification") if isinstance(posted.get("verification"), dict) else None
+    if not verification:
+        return sanitize_public_payload({
+            "status": "posted_pending_verification",
+            "post_id": post_id,
+            "comment": posted,
+            "verification": {
+                "attempted": False,
+                "verified": False,
+                "reason": "No fresh verification challenge returned (possibly an existing/deduplicated comment).",
+            },
+        })
+
+    challenge = verification.get("challenge_text") or verification.get("challenge")
+    code = verification.get("verification_code") or verification.get("code")
+    if not comment_id or not challenge or not code:
+        return sanitize_public_payload({
+            "status": "posted_pending_verification",
+            "post_id": post_id,
+            "comment": posted,
+            "verification": {
+                "attempted": False,
+                "verified": False,
+                "reason": "Fresh verification data is incomplete.",
+                "challenge_text": challenge,
+            },
+        })
+
+    try:
+        answer, parsed = _solve_challenge(str(challenge))
+    except Exception as exc:
+        return sanitize_public_payload({
+            "status": "posted_pending_verification",
+            "post_id": post_id,
+            "comment_id": str(comment_id),
+            "comment": posted,
+            "verification": {
+                "attempted": False,
+                "verified": False,
+                "reason": f"Challenge solver could not safely parse the challenge: {exc}",
+                "challenge_text": challenge,
+            },
+        })
+
+    verify_body = {"answer": answer, "verification_code": str(code)}
+    verify_status, verify_response = await asyncio.to_thread(
+        req,
+        "POST",
+        f"{BASE}/verify",
+        {"Authorization": f"Bearer {_key()}", "Content-Type": "application/json"},
+        verify_body,
+    )
+
+    verified = verify_status < 400 and isinstance(verify_response, dict) and verify_response.get("success") is True
+    result = {
+        "status": "verified" if verified else "posted_pending_verification",
+        "post_id": post_id,
+        "comment_id": str(comment_id),
+        "comment": posted,
+        "verification": {
+            "attempted": True,
+            "verified": verified,
+            "answer": answer,
+            "parsed": parsed,
+            "status_code": verify_status,
+            "challenge_text": challenge,
+            "response": verify_response,
+        },
+    }
+    # Never expose verification_code, even if the upstream response includes it.
+    return sanitize_public_payload(result)
 
 
 @router.post("/comment/{comment_id}/verify")

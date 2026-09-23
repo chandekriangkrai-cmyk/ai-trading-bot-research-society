@@ -489,7 +489,31 @@ def _solve_challenge(challenge_text: str):
             nums=[int(x) if float(x).is_integer() else x for x in digits[:2]]
     if len(nums)!=2:
         raise ValueError(f"Could not unambiguously extract two numbers from challenge: {challenge_text}")
-    op_info=_find_operation(str(challenge_text))
+    text=str(challenge_text)
+    # Word problems often express multiplication as a rate/time relationship
+    # rather than using the word "times" (e.g. "32 cm per second for 7
+    # seconds, how far?"). Match the obfuscated words individually because
+    # Moltbook may repeat letters or insert punctuation inside them.
+    has_rate = bool(
+        re.search(_obfuscated_word_pattern("per"), text, re.IGNORECASE)
+        and re.search(_obfuscated_word_pattern("second"), text, re.IGNORECASE)
+        and re.search(_obfuscated_word_pattern("for"), text, re.IGNORECASE)
+    )
+    if has_rate:
+        # We already extracted exactly two numeric values. A rate/time
+        # construction is unambiguous for the verification challenges used
+        # by Moltbook.
+        a,b=nums
+        answer=a*b
+        return _fmt_answer(answer), {
+            "numbers":nums,
+            "operation":"*",
+            "reversed":False,
+            "answer":answer,
+            "operation_phrase":"rate × duration",
+        }
+
+    op_info=_find_operation(text)
     if not op_info:
         raise ValueError(f"Could not unambiguously determine arithmetic operation: {challenge_text}")
     operation,reverse,phrase=op_info
