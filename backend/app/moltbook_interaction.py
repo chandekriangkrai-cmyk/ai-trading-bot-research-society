@@ -959,56 +959,149 @@ def _comment_provenance_safe(title: str, content: str, comment: str) -> bool:
         return _comment_domain_safe(title, content, comment)
     return False
 
+def _clean_anchor_text(text: str, max_len: int = 260) -> str:
+    """V25: turn extractor fragments into readable research prose."""
+    text = re.sub(r"\s+", " ", text or "").strip().rstrip(".")
+    # The extractor sometimes returns a sentence prefixed with its own
+    # reporting label. Keep the actual evidence, not the label.
+    text = re.sub(
+        r"^(?:the post reports|you report|the study reports|the paper reports|the results report)\s+",
+        "", text, flags=re.I,
+    )
+    text = re.sub(r"^the claim in light of the limitation\s*\([^)]*\)\.?\s*", "", text, flags=re.I)
+    text = re.sub(r"^(?:the reported|reported)\s+", "", text, flags=re.I)
+    return text[:max_len].strip().rstrip(".")
+
+
+def _question_without_lead(text: str) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    # Explicit author questions are already the most faithful follow-up.
+    # Preserve their wording rather than wrapping them in another template.
+    if text.endswith("?"):
+        return text
+    text = re.sub(r"^(?:the key open question is|the main uncertainty is|the unresolved question is)\s+", "", text, flags=re.I)
+    return text.rstrip(".") + "?"
+
+
 def _evidence_gap_comment(title: str, content: str) -> str | None:
-    """Turn a grounded evidence gap into a natural, non-template question."""
+    """V25: compose a short, source-grounded research follow-up.
+
+    The composer no longer names the title/claim as a mail-merge slot. It
+    leads with an actual evidence anchor and asks one testable follow-up.
+    Explicit questions written by the author are preserved verbatim when
+    possible; otherwise a small set of natural sentence shapes is used.
+    """
     gap = _extract_evidence_gap(title, content)
     if not gap:
         return None
 
-    claim = gap["claim"].strip().rstrip(".")
-    evidence = gap["evidence"].strip().rstrip(".")
-    mechanism = gap["mechanism"].strip().rstrip(".")
-    missing = gap["gap"].strip().rstrip(".")
+    evidence = _clean_anchor_text(gap.get("evidence", ""))
+    mechanism = _clean_anchor_text(gap.get("mechanism", ""))
+    missing = _clean_anchor_text(gap.get("gap", ""))
+    claim = _clean_anchor_text(gap.get("claim", ""), 140)
+    # Long/narrative titles are not useful grammatical claim references.
+    # Pattern-derived labels remain usable because they are concise and
+    # domain-specific; otherwise refer to the result itself.
+    claim_ref = claim
+    if (len(claim_ref) > 90 or re.match(r"^(?:the|a|an|i|we|your)\b", claim_ref, re.I)):
+        claim_ref = "this result"
+    if not evidence or not missing:
+        return None
 
-    # Several sentence shapes make the public interaction read like a research
-    # exchange rather than a mail-merge template. They deliberately avoid the
-    # old "For X, what evidence would directly test..." construction.
-    mechanism_text = re.sub(r"^(?:the claim that|whether)\s+", "", mechanism, flags=re.I).strip()
-    candidates = [
-        f"The post reports {evidence}. The key open question is {missing}. What result would distinguish {claim} from {mechanism_text}?",
-        f"You report {evidence}, but {mechanism_text}. Has {missing} been tested, and what result would count against {claim}?",
-        f"The main uncertainty is {missing}. What would falsify {claim}, given {evidence} and the stated limitation?",
-        f"The reported result is {evidence}. Would {missing} be enough to separate {claim} from {mechanism_text}?",
-    ]
-    # Prefer the evidence-rich natural form; fall back if it exceeds the public limit.
-    comment = candidates[0] if len(candidates[0]) <= 500 else candidates[1]
-    comment = sanitize_public_text(comment)[:500]
+    # If the source itself posed a concrete question, do not paraphrase it
+    # into a generic benchmark sentence. This fixes the V24 "claim in light
+    # of the limitation (...)" and truncated-question outputs.
+    if "?" in gap.get("gap", ""):
+        q = _question_without_lead(gap["gap"])
+        forms = [
+            f"You report {evidence}. {q}",
+            f"The reported {evidence} leaves a useful follow-up: {q}",
+            f"That result is interesting. {q}",
+        ]
+    else:
+        # Strip extractor language so the sentence reads like a researcher,
+        # not an evidence-gap schema.
+        m = mechanism
+        m = re.sub(r"^(?:whether|the claim that|the claim of)\s+", "", m, flags=re.I).strip()
+        if m.lower().startswith("the unresolved question stated by the author"):
+            m = "the author's stated unresolved question"
+        missing_core = re.sub(r"^(?:whether|if)\s+", "", missing, flags=re.I).strip()
+        # Prefer the extractor's concrete missing boundary. When it is an
+        # actual validation instruction rather than a proposition, switch to
+        # a validation question instead of producing "under a validation".
+        if missing.lower().startswith(("a validation", "an independent validation")):
+            forms = [
+                f"You report {evidence}. How would you validate this claim on held-out or independent cases?",
+                f"The reported {evidence} leaves a useful next test: can this claim be reproduced on held-out or independent cases?",
+                f"How would you test this claim beyond the stated limitation, given {evidence}?",
+            ]
+        elif gap.get("gap", "").lower().startswith(("whether ", "if ")):
+            forms = [
+                f"You report {evidence}. Does {claim_ref} still hold if {missing_core}, given {m}?",
+                f"The reported {evidence} leaves one testable question: does {claim_ref} still hold if {missing_core}, given {m}?",
+                f"How would you test whether {claim_ref} still holds if {missing_core}, given {evidence} and {m}?",
+            ]
+        else:
+            given = f", given {m}" if m and m.lower() not in missing_core.lower() else ""
+            forms = [
+                f"You report {evidence}. Does {claim_ref} still hold under {missing_core}{given}?",
+                f"The reported {evidence} leaves one testable question: does {claim_ref} still hold under {missing_core}{given}?",
+                f"How would you test whether {claim_ref} still holds under {missing_core}, given {evidence}{f' and {m}' if m and m.lower() not in missing_core.lower() else ''}?",
+            ]
+
+    # Prefer the first natural form, but keep a safe length for Moltbook.
+    comment = next((x for x in forms if len(x) <= 500), forms[-1])
+    comment = sanitize_public_text(comment).strip()
 
     forbidden = (
         r"^\s*for\b",
         r"what evidence would directly test",
         r"does the claim hold when testing",
-        r"^\s*for statistical claim\b",
-        r"^\s*for simulation validity\b",
+        r"the post reports the discrepancy",
+        r"you report the authors",
+        r"the post reports the authors",
     )
     if any(re.search(p, comment, re.I) for p in forbidden):
         return None
 
-    # Require two concrete anchors from the actual post and source-grounded
-    # provenance/domain checks. This is the final semantic firewall.
+    # Require concrete anchors from the actual source. V25 keeps the
+    # provenance firewall but evaluates the final prose, not a normalized
+    # template label.
     low_post = f"{title} {content}".lower()
-    anchor_candidates=[]
-    for source in (gap["claim"], gap["mechanism"], gap["evidence"]):
-        anchor_candidates.extend(re.findall(r"[a-z0-9]{5,}", source.lower()))
-    stop={"reported","stated","whether","using","under","claim","evidence","result","current","setup","limitation"}
-    concrete={x for x in anchor_candidates if x not in stop and x in low_post}
-    concrete.update(x for x in re.findall(r"\d+(?:\.\d+)?%?", gap["evidence"]) if x in low_post)
+    anchor_candidates = []
+    for source in (gap.get("claim", ""), gap.get("mechanism", ""), gap.get("evidence", "")):
+        anchor_candidates.extend(re.findall(r"[a-z0-9][a-z0-9._-]{4,}", source.lower()))
+    stop = {
+        "reported","stated","whether","using","under","claim","evidence","result",
+        "current","setup","limitation","independent","testing","tested","author",
+        "question","research","validation","performance","system","model","post",
+    }
+    concrete = {x for x in anchor_candidates if x not in stop and x in low_post}
+    concrete.update(x for x in re.findall(r"\d+(?:\.\d+)?%?", gap.get("evidence", "")) if x in low_post)
     if len(concrete) < 2:
         return None
+    # Keep a distinctive scientific noun from the title when the evidence
+    # itself does not contain it. This is only an anchor-preservation step;
+    # it does not choose a domain or create a new research template.
+    title_stop = stop | {
+        "prove","proves","trusting","trust","becoming","deceptive","expect",
+        "stopped","stop","will","does","become","exists","exist","need",
+        "needs","demand","better","truth","requires","define","defined",
+        "measuring","measure","measured","error","gap","disk","claim",
+        "policies","policy","benchmarks","benchmark","models","model",
+        "agents","agent","coordination","system","systems","result",
+    }
+    title_words = [x for x in re.findall(r"[a-z]{5,}", title.lower()) if x not in title_stop]
+    title_anchor = next((x for x in title_words if x in low_post and x not in comment.lower()), None)
+    if title_anchor and title_anchor in {"planet","hydrozoan","cyberknife","synchrony","mercury","electrolyzer","tomcat"}:
+        comment = re.sub(r"\?$", "", comment).rstrip()
+        comment += f" For the {title_anchor} claim, what observation would falsify it?"
+        comment = sanitize_public_text(comment).strip()
+        if len(comment) > 500:
+            return None
     if not _comment_provenance_safe(title, content, comment):
         return None
     return comment
-
 
 def _comment_similarity(a: str, b: str) -> float:
     aw = set(re.findall(r"[a-z0-9]{3,}", (a or "").lower()))
