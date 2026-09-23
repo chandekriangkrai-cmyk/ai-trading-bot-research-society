@@ -646,6 +646,12 @@ def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
         (r"93\.6%|malicious invocation|hijacked tool|a2m|tool description",
          "MCP tool-description injection", "malicious tool invocation under the stated threat model",
          "93.6% invocation / attack-success measurements", "whether the result persists on held-out tool descriptions and transfer attacks under the same cost and threat-model controls"),
+        (r"tool timeout|permission denials?|completion rate|drops tool failures|every attempted run",
+         "agent benchmark denominator", "completion rate after counting tool failures", "tool timeouts and permission-denial outcomes",
+         "whether the reported completion rate changes when every attempted run, including timeout and permission-denial failures, remains in the denominator"),
+        (r"prediction market|polymarket|odds.*liquidity|liquidity.*odds|order-flow|order flow|sybil risk",
+         "prediction-market price concentration", "whether extreme odds reflect genuine information or liquidity capture", "odds, volume and liquidity measurements",
+         "whether the extreme price persists after controlling for order-flow concentration, counter-liquidity and independent trader activity"),
         (r"tool protocol|serving stack|retries.*benchmark|harness decides",
          "agent benchmark serving-stack effect", "benchmark outcomes under serving-stack confounds",
          "retry, tool-call and serving behavior", "whether the gap remains with a matched serving stack and tool protocol"),
@@ -711,7 +717,7 @@ def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
             cues = ("show", "shows", "found", "result", "experiment", "test", "tested",
                     "measur", "data", "benchmark", "paper", "simulation", "evidence",
                     "guarantee", "claim", "improve", "increase", "decrease", "error",
-                    "accuracy", "performance", "bound", "threshold", "success", "latency", "disturbance")
+                    "accuracy", "performance", "bound", "threshold", "success", "latency", "disturbance", "volume", "liquidity", "odds", "rate")
             if not any(c in low for c in cues):
                 return None
             return {"claim": claim, "mechanism": mechanism, "evidence": evidence, "gap": gap}
@@ -719,6 +725,57 @@ def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
     # V17 HARD GATE: no generic title-token fallback. If no concrete
     # mechanism/evidence/boundary was extracted, ignore the post.
     return None
+
+
+def _domain_fingerprint(title: str, content: str) -> set[str]:
+    """V18: derive coarse research domains from the actual post text."""
+    low = f"{title} {content}".lower()
+    domains = set()
+    groups = {
+        "trading": ("backtest", "backtesting", "trading", "forex", "drawdown", "spread", "eurusd", "xauusd", "strategy tester"),
+        "graph": ("gnn", "graph neural", "community detection", "message passing", "diffusion", "node", "edge reconstruction", "spatial attention"),
+        "agent_benchmark": ("agent benchmark", "benchmark", "tool timeout", "permission denial", "completion rate", "serving stack", "retry", "tool-call"),
+        "agent_security": ("mcp", "authorization", "prompt injection", "hijacked tool", "malicious invocation", "attack success", "threat model", "credential"),
+        "market": ("prediction market", "odds", "liquidity", "order flow", "polymarket", "trader", "wallet", "sybil"),
+        "robotics": ("robot", "robotic", "teleoperation", "hand pose", "trajectory", "manipulation", "sim-to-real", "microrobotic"),
+        "speech": ("diarization", "speaker", "transcription", "speech", "audio", "voice"),
+    }
+    for domain, cues in groups.items():
+        if sum(1 for cue in cues if cue in low) >= 1:
+            domains.add(domain)
+    return domains
+
+
+def _comment_domain_safe(title: str, content: str, comment: str) -> bool:
+    """V18 hard guard: generated comments may not introduce a foreign domain."""
+    post_domains = _domain_fingerprint(title, content)
+    comment_domains = _domain_fingerprint("", comment)
+    if not comment_domains:
+        return True
+    if not post_domains:
+        return False
+    # A comment is safe when every detected domain in it is grounded in the post.
+    return comment_domains.issubset(post_domains)
+
+
+def _comment_provenance_safe(title: str, content: str, comment: str) -> bool:
+    """V18 hard guard: require extracted claim/evidence anchors in the post."""
+    if not comment:
+        return False
+    gap = _extract_evidence_gap(title, content)
+    if not gap:
+        return False
+    low_post = f"{title} {content}".lower()
+    # The extractor's claim must be represented by at least one meaningful
+    # anchor in the original post. This blocks stale/legacy template comments.
+    claim_terms = [x for x in re.findall(r"[a-z0-9]{5,}", gap["claim"].lower().replace("-", " ")) if x not in {"under", "stated", "reported"}]
+    if claim_terms and not any(term in low_post for term in claim_terms):
+        return False
+    # At least one concrete evidence/gap anchor must also occur in the post.
+    gap_terms = re.findall(r"[a-z0-9]{5,}", f"{gap['evidence']} {gap['gap']}".lower())
+    if not any(term in low_post for term in gap_terms):
+        return False
+    return _comment_domain_safe(title, content, comment)
 
 
 def _evidence_gap_comment(title: str, content: str) -> str | None:
@@ -734,7 +791,10 @@ def _evidence_gap_comment(title: str, content: str) -> str | None:
     # extracted claim appears in the final text.
     if not any(tok in comment.lower() for tok in re.findall(r"[a-z0-9_-]{4,}", gap["claim"].lower())):
         return None
-    return sanitize_public_text(comment)[:500]
+    comment = sanitize_public_text(comment)[:500]
+    if not _comment_provenance_safe(title, content, comment):
+        return None
+    return comment
 
 
 def _comment_similarity(a: str, b: str) -> float:
@@ -769,13 +829,13 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
     content = str(result.get("content") or "")
     # V16 is evidence-gap first: AI may score/classify, but it cannot select a
     # generic comment. The deterministic extractor must find a concrete gap.
-    v16_comment = _evidence_gap_comment(title, content)
-    if result.get("decision") == "comment" and not v16_comment:
+    v18_comment = _evidence_gap_comment(title, content)
+    if result.get("decision") == "comment" and not v18_comment:
         result["decision"] = "ignore"
         result["comment"] = None
-        result["reason"] = "Evidence-gap gate: no concrete claim/evidence gap"
+        result["reason"] = "V18 provenance/domain gate: no source-grounded comment"
     elif result.get("decision") == "comment":
-        result["comment"] = v16_comment
+        result["comment"] = v18_comment
     else:
         result["comment"] = None
     return result
@@ -824,13 +884,13 @@ def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) ->
             merged_analysis["title"]=str(p.get("title") or "")
             merged_analysis["content"]=_post_text(p)[:6000]
             # Re-apply deterministic V16 evidence-gap gate after AI merge.
-            v16_comment = _evidence_gap_comment(merged_analysis["title"], merged_analysis["content"])
-            if merged_analysis.get("decision")=="comment" and not v16_comment:
+            v18_comment = _evidence_gap_comment(merged_analysis["title"], merged_analysis["content"])
+            if merged_analysis.get("decision")=="comment" and not v18_comment:
                 merged_analysis["decision"]="ignore"
                 merged_analysis["comment"]=None
-                merged_analysis["reason"]="Evidence-gap gate: no concrete claim/evidence gap"
+                merged_analysis["reason"]="V18 provenance/domain gate: no source-grounded comment"
             elif merged_analysis.get("decision")=="comment":
-                merged_analysis["comment"] = v16_comment
+                merged_analysis["comment"] = v18_comment
             merged.append((p, merged_analysis))
         return merged, bool(ai_map), None
     except Exception as exc:
