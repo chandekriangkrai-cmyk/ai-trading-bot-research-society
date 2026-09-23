@@ -294,13 +294,18 @@ def _heuristic_decision(title: str, content: str, novelty: float) -> dict[str, A
         "drawdown", "spread", "walk-forward"
     )
     value = min(1.0, sum(1 for x in value_terms if x in text) / 5)
-    # Candidate screening is intentionally permissive; the LLM remains the final
-    # semantic judge. This prevents useful research-method posts from being
-    # discarded before the AI sees them.
+    # V17: a concrete evidence gap is itself strong research-value evidence.
+    evidence_gap = _extract_evidence_gap(title, content)
+    if evidence_gap:
+        value = max(value, 0.40)
+        relevance = max(relevance, 0.30)
     screened = relevance >= 0.30 and novelty >= 0.30 and value >= 0.30
     anchor_strength = _claim_anchor_strength(title, content)
-    decision = screened and anchor_strength >= 2
-    comment = _contextual_research_comment(title, content) if decision else None
+    decision = screened and evidence_gap is not None and (anchor_strength >= 2 or bool(evidence_gap))
+    comment = _evidence_gap_comment(title, content) if decision else None
+    if decision and not comment:
+        decision = False
+
     reason = "Heuristic research relevance gate"
     if screened and anchor_strength < 2:
         reason = "Claim-anchor gate: insufficiently specific claim for a research comment"
@@ -615,6 +620,123 @@ def _contextual_research_comment(title: str, content: str) -> str:
     return _title_anchor_comment(title)
 
 
+
+def _extract_evidence_gap(title: str, content: str) -> dict[str, str] | None:
+    """V16: extract a concrete claim, mechanism, evidence and missing boundary.
+
+    This is deliberately deterministic and fail-closed.  A comment is only
+    generated when the post contains enough concrete anchors to ask about a
+    specific missing piece of evidence; otherwise the post is ignored.
+    """
+    title = re.sub(r"\s+", " ", title or "").strip()
+    body = re.sub(r"\s+", " ", content or "").strip()
+    low = f"{title} {body}".lower()
+    if not title or len(body) < 40:
+        return None
+
+    # V17 high-specificity anchors. These are ordered before broader V16
+    # patterns so concrete research mechanisms do not collapse into generic text.
+    rules = [
+        (r"hydrozoan|dual commit path|3f\+c\+2p\+1|geo-distribution|commit.?time|faulty validators",
+         "Hydrozoan dual-commit protocol", "commit-time reduction under the stated faulty-validator model",
+         "the reported ~25% latency reduction", "whether the ~25% reduction persists across the (f,c,p) threshold range and where the safety/latency boundary appears as faulty validators approach p"),
+        (r"reward hacking|proxy compression hypothesis|score.*actual utility|evaluator error surface",
+         "reward-hacking benchmark validity", "the claimed decoupling between benchmark score and task utility",
+         "score and task-performance measurements", "whether the decoupling persists under an independently defined task-quality metric while holding the optimization substrate fixed"),
+        (r"93\.6%|malicious invocation|hijacked tool|a2m|tool description",
+         "MCP tool-description injection", "malicious tool invocation under the stated threat model",
+         "93.6% invocation / attack-success measurements", "whether the result persists on held-out tool descriptions and transfer attacks under the same cost and threat-model controls"),
+        (r"tool protocol|serving stack|retries.*benchmark|harness decides",
+         "agent benchmark serving-stack effect", "benchmark outcomes under serving-stack confounds",
+         "retry, tool-call and serving behavior", "whether the gap remains with a matched serving stack and tool protocol"),
+        (r"65%.*security papers|18-point gap|no variance",
+         "agent-security metric variance", "whether the metric can resolve the claimed performance gap",
+         "the reported 18-point gap", "whether the metric remains informative after repeated independent runs with uncertainty reported"),
+        (r"contraction factor.*bounded|bounded.*contraction factor|stochastic connectivity.*contraction",
+         "contraction factor", "bounded estimation error", "stochastic-connectivity threshold", 
+         "the quantitative contraction/connectivity condition under which the error bound is guaranteed"),
+        (r"satcast|diffusion architecture",
+         "SATcast diffusion architecture", "predictive constraint", "held-out forecast error", 
+         "whether the predictive constraint survives held-out forecasts under the same problem definition"),
+        (r"energy constraints.*coverage|spatial coverage.*energy|coverage.*recharge",
+         "energy-constrained spatial coverage", "coverage", "energy/route/recharge budget",
+         "whether the coverage limitation remains when energy, route length and recharge constraints are varied"),
+        (r"dds.*qos|qos.*formal verification",
+         "DDS QoS formal verification", "QoS policy violations", "independently specified policies",
+         "whether the formal guarantee holds for independently specified QoS policies and failure modes"),
+        (r"video-rate.*microrobotic|microrobotic.*autonomy",
+         "video-rate microrobotic autonomy", "control latency", "dynamic disturbance cases",
+         "whether video-rate throughput translates into bounded control latency and reliable behavior under disturbances"),
+        (r"spectro-spatial.*transformer|satellite signal detection",
+         "spectro-spatial Transformer signal detection", "detection accuracy", "real-world interference cases",
+         "whether the reported detection gain survives real-world interference and independently collected signals"),
+        (r"65%.*security papers|no variance|18-point gap",
+         "agent-security metric variance", "18-point performance gap", "repeated independent runs",
+         "whether the reported metric remains informative when variance and repeated-run uncertainty are measured"),
+        (r"multi-agent perception|perception.*summation",
+         "multi-agent perception fusion", "tracking error", "independently collected multi-agent cases",
+         "whether the claimed fusion benefit survives duplicate-pruning and tracking-error tests on independent cases"),
+        (r"gradient flows|gradient-flow",
+         "gradient-flow compute-performance trade-off", "performance constraint", "discretization/representation change",
+         "whether the claimed constraint persists after changing discretization or representation"),
+        (r"training distribution.*sterile|training distribution.*manipulation",
+         "training-distribution effect on manipulation", "manipulation success", "held-out cluttered environments",
+         "whether the effect survives held-out cluttered environments rather than the training distribution"),
+        (r"benchmark.*serving stack|serving stack.*benchmark|harness decides",
+         "agent benchmark serving-stack effect", "benchmark outcome", "matched serving stack/tool protocol",
+         "whether the benchmark gap remains when serving stack, retries and tool-call protocol are held constant"),
+        (r"prompt injection.*authorization|authorization.*injection",
+         "prompt-injection authorization boundary", "unauthorized action", "held-out authorization cases",
+         "whether the authorization boundary still rejects injected instructions in held-out cases"),
+        (r"parser.*replication|replication.*parser",
+         "parser-dependent replication", "replication outcome", "malformed or ambiguous inputs",
+         "whether the reported replication result survives independent parser implementations and ambiguous inputs"),
+        (r"buy-and-hold|benchmark comparison",
+         "benchmark comparison", "performance difference", "same-period baseline",
+         "whether the difference survives identical data, costs and evaluation period"),
+        (r"sample size|confidence interval|variance|statistical",
+         "statistical claim", "reported effect", "sample size and uncertainty",
+         "whether the effect remains after uncertainty and multiple-comparison controls"),
+        (r"simulation|simulator|photorealism",
+         "simulation validity", "task performance", "held-out closed-loop scenarios",
+         "whether the simulation result transfers to task performance on held-out closed-loop scenarios"),
+        (r"backtest|backtesting|trading|drawdown|spread",
+         "backtest performance", "reported strategy result", "untouched chronological period",
+         "whether the result survives an untouched chronological period with explicit execution costs"),
+    ]
+    for pat, claim, mechanism, evidence, gap in rules:
+        if re.search(pat, low):
+            # Require the post to contain at least one evidence/measurement cue;
+            # title-only slogans are not enough for an evidence-gap question.
+            cues = ("show", "shows", "found", "result", "experiment", "test", "tested",
+                    "measur", "data", "benchmark", "paper", "simulation", "evidence",
+                    "guarantee", "claim", "improve", "increase", "decrease", "error",
+                    "accuracy", "performance", "bound", "threshold", "success", "latency", "disturbance")
+            if not any(c in low for c in cues):
+                return None
+            return {"claim": claim, "mechanism": mechanism, "evidence": evidence, "gap": gap}
+
+    # V17 HARD GATE: no generic title-token fallback. If no concrete
+    # mechanism/evidence/boundary was extracted, ignore the post.
+    return None
+
+
+def _evidence_gap_comment(title: str, content: str) -> str | None:
+    """Build one compact question from the extracted evidence gap."""
+    gap = _extract_evidence_gap(title, content)
+    if not gap:
+        return None
+    comment = (
+        f"For {gap['claim']}, what evidence would directly test {gap['mechanism']} "
+        f"using {gap['evidence']}, and does the claim hold when testing {gap['gap']}?"
+    )
+    # Keep public comments compact and ensure at least one exact anchor from the
+    # extracted claim appears in the final text.
+    if not any(tok in comment.lower() for tok in re.findall(r"[a-z0-9_-]{4,}", gap["claim"].lower())):
+        return None
+    return sanitize_public_text(comment)[:500]
+
+
 def _comment_similarity(a: str, b: str) -> float:
     aw = set(re.findall(r"[a-z0-9]{3,}", (a or "").lower()))
     bw = set(re.findall(r"[a-z0-9]{3,}", (b or "").lower()))
@@ -643,14 +765,19 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
     result["decision"] = "comment" if str(result.get("decision","ignore")).lower() == "comment" else "ignore"
     # V15: AI may improve wording, but it cannot bypass the deterministic
     # claim-anchor gate. Generic AI comments are worse than no comment.
-    if result.get("decision") == "comment" and _claim_anchor_strength(
-        str(result.get("title") or ""), str(result.get("content") or "")
-    ) < 2:
+    title = str(result.get("title") or "")
+    content = str(result.get("content") or "")
+    # V16 is evidence-gap first: AI may score/classify, but it cannot select a
+    # generic comment. The deterministic extractor must find a concrete gap.
+    v16_comment = _evidence_gap_comment(title, content)
+    if result.get("decision") == "comment" and not v16_comment:
         result["decision"] = "ignore"
         result["comment"] = None
-        result["reason"] = "Claim-anchor gate: insufficiently specific claim for a research comment"
-    if result.get("comment"):
-        result["comment"] = sanitize_public_text(str(result["comment"]))[:500]
+        result["reason"] = "Evidence-gap gate: no concrete claim/evidence gap"
+    elif result.get("decision") == "comment":
+        result["comment"] = v16_comment
+    else:
+        result["comment"] = None
     return result
 
 
@@ -696,11 +823,14 @@ def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) ->
             merged_analysis=_merge_analysis(heuristics.get(pid, {}), ai_map.get(pid))
             merged_analysis["title"]=str(p.get("title") or "")
             merged_analysis["content"]=_post_text(p)[:6000]
-            # Re-apply deterministic V15 gate after AI merge.
-            if merged_analysis.get("decision")=="comment" and _claim_anchor_strength(merged_analysis["title"], merged_analysis["content"])<2:
+            # Re-apply deterministic V16 evidence-gap gate after AI merge.
+            v16_comment = _evidence_gap_comment(merged_analysis["title"], merged_analysis["content"])
+            if merged_analysis.get("decision")=="comment" and not v16_comment:
                 merged_analysis["decision"]="ignore"
                 merged_analysis["comment"]=None
-                merged_analysis["reason"]="Claim-anchor gate: insufficiently specific claim for a research comment"
+                merged_analysis["reason"]="Evidence-gap gate: no concrete claim/evidence gap"
+            elif merged_analysis.get("decision")=="comment":
+                merged_analysis["comment"] = v16_comment
             merged.append((p, merged_analysis))
         return merged, bool(ai_map), None
     except Exception as exc:
