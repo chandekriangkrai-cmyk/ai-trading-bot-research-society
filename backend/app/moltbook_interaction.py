@@ -289,6 +289,27 @@ def _extract_claim_focus(title: str, content: str) -> tuple[str, str]:
 
     # Highly specific title/thesis signals first.
     specific = [
+        (r"state updates.*single-pass inference|single-pass inference.*state updates",
+         "state updates versus single-pass inference",
+         "diagnostic error reduction from iterative state updates on held-out cases"),
+        (r"satcast diffusion architecture|predictive constraints of the satcast",
+         "SATcast predictive constraints",
+         "prediction error under the architecture's stated constraints on held-out cases"),
+        (r"energy constraints.*spatial coverage|spatial coverage.*energy constraints",
+         "energy-constrained spatial coverage",
+         "coverage achieved under fixed energy, route-length, and recharge constraints"),
+        (r"ai compliance.*hazard chains|compliance.*hazard chains",
+         "AI compliance across hazard chains",
+         "held-out hazard-chain cases spanning the tested compliance boundaries"),
+        (r"dds qos|qos policies",
+         "DDS QoS policy verification",
+         "formal verification outcomes versus trial-and-error tuning failures"),
+        (r"deliberately tiny instance|tiny instance|no-meta-observable-invention",
+         "deliberately tiny instance",
+         "whether the tiny-instance result survives a separately constructed instance without meta-observable leakage"),
+        (r"slms.*replace llms|llms.*replace slms",
+         "SLM versus LLM replacement",
+         "a predefined task-level acceptance criterion under matched cost and capability constraints"),
         (r"quality estimation.*single-step|single-step.*quality estimation",
          "single-step quality estimation",
          "segment-level diagnostic accuracy that the one-step score misses"),
@@ -392,10 +413,78 @@ def _extract_claim_focus(title: str, content: str) -> tuple[str, str]:
     return "the main claim", "an independent test that could falsify it"
 
 
-def _contextual_research_comment(title: str, content: str) -> str:
-    """Generate a deterministic post-specific research question without an LLM."""
+def _title_anchor_tokens(title: str) -> list[str]:
+    """Return meaningful title anchors used as a domain-mismatch guard."""
+    stop={
+        "your","you","will","the","a","an","is","are","was","were","just","not",
+        "from","to","of","for","and","or","in","on","with","without","can","does",
+        "do","i","my","this","that","these","those","when","how","what","why","beyond",
+        "through","primary","rough","single","step","one","new","real","true","still",
+    }
+    raw=re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", title or "")
+    return [x.lower() for x in raw if x.lower() not in stop]
+
+
+def _title_anchor_comment(title: str) -> str:
+    """Fallback that stays anchored to the author's actual title thesis."""
+    t=re.sub(r"\s+", " ", title or "").strip()
+    low=t.lower()
+    # Common thesis forms. Keep the question falsifiable without pretending to
+    # know evidence that is not present in the post.
+    m=re.match(r"(?:i will|we will) (?:stop|start|avoid|demand|use) (.+?)(?:[.!?]|$)", t, re.I)
+    if m:
+        subject=m.group(1).strip()
+        return f"What measurable outcome would show that {subject} changes the claimed failure, and what result would falsify that change?"
+    m=re.match(r"(?:can|does|will) (.+?) (?:fix|replace|solve|invalidate) (.+?)[.!?]*$", t, re.I)
+    if m:
+        a,b=m.group(1).strip(),m.group(2).strip()
+        return f"What controlled test distinguishes {a} from {b}, and what result would show the proposed change does not hold?"
+    m=re.match(r"(.+?) (?:is|are|was|were) (?:not|just) (.+?)[.!?]*$", t, re.I)
+    if m:
+        a,b=m.group(1).strip(),m.group(2).strip()
+        return f"What measurement distinguishes {a} from {b}, and which held-out case would falsify that distinction?"
+    m=re.match(r"(?:evaluating|evaluation of) (.+)$", t, re.I)
+    if m:
+        subject=m.group(1).rstrip(".?!")
+        return f"Which measurable constraint of {subject} is being tested, and what held-out result would count as a failure?"
+    if re.search(r"\b(replace|replacement)\b", low):
+        return f"What acceptance criterion would demonstrate the claimed replacement in '{t}', and what result would count as failure?"
+    if re.search(r"\b(invalidate|invalidates|invalidated)\b", low):
+        return f"Which controlled comparison supports the claim in '{t}', and what result would falsify it?"
+    if re.search(r"\bbenchmark\b", low):
+        return f"What baseline benchmark is being compared in '{t}', and what same-period result would falsify the claimed difference?"
+    if re.search(r"photorealism|photorealistic|simulator|simulation", low):
+        return f"What held-out simulation result would show the photorealism claim in '{t}' matters for task performance rather than appearance alone?"
+    if re.search(r"\b(primary metric|metric)\b", low):
+        return f"How is the metric in '{t}' operationalized, and what competing outcome would show it is insufficient?"
+    clean=t.rstrip(".?!")
+    return f"For '{clean}', what evidence directly tests the central claim, and which independent result would falsify it?"
+
+
+def _comment_matches_title_domain(title: str, comment: str) -> bool:
+    """Reject comments that lose the concrete subject of the title."""
+    tokens=_title_anchor_tokens(title)
+    if not tokens:
+        return True
+    c=(comment or "").lower()
+    # Acronyms/product names are especially strong anchors.
+    strong=[x for x in tokens if len(x) >= 5 or any(ch.isdigit() for ch in x)]
+    if not strong:
+        strong=tokens
+    return any(x in c for x in strong)
+
+
+def _contextual_research_comment_core(title: str, content: str) -> str:
+    """Generate the deterministic research question before the V14 domain guard."""
     focus, evidence = _extract_claim_focus(title, content)
     questions = {
+        "state updates versus single-pass inference": "Which diagnostic failures improve when state updates are added, and does that improvement persist on held-out cases against the single-pass baseline?",
+        "SATcast predictive constraints": "Which predictive constraint is measured for SATcast, and does the claimed improvement persist on held-out forecasts under the same problem definition?",
+        "energy-constrained spatial coverage": "Which energy, route-length, and recharge constraints were fixed, and does the coverage claim persist on held-out scenarios under the same budget?",
+        "AI compliance across hazard chains": "Which held-out hazard-chain cases were fixed before evaluation, and does compliance remain consistent across each tested boundary rather than only the easiest channel?",
+        "DDS QoS policy verification": "Which DDS QoS violations or tuning failures were prevented by formal verification, and does that advantage persist on independently specified policies?",
+        "deliberately tiny instance": "What does the tiny instance isolate, and does the result survive on a separately constructed instance without relying on meta-observable information?",
+        "SLM versus LLM replacement": "Which task-level acceptance criterion was fixed before comparison, and does the SLM meet it under matched cost, latency, and capability constraints?",
         "single-step quality estimation": "Which segment-level metric demonstrates that the proposed decomposition detects failures that the one-step score misses?",
         "Dual-Frontier error attribution": "What evidence shows Dual-Frontier improves error attribution, and which predefined failure cases distinguish it from the baseline?",
         "evidence freshness in a long-running agent": "How was evidence freshness measured over the long-running evaluation, and what degradation threshold was fixed before the results were observed?",
@@ -456,7 +545,23 @@ def _contextual_research_comment(title: str, content: str) -> str:
         return "What acceptance criterion was fixed before observing the outcome, and what result would have counted as a failure?"
     if focus == "agent validation":
         return "For the agent validation claim, which evaluation cases were fixed before development, and what result would count as a failed improvement?"
-    return f"For {focus.lower()}, how was {evidence} used to test the claim, and what independent result would falsify it?"
+    comment = f"For {focus.lower()}, how was {evidence} used to test the claim, and what independent result would falsify it?"
+    if not _comment_matches_title_domain(title, comment):
+        return _title_anchor_comment(title)
+    return comment
+
+
+def _contextual_research_comment(title: str, content: str) -> str:
+    """V14: generate a claim-aware comment and enforce title-domain anchoring."""
+    comment=_contextual_research_comment_core(title, content)
+    if _comment_matches_title_domain(title, comment):
+        return comment
+    low_title=(title or "").lower()
+    low_content=(content or "").lower()
+    if "photorealism" in low_title and "simulation" in low_content:
+        return "What held-out simulation result would show the photorealism claim matters for task performance rather than appearance alone?"
+    return _title_anchor_comment(title)
+
 
 def _comment_similarity(a: str, b: str) -> float:
     aw = set(re.findall(r"[a-z0-9]{3,}", (a or "").lower()))
