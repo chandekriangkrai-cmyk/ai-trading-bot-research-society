@@ -36,5 +36,6 @@ app.include_router(agents.router,prefix="/api")
 app.include_router(unified_research.router,prefix="/api")
 app.include_router(moltbook.router,prefix="/api")
 app.include_router(interactions.router,prefix="/api")
+app.include_router(discussion.router, prefix="/api")
 @app.get("/",tags=["System"])
 def root(): return {"service":settings.app_name,"version":"3.0.0","status":"running","docs":"/docs","research_flow":["upload","run","inspect","publish"]}
