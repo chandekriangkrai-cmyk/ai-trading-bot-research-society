@@ -135,32 +135,44 @@ def _self_name() -> str:
     return str(a.get("name") or a.get("username") or "")
 
 
-def _ai_json_batch(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Call the configured LLM once for a batch and parse its structured result."""
+def _ai_json_batch(items: list[dict[str, Any]], retry: bool = False) -> dict[str, dict[str, Any]]:
+    """Ask the LLM for a compact decision/question payload.
+
+    V28 deliberately minimizes output size.  The model only returns a decision
+    and, when commenting, one short research question.  Heuristic scores and
+    source/domain guards remain local and deterministic.
+    """
     if not AI_KEY or not items:
         return {}
 
     system = """You are the research interaction brain for an AI trading research agent on Moltbook.
-Be skeptical, concise, and evidence-driven. Decide whether a public comment adds research value.
-Do not flatter, spam, promote, give trading signals, or invent evidence. Do not reveal proprietary EA
-source code, exact indicators, thresholds, parameters, entry/exit rules, secrets, credentials, or private data.
-Prefer one precise question, falsifiable challenge, replication idea, or evidence comparison.
-A post may be relevant even when it is not directly about trading: research methodology, AI/agent evaluation,
-benchmark design, simulation validity, reproducibility, evidence quality, statistical inference, or experimental
-design can provide transferable research methods for an AI trading research society. Prefer posts with a concrete
-claim, measurement, benchmark, experiment, limitation, or falsifiable question. Ignore purely social, promotional,
-poetic, political, or generic opinion posts.
-For comments, write the final comment yourself. Make it sound like a researcher replying to this specific author,
-not a template. Do NOT begin with "For ", "You report", "The post", or "How would you validate this claim".
-Mention one concrete anchor from the post and ask one specific research question about replication, boundary
-conditions, measurement validity, controls, or falsification. Never invent facts.
-Return ONLY a JSON object with key "results" whose value is an array. One object per input post, preserving exact post_id.
-Each object must contain: post_id, relevance_score, novelty_score, research_value_score,
-classification, decision (comment|ignore), reason, comment.
-Scores must be numbers from 0 to 1. Keep comment <= 500 characters and self-contained.
+Return JSON ONLY. No markdown, no explanations, no extra keys.
+For every input post return exactly one object with post_id and decision.
+Use decision=\"ignore\" for social/promotional/opinion content or when no concrete research question is justified.
+Use decision=\"comment\" only when one specific, falsifiable research question is grounded in the post.
+For comment, add question: one natural sentence, <= 220 characters.
+The question must mention a concrete anchor from the post and ask about replication, measurement validity,
+controls, boundary conditions, or falsification. Do not invent facts. Do not give trading signals.
+Never begin the question with: For, You report, The post, or How would you validate this claim.
+Do not expose proprietary EA source code, exact indicators, thresholds, parameters, entry/exit rules, secrets,
+credentials, or private data.
+Output shape: {\"results\":[{\"post_id\":\"...\",\"decision\":\"ignore\"|\"comment\",\"question\":\"...\"}]}
+For ignore, omit question.
 """
-    user_text = json.dumps({"posts": items, "topics": TOPICS}, ensure_ascii=False)
-    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "5000"))
+    # Keep the input bounded as well; the model has enough context to anchor a
+    # question without reproducing entire long Moltbook posts.
+    user_items = []
+    for x in items:
+        user_items.append({
+            "post_id": x.get("post_id"),
+            "title": str(x.get("title") or "")[:500],
+            "content": str(x.get("content") or "")[:3000],
+        })
+    user_text = json.dumps({"posts": user_items}, ensure_ascii=False)
+    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "900"))
+    if retry:
+        max_tokens = min(max_tokens, 600)
+        system += "\nBe extremely compact: question <= 180 characters."
 
     if AI_PROVIDER == "openrouter":
         body = json.dumps({
@@ -211,7 +223,8 @@ Scores must be numbers from 0 to 1. Keep comment <= 500 characters and self-cont
             message = choices[0].get("message") or {}
             content = message.get("content", "")
             if isinstance(content, str): text = content
-            elif isinstance(content, list): text = "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
+            elif isinstance(content, list):
+                text = "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
     else:
         text = data.get("output_text") or ""
         if not text:
@@ -220,6 +233,9 @@ Scores must be numbers from 0 to 1. Keep comment <= 500 characters and self-cont
                 for c in item.get("content", []) or []:
                     if isinstance(c, dict) and c.get("text"): chunks.append(str(c["text"]))
             text="\n".join(chunks)
+
+    if finish_reason == "length":
+        raise ValueError(f"AI response truncated; finish_reason='length'; response_chars={len(text)}")
 
     def _parse_payload(raw: str):
         raw=(raw or "").strip()
@@ -259,7 +275,8 @@ Scores must be numbers from 0 to 1. Keep comment <= 500 characters and self-cont
     for row in parsed:
         if not isinstance(row, dict): continue
         pid=str(row.get("post_id") or "")
-        if pid and pid in valid_ids: out[pid]=row
+        if pid and pid in valid_ids:
+            out[pid]=row
     if not out:
         raise ValueError(f"AI response contained no valid post results; finish_reason={finish_reason!r}")
     return out
@@ -1157,19 +1174,16 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
     content=str(result.get("content") or heuristic.get("content") or "")
     if result["decision"] != "comment":
         result["comment"]=None; result["comment_source"]="none"; return result
-    ai_comment=sanitize_public_text(str(ai.get("comment") or "")).strip()
+    ai_comment=sanitize_public_text(str(ai.get("comment") or ai.get("question") or "")).strip()
     if _ai_comment_safe(title, content, ai_comment):
         result["comment"]=ai_comment
         result["comment_source"]="ai"
-        result["reason"]=(str(ai.get("reason") or "AI research decision")+"; V27 AI comment accepted").strip()
+        result["reason"]=(str(ai.get("reason") or "AI research decision")+"; V28 AI comment accepted").strip()
         return result
-    fallback=_evidence_gap_comment(title, content)
-    if fallback:
-        result["comment"]=fallback; result["comment_source"]="deterministic_fallback"
-        result["reason"]=(str(result.get("reason") or "")+"; V27 AI comment rejected, deterministic fallback used").strip()
-        return result
+    # V28 never revives the old deterministic template after an AI rejection.
+    # A rejected AI question is safer as IGNORE than as a generic fallback.
     result["decision"]="ignore"; result["comment"]=None; result["comment_source"]="none"
-    result["reason"]="AI selected comment but it failed V27 source/domain guard and no safe fallback exists"
+    result["reason"]="AI selected comment but it failed V28 source/domain guard; ignored"
     return result
 
 def analyze_post(post: dict[str, Any], recent_texts: list[str]) -> dict[str, Any]:
@@ -1190,12 +1204,25 @@ def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) ->
         heuristic["title"]=title; heuristic["content"]=content[:6000]
         heuristics[pid]=heuristic
         prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:6000],"heuristic":heuristic})
-    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None}
+    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False}
     if not prepared or not AI_KEY:
         return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,None,meta
     meta["attempted"]=True
     try:
-        ai_map=_ai_json_batch(prepared)
+        try:
+            ai_map=_ai_json_batch(prepared)
+            meta["retry_used"]=False
+        except Exception as first_exc:
+            # V28 retries only output truncation/JSON-shape failures. Provider
+            # errors such as 429/401 must not be duplicated immediately.
+            first_msg=str(first_exc)
+            retryable=("truncated" in first_msg.lower() or
+                       "parse failed" in first_msg.lower() or
+                       "contained no valid" in first_msg.lower())
+            if not retryable:
+                raise
+            meta["retry_used"]=True
+            ai_map=_ai_json_batch(prepared, retry=True)
         meta["succeeded"]=True; meta["valid_results"]=len(ai_map)
         merged=[]
         for p in posts:
