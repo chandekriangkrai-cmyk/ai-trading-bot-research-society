@@ -12,7 +12,7 @@ from typing import Any
 from app.api.moltbook import BASE, TIMEOUT, req
 from app.database import SessionLocal
 from app.public_safety import sanitize_public_text
-from app.research_models import MoltbookInteraction, MoltbookInteractionLead
+from app.research_models import MoltbookInteraction, MoltbookInteractionLead, MoltbookCommentFeedback
 
 # Explicit provider selection. Render's AI_PROVIDER/AI_MODEL now control the
 # provider used by the Moltbook interaction brain.
@@ -135,6 +135,33 @@ def _self_name() -> str:
     return str(a.get("name") or a.get("username") or "")
 
 
+def _feedback_examples(limit_each: int = 3) -> dict[str, list[dict[str, str]]]:
+    """V33: retrieve human thumb feedback without making an AI/API call."""
+    db = SessionLocal()
+    try:
+        try:
+            rows = (db.query(MoltbookCommentFeedback)
+                    .order_by(MoltbookCommentFeedback.updated_at.desc())
+                    .limit(max(2, limit_each * 4)).all())
+        except Exception:
+            # Backward-compatible with an existing test/DB created before V33.
+            db.rollback()
+            return {"up": [], "down": []}
+        out = {"up": [], "down": []}
+        for row in rows:
+            bucket = row.rating if row.rating in out else None
+            if not bucket or len(out[bucket]) >= limit_each:
+                continue
+            title = row.post_title or ""
+            if not title:
+                lead = db.query(MoltbookInteractionLead).filter(MoltbookInteractionLead.post_id == row.post_id).first()
+                title = lead.title if lead else ""
+            out[bucket].append({"title": title[:120], "comment": (row.comment_text or "")[:220]})
+        return out
+    finally:
+        db.close()
+
+
 def _ai_json_batch(items: list[dict[str, Any]], retry: bool = False) -> dict[str, dict[str, Any]]:
     """Ask the LLM for a compact decision/question payload.
 
@@ -159,7 +186,14 @@ Do not expose proprietary EA source code, exact indicators, thresholds, paramete
 credentials, or private data.
 Output shape: {\"results\":[{\"post_id\":\"...\",\"decision\":\"ignore\"|\"comment\",\"question\":\"...\"}]}
 For ignore, omit question.
+
+V33 HUMAN THUMB FEEDBACK (learn the quality pattern, do not copy wording):
+{feedback_context}
 """
+    feedback = _feedback_examples(limit_each=3)
+    feedback_context = json.dumps(feedback, ensure_ascii=False)
+    system = system.replace("{feedback_context}", feedback_context)
+
     # Keep the input bounded as well; the model has enough context to anchor a
     # question without reproducing entire long Moltbook posts.
     user_items = []

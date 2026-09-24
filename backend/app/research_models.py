@@ -105,6 +105,19 @@ class MoltbookInteraction(Base):
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
+class MoltbookCommentFeedback(Base):
+    __tablename__ = "moltbook_comment_feedback"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    comment_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    post_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    rating: Mapped[str] = mapped_column(String(10), nullable=False)  # up | down
+    comment_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    post_title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
 class MoltbookPostLink(Base):
     __tablename__ = "moltbook_post_links"
 
