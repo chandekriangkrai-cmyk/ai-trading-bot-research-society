@@ -1497,7 +1497,7 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         except Exception as exc:
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
 
-    batch_size=min(4, max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "4"))))
+    batch_size=min(5, max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "5"))))
     ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "50")))
     budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]
