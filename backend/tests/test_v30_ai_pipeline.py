@@ -31,3 +31,34 @@ def test_v30_recursive_split_reaches_single_posts(monkeypatch):
     assert len(pairs) == 5
     assert any(n == 1 and retry is False for n,retry in calls)
     assert any(n == 2 and retry is True for n,retry in calls)
+
+
+def test_v31_hard_request_budget_stops_recursive_calls(monkeypatch):
+    calls=[]
+    def fake(items, retry=False):
+        calls.append((len(items), retry))
+        raise ValueError("AI response truncated; finish_reason='length'; response_chars=0")
+    monkeypatch.setattr(mi, "_ai_json_batch", fake)
+    monkeypatch.setattr(mi, "AI_KEY", "test-key")
+    budget={"limit":4,"used":0,"exhausted":False}
+    posts=[{"id":f"p{i}","title":"experiment","content":"93.6% measured benchmark"} for i in range(5)]
+    pairs, used, err, meta=mi.analyze_posts_batch(posts, [], budget=budget)
+    assert budget["used"] <= 4
+    assert budget["exhausted"] is True
+    assert len(calls) <= 4
+    assert meta["budget_exhausted"] is True
+
+
+def test_v31_429_does_not_retry_or_split(monkeypatch):
+    calls=[]
+    def fake(items, retry=False):
+        calls.append((len(items), retry))
+        raise ValueError("OPENROUTER AI interaction batch failed HTTP 429: rate limit exceeded")
+    monkeypatch.setattr(mi, "_ai_json_batch", fake)
+    monkeypatch.setattr(mi, "AI_KEY", "test-key")
+    budget={"limit":48,"used":0,"exhausted":False}
+    posts=[{"id":f"p{i}","title":"experiment","content":"93.6% measured benchmark"} for i in range(5)]
+    pairs, used, err, meta=mi.analyze_posts_batch(posts, [], budget=budget)
+    assert calls == [(5, False)]
+    assert budget["used"] == 1
+    assert used is False
