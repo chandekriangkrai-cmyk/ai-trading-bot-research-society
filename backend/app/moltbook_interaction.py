@@ -169,9 +169,9 @@ For ignore, omit question.
             "content": str(x.get("content") or "")[:3000],
         })
     user_text = json.dumps({"posts": user_items}, ensure_ascii=False)
-    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "900"))
+    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "650"))
     if retry:
-        max_tokens = min(max_tokens, 600)
+        max_tokens = min(max_tokens, 450)
         system += "\nBe extremely compact: question <= 180 characters."
 
     if AI_PROVIDER == "openrouter":
@@ -264,6 +264,7 @@ For ignore, omit question.
             try: obj=json.loads(candidate.strip())
             except Exception: continue
             if isinstance(obj, dict) and isinstance(obj.get("results"), list): return obj["results"]
+            if isinstance(obj, dict) and isinstance(obj.get("r"), list): return obj["r"]
             if isinstance(obj, list): return obj
         return None
 
@@ -274,9 +275,16 @@ For ignore, omit question.
     valid_ids={str(x.get("post_id")) for x in items if x.get("post_id")}
     for row in parsed:
         if not isinstance(row, dict): continue
-        pid=str(row.get("post_id") or "")
+        # V29 compact schema: p=post_id, d=decision, q=question.
+        pid=str(row.get("post_id") or row.get("p") or "")
+        decision=str(row.get("decision") or row.get("d") or "ignore").lower()
+        if decision in {"c", "comment"}: decision="comment"
+        else: decision="ignore"
+        normalized={"post_id":pid,"decision":decision}
+        if row.get("question") or row.get("q"):
+            normalized["question"]=str(row.get("question") or row.get("q"))[:220]
         if pid and pid in valid_ids:
-            out[pid]=row
+            out[pid]=normalized
     if not out:
         raise ValueError(f"AI response contained no valid post results; finish_reason={finish_reason!r}")
     return out
@@ -1149,19 +1157,38 @@ def _recent_outbound_comments(db, limit: int = 30) -> list[str]:
 
 
 def _ai_comment_safe(title: str, content: str, comment: str) -> bool:
-    """Allow AI wording without forcing it through the legacy template composer."""
+    """V30 AI guard: grounded in the actual post, without requiring an evidence-gap extractor match."""
     if not comment: return False
     c=sanitize_public_text(comment).strip()
     if len(c) < 35 or len(c) > 500: return False
     if re.match(r"(?i)^\s*(?:for\b|you report\b|the post\b|how would you validate this claim\b)", c): return False
     if "http://" in c.lower() or "https://" in c.lower(): return False
     if not _comment_domain_safe(title, content, c): return False
-    generic={"about","agent","agents","claim","comment","does","effect","evidence","how","model","models","post","research","result","results","same","system","systems","test","testing","tested","whether","what","would","with","under","using","validation","validate","reported","report","measurement","question"}
+
+    generic={"about","agent","agents","claim","comment","does","effect","evidence","how","model","models","post","research","result","results","same","system","systems","test","testing","tested","whether","what","would","with","under","using","validation","validate","reported","report","measurement","question","metrics","metric","performance","study","paper","data","method","methods"}
     post_tokens=set(re.findall(r"[a-z][a-z0-9._-]{4,}", f"{title} {content}".lower()))
     comment_tokens=set(re.findall(r"[a-z][a-z0-9._-]{4,}", c.lower()))
     shared={x for x in post_tokens & comment_tokens if x not in generic}
+
+    # V30: one distinctive anchor is enough when it is clearly technical/named,
+    # because many valid research posts do not contain the older evidence-gap
+    # vocabulary. Keep a stricter fallback for generic anchors.
+    technical_markers=(
+        "ner","nlp","mcp","cbf","mpc","lidar","uav","ros","webots","arxiv",
+        "gitlab","cvss","regex","parser","redis","euclid","lofar","qwen","waymo",
+        "nwp","rto","tpg","snn","esp32","mil-std","barkhausen","xrd","eurusd",
+        "xauusd","forex","backtest","drawdown","spread","precision","recall","latency",
+        "throughput","variance","calibration","oem","vpn","play","provenance","sigstore"
+    )
+    named_or_technical={x for x in shared if x in technical_markers or any(ch.isdigit() for ch in x) or x in re.findall(r"[a-z]+[-_][a-z0-9-]+", f"{title} {content}".lower())}
     nums=re.findall(r"\d+(?:\.\d+)?%?", f"{title} {content}")
-    return len(shared) >= 2 or (len(shared) >= 1 and any(n in c for n in nums))
+    numeric_hit=any(n in c for n in nums)
+    question_like=("?" in c and bool(re.search(r"(?i)\b(?:does|can|could|would|how|what|which|whether|is|are)\b", c)))
+    if len(shared) >= 2:
+        return True
+    if named_or_technical and question_like:
+        return True
+    return len(shared) >= 1 and numeric_hit and question_like
 
 def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dict[str, Any]:
     if not ai: return heuristic
@@ -1194,7 +1221,8 @@ def analyze_post(post: dict[str, Any], recent_texts: list[str]) -> dict[str, Any
     return _heuristic_decision(title, content, novelty)
 
 
-def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) -> tuple[list[dict[str, Any]], bool, str | None, dict[str, Any]]:
+def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[str], allow_split: bool = True, split_depth: int = 0):
+    """V30: compact AI call, retry, then recursively split failed batches to single-post calls."""
     prepared=[]; heuristics={}
     for post in posts:
         pid=_post_id(post)
@@ -1204,25 +1232,45 @@ def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) ->
         heuristic["title"]=title; heuristic["content"]=content[:6000]
         heuristics[pid]=heuristic
         prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:6000],"heuristic":heuristic})
-    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False}
+    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False,"split_used":False,"split_children":0}
     if not prepared or not AI_KEY:
         return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,None,meta
     meta["attempted"]=True
     try:
         try:
             ai_map=_ai_json_batch(prepared)
-            meta["retry_used"]=False
         except Exception as first_exc:
-            # V28 retries only output truncation/JSON-shape failures. Provider
-            # errors such as 429/401 must not be duplicated immediately.
             first_msg=str(first_exc)
-            retryable=("truncated" in first_msg.lower() or
-                       "parse failed" in first_msg.lower() or
-                       "contained no valid" in first_msg.lower())
+            retryable=("truncated" in first_msg.lower() or "parse failed" in first_msg.lower() or "contained no valid" in first_msg.lower())
             if not retryable:
                 raise
             meta["retry_used"]=True
-            ai_map=_ai_json_batch(prepared, retry=True)
+            try:
+                ai_map=_ai_json_batch(prepared, retry=True)
+            except Exception as retry_exc:
+                # V30: recursively split after retry. A failed pair is split
+                # into single-post calls, preventing one oversized response from
+                # discarding otherwise valid AI decisions.
+                if allow_split and len(prepared) > 1 and ("truncated" in str(retry_exc).lower() or "parse failed" in str(retry_exc).lower() or "contained no valid" in str(retry_exc).lower()):
+                    chunks=([posts[j:j+2] for j in range(0,len(posts),2)] if len(posts) > 2 else [[x] for x in posts])
+                    meta["split_used"]=True
+                    meta["split_children"]=len(chunks)
+                    child_results=[]; child_meta=[]
+                    all_ok=True; first_child_err=None
+                    for chunk in chunks:
+                        cp,cu,ce,cm=_analyze_posts_batch_once(chunk,recent_texts,allow_split=True,split_depth=split_depth+1)
+                        child_results.extend(cp); child_meta.append(cm)
+                        if not cu:
+                            all_ok=False
+                            if first_child_err is None: first_child_err=ce
+                    meta["attempted"]=True
+                    meta["succeeded"]=all_ok
+                    meta["valid_results"]=sum(int(x.get("valid_results",0)) for x in child_meta)
+                    meta["retry_used"]=True
+                    meta["error"] = None if all_ok else (first_child_err or str(retry_exc))
+                    meta["children"]=child_meta
+                    return child_results, meta["succeeded"], meta["error"], meta
+                raise retry_exc
         meta["succeeded"]=True; meta["valid_results"]=len(ai_map)
         merged=[]
         for p in posts:
@@ -1235,6 +1283,10 @@ def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]) ->
     except Exception as exc:
         meta["error"]=str(exc)
         return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,str(exc),meta
+
+
+def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]):
+    return _analyze_posts_batch_once(posts, recent_texts, allow_split=True, split_depth=0)
 
 def persist_lead(post: dict[str, Any], analysis: dict[str, Any], status: str = "draft") -> str:
     db=SessionLocal()
