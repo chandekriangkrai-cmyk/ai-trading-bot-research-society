@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Body
 from app.moltbook_interaction import discover_and_analyze, run_cycle, post_comment
 from app.database import SessionLocal
-from app.research_models import MoltbookInteractionLead, MoltbookInteraction
+from app.research_models import MoltbookInteractionLead, MoltbookInteraction, MoltbookCommentFeedback
 
 router=APIRouter(prefix="/moltbook-interactions", tags=["Moltbook AI↔AI Research Interaction"])
 
@@ -83,6 +83,42 @@ async def publish_lead(lead_id: str):
         db.commit()
         return {"status":"posted","lead_id":lead_id,"post_id":post_id,"comment_id":cid,"response":body}
     finally: db.close()
+
+
+@router.post("/feedback")
+def feedback(payload: dict = Body(...)):
+    """V33: record a thumb-up/down label with zero AI calls."""
+    comment_id=str(payload.get("comment_id") or "").strip()
+    rating=str(payload.get("rating") or "").strip().lower()
+    if not comment_id or rating not in {"up", "down"}:
+        raise HTTPException(400, "comment_id and rating=up|down are required")
+    db=SessionLocal()
+    try:
+        interaction=db.query(MoltbookInteraction).filter(MoltbookInteraction.comment_id==comment_id).first()
+        if not interaction:
+            raise HTTPException(404, "Posted comment not found")
+        row=db.query(MoltbookCommentFeedback).filter(MoltbookCommentFeedback.comment_id==comment_id).first()
+        if not row:
+            row=MoltbookCommentFeedback(comment_id=comment_id, post_id=interaction.post_id, rating=rating, comment_text=interaction.content, post_title="")
+            db.add(row)
+        else:
+            row.rating=rating
+        db.commit()
+        return {"status":"recorded","comment_id":comment_id,"post_id":interaction.post_id,"rating":rating,"ai_requests_used":0}
+    finally:
+        db.close()
+
+
+@router.get("/feedback/summary")
+def feedback_summary():
+    db=SessionLocal()
+    try:
+        up=db.query(MoltbookCommentFeedback).filter(MoltbookCommentFeedback.rating=="up").count()
+        down=db.query(MoltbookCommentFeedback).filter(MoltbookCommentFeedback.rating=="down").count()
+        total=up+down
+        return {"total":total,"up":up,"down":down,"up_rate":round(up/total,4) if total else None,"ai_requests_used":0}
+    finally:
+        db.close()
 
 
 @router.get("/diagnostics")
