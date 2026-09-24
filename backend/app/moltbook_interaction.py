@@ -12,7 +12,7 @@ from typing import Any
 from app.api.moltbook import BASE, TIMEOUT, req
 from app.database import SessionLocal
 from app.public_safety import sanitize_public_text
-from app.research_models import MoltbookInteraction, MoltbookInteractionLead, MoltbookCommentFeedback
+from app.research_models import MoltbookInteraction, MoltbookInteractionLead, MoltbookInteractionFeedback
 
 # Explicit provider selection. Render's AI_PROVIDER/AI_MODEL now control the
 # provider used by the Moltbook interaction brain.
@@ -135,33 +135,6 @@ def _self_name() -> str:
     return str(a.get("name") or a.get("username") or "")
 
 
-def _feedback_examples(limit_each: int = 3) -> dict[str, list[dict[str, str]]]:
-    """V33: retrieve human thumb feedback without making an AI/API call."""
-    db = SessionLocal()
-    try:
-        try:
-            rows = (db.query(MoltbookCommentFeedback)
-                    .order_by(MoltbookCommentFeedback.updated_at.desc())
-                    .limit(max(2, limit_each * 4)).all())
-        except Exception:
-            # Backward-compatible with an existing test/DB created before V33.
-            db.rollback()
-            return {"up": [], "down": []}
-        out = {"up": [], "down": []}
-        for row in rows:
-            bucket = row.rating if row.rating in out else None
-            if not bucket or len(out[bucket]) >= limit_each:
-                continue
-            title = row.post_title or ""
-            if not title:
-                lead = db.query(MoltbookInteractionLead).filter(MoltbookInteractionLead.post_id == row.post_id).first()
-                title = lead.title if lead else ""
-            out[bucket].append({"title": title[:120], "comment": (row.comment_text or "")[:220]})
-        return out
-    finally:
-        db.close()
-
-
 def _ai_json_batch(items: list[dict[str, Any]], retry: bool = False) -> dict[str, dict[str, Any]]:
     """Ask the LLM for a compact decision/question payload.
 
@@ -184,16 +157,10 @@ Never begin the question with: For, You report, The post, or How would you valid
 The question must be a complete sentence and must end with ?. Never end mid-clause or with a dangling conjunction/preposition.
 Do not expose proprietary EA source code, exact indicators, thresholds, parameters, entry/exit rules, secrets,
 credentials, or private data.
-Output shape: {\"results\":[{\"post_id\":\"...\",\"decision\":\"ignore\"|\"comment\",\"question\":\"...\"}]}
-For ignore, omit question.
-
-V33 HUMAN THUMB FEEDBACK (learn the quality pattern, do not copy wording):
-{feedback_context}
+For comment, self-evaluate the proposed question before returning it using relevance, evidence grounding, specificity/falsifiability, research value, naturalness, and domain match. Return vote=up only when it clearly passes; vote=down when clearly poor/generic/unsupported; vote=no_vote when evidence is insufficient or confidence is low. Confidence is 0..1. Keep judge_reason <= 90 characters.
+Output shape: {\"results\":[{\"post_id\":\"...\",\"decision\":\"ignore\"|\"comment\",\"question\":\"...\",\"vote\":\"up\"|\"down\"|\"no_vote\",\"confidence\":0.0,\"judge_reason\":\"...\"}]}
+For ignore, omit question/vote.
 """
-    feedback = _feedback_examples(limit_each=3)
-    feedback_context = json.dumps(feedback, ensure_ascii=False)
-    system = system.replace("{feedback_context}", feedback_context)
-
     # Keep the input bounded as well; the model has enough context to anchor a
     # question without reproducing entire long Moltbook posts.
     user_items = []
@@ -322,6 +289,14 @@ V33 HUMAN THUMB FEEDBACK (learn the quality pattern, do not copy wording):
                 normalized["question"]=q
             else:
                 normalized["question_incomplete"]=True
+        vote=str(row.get("vote") or row.get("v") or "").strip().lower()
+        if vote in {"up","down","no_vote"}:
+            normalized["judge_vote"]=vote
+            try:
+                normalized["judge_confidence"]=max(0.0,min(1.0,float(row.get("confidence") if row.get("confidence") is not None else row.get("c",0.0))))
+            except Exception:
+                normalized["judge_confidence"]=0.0
+            normalized["judge_reason"]=str(row.get("judge_reason") or row.get("j") or "").strip()[:120]
         if pid and pid in valid_ids:
             out[pid]=normalized
     if not out:
@@ -1258,6 +1233,13 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
         try: result[k]=max(0.0,min(1.0,float(result.get(k, heuristic[k]))))
         except Exception: result[k]=heuristic[k]
     result["decision"]="comment" if str(result.get("decision","ignore")).lower()=="comment" else "ignore"
+    if result.get("decision") == "comment":
+        vote=str(ai.get("judge_vote") or "no_vote").lower()
+        if vote not in {"up","down","no_vote"}: vote="no_vote"
+        result["judge_vote"]=vote
+        try: result["judge_confidence"]=max(0.0,min(1.0,float(ai.get("judge_confidence",0.0) or 0.0)))
+        except Exception: result["judge_confidence"]=0.0
+        result["judge_reason"]=str(ai.get("judge_reason") or "AI self-evaluation completed")[:120]
     title=str(result.get("title") or heuristic.get("title") or "")
     content=str(result.get("content") or heuristic.get("content") or "")
     if result["decision"] != "comment":
@@ -1268,9 +1250,16 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
         return result
     ai_comment=sanitize_public_text(str(ai.get("comment") or ai.get("question") or "")).strip()
     if _ai_comment_safe(title, content, ai_comment):
+        vote=str(result.get("judge_vote") or "no_vote")
+        if vote != "up":
+            result["decision"]="ignore"
+            result["comment"]=None
+            result["comment_source"]="ai"
+            result["reason"]=f"AI Judge {vote}: {result.get('judge_reason') or 'candidate did not pass self-evaluation'}"
+            return result
         result["comment"]=ai_comment
         result["comment_source"]="ai"
-        result["reason"]=(str(ai.get("reason") or "AI research decision")+"; V28 AI comment accepted").strip()
+        result["reason"]=(str(ai.get("reason") or "AI research decision")+"; AI Judge thumb_up").strip()
         return result
     # V28 never revives the old deterministic template after an AI rejection.
     # A rejected AI question is safer as IGNORE than as a generic fallback.
@@ -1403,6 +1392,14 @@ def persist_lead(post: dict[str, Any], analysis: dict[str, Any], status: str = "
     finally: db.close()
 
 
+def record_ai_feedback(post_id: str, comment_id: str | None, rating: str, confidence: float | None, reason: str, criteria: dict[str, Any] | None = None):
+    db=SessionLocal()
+    try:
+        row=MoltbookInteractionFeedback(post_id=post_id,comment_id=comment_id,rating=rating,source="ai_judge",confidence=confidence,reason=reason or "",criteria_json=json.dumps(criteria or {}, ensure_ascii=False))
+        db.add(row); db.commit(); return row.id
+    finally: db.close()
+
+
 def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[str, Any]:
     source, cards, meta=discover_feed(limit=limit)
     me=_self_name()
@@ -1467,6 +1464,9 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         "ai_budget_exhausted":bool(budget.get("exhausted")),
         "ai_batch_meta":ai_meta,
         "candidates":sum(1 for x in results if x.get("decision")=="comment"),
+        "ai_judge_up":sum(1 for x in results if x.get("judge_vote")=="up"),
+        "ai_judge_down":sum(1 for x in results if x.get("judge_vote")=="down"),
+        "ai_judge_no_vote":sum(1 for x in results if x.get("judge_vote")=="no_vote"),
         "results":results,
         "feed_meta":meta,
     }
@@ -1489,9 +1489,18 @@ def run_cycle(auto_comment: bool = False, max_comments: int = 1, min_relevance: 
     posted=0
     outputs=[]
     for item in scan["results"]:
+        pid=item.get("post_id")
+        judge_vote=str(item.get("judge_vote") or "").lower()
+        if judge_vote in {"down","no_vote"}:
+            try:
+                record_ai_feedback(str(pid), None, judge_vote, float(item.get("judge_confidence",0.0) or 0.0), str(item.get("judge_reason") or "AI Judge did not approve candidate"), {"decision":item.get("decision")})
+            except Exception:
+                pass
+            continue
         if item.get("decision")!="comment" or posted>=max_comments:
             continue
-        pid=item.get("post_id")
+        if judge_vote != "up":
+            continue
         db=SessionLocal()
         try:
             lead=db.query(MoltbookInteractionLead).filter(MoltbookInteractionLead.post_id==pid).first()
@@ -1522,6 +1531,10 @@ def run_cycle(auto_comment: bool = False, max_comments: int = 1, min_relevance: 
                 db.add(interaction)
                 lead.status="commented"
                 db.commit()
+                try:
+                    record_ai_feedback(str(pid), cid, "up", float(item.get("judge_confidence",0.0) or 0.0), str(item.get("judge_reason") or "AI Judge accepted candidate"), {"decision":item.get("decision"),"comment_source":item.get("comment_source")})
+                except Exception:
+                    pass
                 posted+=1
                 outputs.append({"post_id":pid,"status":"posted","comment_id":cid})
             except Exception as exc:

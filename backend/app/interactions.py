@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import os
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
+import json
 from app.moltbook_interaction import discover_and_analyze, run_cycle, post_comment
 from app.database import SessionLocal
-from app.research_models import MoltbookInteractionLead, MoltbookInteraction
+from app.research_models import MoltbookInteractionLead, MoltbookInteraction, MoltbookInteractionFeedback
 
 router=APIRouter(prefix="/moltbook-interactions", tags=["Moltbook AI↔AI Research Interaction"])
+
+
+
+class FeedbackRequest(BaseModel):
+    comment_id: str = Field(..., description="Moltbook comment ID", examples=["7b836b34-bebc-47c6-824f-e92fa5d6a028"])
+    rating: str = Field(..., pattern="^(up|down|no_vote)$", description="up, down, or no_vote", examples=["up"])
 
 
 def _auto_enabled() -> bool:
@@ -82,4 +90,34 @@ async def publish_lead(lead_id: str):
         row.status="commented"
         db.commit()
         return {"status":"posted","lead_id":lead_id,"post_id":post_id,"comment_id":cid,"response":body}
+    finally: db.close()
+
+
+@router.post("/feedback")
+def feedback(payload: FeedbackRequest):
+    """Manual feedback endpoint retained for human labels; AI Judge does not require it."""
+    db=SessionLocal()
+    try:
+        row=db.query(MoltbookInteraction).filter(MoltbookInteraction.comment_id==payload.comment_id).order_by(MoltbookInteraction.created_at.desc()).first()
+        if not row:
+            raise HTTPException(404, "Comment interaction not found")
+        fb=MoltbookInteractionFeedback(post_id=row.post_id, comment_id=payload.comment_id, rating=payload.rating, source="human", confidence=1.0, reason="Manual human feedback", criteria_json="{}")
+        db.add(fb); db.commit()
+        return {"status":"recorded","comment_id":payload.comment_id,"post_id":row.post_id,"rating":payload.rating,"ai_requests_used":0}
+    finally: db.close()
+
+
+@router.get("/feedback/summary")
+def feedback_summary(limit: int = Query(100, ge=1, le=500)):
+    db=SessionLocal()
+    try:
+        rows=db.query(MoltbookInteractionFeedback).order_by(MoltbookInteractionFeedback.created_at.desc()).limit(limit).all()
+        counts={"up":0,"down":0,"no_vote":0}
+        sources={"ai_judge":0,"human":0}
+        items=[]
+        for r in rows:
+            counts[r.rating]=counts.get(r.rating,0)+1
+            sources[r.source]=sources.get(r.source,0)+1
+            items.append({"id":r.id,"post_id":r.post_id,"comment_id":r.comment_id,"rating":r.rating,"source":r.source,"confidence":r.confidence,"reason":r.reason,"created_at":r.created_at.isoformat() if r.created_at else None})
+        return {"count":len(rows),"counts":counts,"sources":sources,"items":items}
     finally: db.close()
