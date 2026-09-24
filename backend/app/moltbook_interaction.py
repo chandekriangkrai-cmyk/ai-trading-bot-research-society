@@ -182,10 +182,13 @@ For every post, self-classify scope as in_scope, out_of_scope, or uncertain.
 - in_scope + low-value, generic, spammy, repetitive, unsupported/unfalsifiable, misleading, or otherwise not useful -> vote=down.
 - credible content that promotes or meaningfully facilitates harm/threats to humans -> h=true and vote=down as a safety override.
 The DOWN vote must describe a quality/safety failure, never scope mismatch alone.
-For comment, self-evaluate the proposed question using evidence grounding, specificity/falsifiability, research value, naturalness, and domain match. Confidence is 0..1. Keep judge_reason <= 30 characters.
-Use compact keys only: p=post_id, s=scope, v=vote, q=question, c=confidence, j=judge_reason, h=harmful.
-Output shape: {"r":[{"p":"...","s":"in_scope","v":"up","q":"...","c":0.9,"j":"specific validation","h":false}]}
-For out_of_scope or uncertain, use vote=no_vote and omit question.
+For comment, self-evaluate the proposed question using evidence grounding, specificity/falsifiability, research value, naturalness, and domain match. Confidence is 0..1. Keep judge_reason <= 20 characters.
+Use compact keys and compact enum values only:
+p=post_id; s=i for in_scope, o for out_of_scope, u for uncertain;
+v=u for up, d for down, n for no_vote; h=1 or 0; c=0..1; j<=20 chars.
+q must be <=120 characters when present.
+Output shape: {"r":[{"p":"...","s":"i","v":"u","q":"...","c":0.9,"j":"specific","h":0}]}
+For s=o or s=u, use v=n and omit q.
 """
     # Keep the input bounded as well; the model has enough context to anchor a
     # question without reproducing entire long Moltbook posts.
@@ -194,13 +197,13 @@ For out_of_scope or uncertain, use vote=no_vote and omit question.
         user_items.append({
             "post_id": x.get("post_id"),
             "title": str(x.get("title") or "")[:500],
-            "content": str(x.get("content") or "")[:1800],
+            "content": str(x.get("content") or "")[:1400],
         })
     user_text = json.dumps({"posts": user_items}, ensure_ascii=False)
-    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "420")), 420)
+    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "360")), 360)
     if retry:
-        max_tokens = min(max_tokens, 280)
-        system += "\nBe extremely compact: q <= 160 characters; j <= 30 characters; one JSON object per post; no filler."
+        max_tokens = min(max_tokens, 220)
+        system += "\nBe extremely compact: q <= 120 characters; j <= 20 characters; one object per post; use only compact enum values; no filler."
 
     if AI_PROVIDER == "openrouter":
         body = json.dumps({
@@ -319,7 +322,10 @@ For out_of_scope or uncertain, use vote=no_vote and omit question.
         pid=str(row.get("post_id") or row.get("p") or "")
         vote=str(row.get("vote") or row.get("v") or "").strip().lower()
         scope=str(row.get("scope") or row.get("s") or "").strip().lower()
-        harmful=bool(row.get("harmful") or row.get("h"))
+        harmful_raw=row.get("harmful") if row.get("harmful") is not None else row.get("h")
+        harmful=str(harmful_raw).strip().lower() in {"1","true","yes","y"}
+        vote={"u":"up","d":"down","n":"no_vote"}.get(vote, vote)
+        scope={"i":"in_scope","o":"out_of_scope","u":"uncertain"}.get(scope, scope)
         if vote not in {"up","down","no_vote"}: vote="no_vote"
         if scope not in {"in_scope","out_of_scope","uncertain"}: scope="uncertain"
         decision="comment" if vote in {"up","down"} and (scope == "in_scope" or harmful) else "ignore"
@@ -334,7 +340,7 @@ For out_of_scope or uncertain, use vote=no_vote and omit question.
             normalized["judge_confidence"]=max(0.0,min(1.0,float(row.get("confidence") if row.get("confidence") is not None else row.get("c",0.0))))
         except Exception:
             normalized["judge_confidence"]=0.0
-        normalized["judge_reason"]=str(row.get("judge_reason") or row.get("j") or "").strip()[:80]
+        normalized["judge_reason"]=str(row.get("judge_reason") or row.get("j") or "").strip()[:40]
         if pid and pid in valid_ids:
             out[pid]=normalized
     if not out:
