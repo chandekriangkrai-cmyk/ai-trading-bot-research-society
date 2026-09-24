@@ -22,7 +22,7 @@ def test_v28_ai_question_is_used_without_deterministic_fallback(monkeypatch):
     title="Tool descriptions are the attack surface"
     content="MCP tool descriptions can cause malicious invocation; 93.6% was observed in the evaluation."
     heuristic={"title":title,"content":content,"relevance_score":0.8,"novelty_score":0.8,"research_value_score":0.8,"decision":"comment","reason":"AI"}
-    ai={"decision":"comment","question":"Does the 93.6% malicious-invocation rate persist on held-out MCP tool descriptions under the same threat model?"}
+    ai={"decision":"comment","question":"Does the 93.6% malicious-invocation rate persist on held-out MCP tool descriptions under the same threat model?","judge_vote":"up","judge_confidence":0.94,"judge_reason":"Specific and evidence-grounded."}
     out=mi._merge_analysis(heuristic, ai)
     assert out["comment_source"] == "ai"
     assert out["comment"].startswith("Does the 93.6%")
