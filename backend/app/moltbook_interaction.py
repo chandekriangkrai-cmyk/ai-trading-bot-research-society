@@ -1221,7 +1221,7 @@ def analyze_post(post: dict[str, Any], recent_texts: list[str]) -> dict[str, Any
     return _heuristic_decision(title, content, novelty)
 
 
-def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[str], allow_split: bool = True, split_depth: int = 0):
+def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[str], allow_split: bool = True, split_depth: int = 0, budget: dict[str, Any] | None = None):
     """V30: compact AI call, retry, then recursively split failed batches to single-post calls."""
     prepared=[]; heuristics={}
     for post in posts:
@@ -1232,33 +1232,46 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
         heuristic["title"]=title; heuristic["content"]=content[:6000]
         heuristics[pid]=heuristic
         prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:6000],"heuristic":heuristic})
-    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False,"split_used":False,"split_children":0}
+    if budget is None:
+        budget={"limit":48,"used":0,"exhausted":False}
+    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False,"split_used":False,"split_children":0,"ai_requests_used":0,"budget_exhausted":False}
     if not prepared or not AI_KEY:
         return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,None,meta
+    def _call_ai(items: list[dict[str, Any]], retry: bool = False):
+        if int(budget.get("used",0)) >= int(budget.get("limit",48)):
+            budget["exhausted"]=True
+            meta["budget_exhausted"]=True
+            raise RuntimeError(f"AI request budget exhausted at {budget.get('limit',48)} requests")
+        budget["used"]=int(budget.get("used",0))+1
+        meta["ai_requests_used"]=int(meta.get("ai_requests_used",0))+1
+        return _ai_json_batch(items, retry=retry)
+
     meta["attempted"]=True
     try:
         try:
-            ai_map=_ai_json_batch(prepared)
+            ai_map=_call_ai(prepared)
         except Exception as first_exc:
             first_msg=str(first_exc)
-            retryable=("truncated" in first_msg.lower() or "parse failed" in first_msg.lower() or "contained no valid" in first_msg.lower())
+            retryable=("truncated" in first_msg.lower() or "parse failed" in first_msg.lower() or "contained no valid" in first_msg.lower()) and "http 429" not in first_msg.lower() and "rate limit" not in first_msg.lower()
             if not retryable:
                 raise
             meta["retry_used"]=True
             try:
-                ai_map=_ai_json_batch(prepared, retry=True)
+                ai_map=_call_ai(prepared, retry=True)
             except Exception as retry_exc:
                 # V30: recursively split after retry. A failed pair is split
                 # into single-post calls, preventing one oversized response from
                 # discarding otherwise valid AI decisions.
-                if allow_split and len(prepared) > 1 and ("truncated" in str(retry_exc).lower() or "parse failed" in str(retry_exc).lower() or "contained no valid" in str(retry_exc).lower()):
+                retry_text=str(retry_exc).lower()
+                split_retryable=("truncated" in retry_text or "parse failed" in retry_text or "contained no valid" in retry_text) and "http 429" not in retry_text and "rate limit" not in retry_text and "budget exhausted" not in retry_text
+                if allow_split and len(prepared) > 1 and split_retryable and int(budget.get("used",0)) < int(budget.get("limit",48)):
                     chunks=([posts[j:j+2] for j in range(0,len(posts),2)] if len(posts) > 2 else [[x] for x in posts])
                     meta["split_used"]=True
                     meta["split_children"]=len(chunks)
                     child_results=[]; child_meta=[]
                     all_ok=True; first_child_err=None
                     for chunk in chunks:
-                        cp,cu,ce,cm=_analyze_posts_batch_once(chunk,recent_texts,allow_split=True,split_depth=split_depth+1)
+                        cp,cu,ce,cm=_analyze_posts_batch_once(chunk,recent_texts,allow_split=True,split_depth=split_depth+1,budget=budget)
                         child_results.extend(cp); child_meta.append(cm)
                         if not cu:
                             all_ok=False
@@ -1269,6 +1282,8 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
                     meta["retry_used"]=True
                     meta["error"] = None if all_ok else (first_child_err or str(retry_exc))
                     meta["children"]=child_meta
+                    meta["ai_requests_used"]=sum(int(x.get("ai_requests_used",0) or 0) for x in child_meta)
+                    meta["budget_exhausted"]=bool(budget.get("exhausted"))
                     return child_results, meta["succeeded"], meta["error"], meta
                 raise retry_exc
         meta["succeeded"]=True; meta["valid_results"]=len(ai_map)
@@ -1282,11 +1297,14 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
         return merged,True,None,meta
     except Exception as exc:
         meta["error"]=str(exc)
+        meta["budget_exhausted"]=bool(budget.get("exhausted"))
         return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,str(exc),meta
 
 
-def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str]):
-    return _analyze_posts_batch_once(posts, recent_texts, allow_split=True, split_depth=0)
+def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str], budget: dict[str, Any] | None = None):
+    if budget is None:
+        budget={"limit":48,"used":0,"exhausted":False}
+    return _analyze_posts_batch_once(posts, recent_texts, allow_split=True, split_depth=0, budget=budget)
 
 def persist_lead(post: dict[str, Any], analysis: dict[str, Any], status: str = "draft") -> str:
     db=SessionLocal()
@@ -1334,10 +1352,15 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
 
     batch_size=max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "10")))
+    ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "48")))
+    budget={"limit":ai_request_budget,"used":0,"exhausted":False}
     all_pairs=[]
     ai_batches_attempted=0; ai_batches_succeeded=0; ai_error=None; ai_valid_results=0; ai_meta=[]
     for i in range(0, len(full_posts), batch_size):
-        pairs, ai_used, err, meta_ai=analyze_posts_batch(full_posts[i:i+batch_size], recent_texts)
+        if int(budget.get("used",0)) >= ai_request_budget:
+            budget["exhausted"]=True
+            break
+        pairs, ai_used, err, meta_ai=analyze_posts_batch(full_posts[i:i+batch_size], recent_texts, budget=budget)
         all_pairs.extend(pairs)
         ai_batches_attempted += int(meta_ai.get("attempted",False))
         ai_batches_succeeded += int(meta_ai.get("succeeded",False))
@@ -1365,6 +1388,10 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         "ai_model":AI_MODEL,
         "ai_valid_results":ai_valid_results,
         "ai_batch_size":batch_size,
+        "ai_request_budget":ai_request_budget,
+        "ai_requests_used":int(budget.get("used",0)),
+        "ai_requests_remaining":max(0, ai_request_budget-int(budget.get("used",0))),
+        "ai_budget_exhausted":bool(budget.get("exhausted")),
         "ai_batch_meta":ai_meta,
         "candidates":sum(1 for x in results if x.get("decision")=="comment"),
         "results":results,
