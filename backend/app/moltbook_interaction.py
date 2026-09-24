@@ -185,13 +185,13 @@ For ignore, omit question/vote.
         user_items.append({
             "post_id": x.get("post_id"),
             "title": str(x.get("title") or "")[:500],
-            "content": str(x.get("content") or "")[:3000],
+            "content": str(x.get("content") or "")[:2200],
         })
     user_text = json.dumps({"posts": user_items}, ensure_ascii=False)
-    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "650"))
+    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "520"))
     if retry:
-        max_tokens = min(max_tokens, 420)
-        system += "\nBe extremely compact: question <= 180 characters; end every question with a question mark."
+        max_tokens = min(max_tokens, 360)
+        system += "\nBe extremely compact: question <= 150 characters; judge_reason <= 45 characters; no filler."
 
     if AI_PROVIDER == "openrouter":
         body = json.dumps({
@@ -1309,16 +1309,16 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
         heuristic=_heuristic_decision(title, content, _novelty(f"{title}\n{content}", recent_texts))
         heuristic["title"]=title; heuristic["content"]=content[:6000]
         heuristics[pid]=heuristic
-        prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:6000],"heuristic":heuristic})
+        prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:5000],"heuristic":heuristic})
     if budget is None:
-        budget={"limit":48,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
+        budget={"limit":50,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False,"split_used":False,"split_children":0,"ai_requests_used":0,"budget_exhausted":False,"split_depth":split_depth,"incomplete_questions_rejected":0}
     if not prepared or not AI_KEY:
         return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,None,meta
     def _call_ai(items: list[dict[str, Any]], retry: bool = False):
         if bool(budget.get("quota_exhausted")):
             raise OpenRouterDailyQuotaError("OpenRouter daily free-model quota already exhausted")
-        if int(budget.get("used",0)) >= int(budget.get("limit",48)):
+        if int(budget.get("used",0)) >= int(budget.get("limit",50)):
             budget["exhausted"]=True
             meta["budget_exhausted"]=True
             raise RuntimeError(f"AI request budget exhausted at {budget.get('limit',48)} requests")
@@ -1354,7 +1354,7 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
                 # discarding otherwise valid AI decisions.
                 retry_text=str(retry_exc).lower()
                 split_retryable=("truncated" in retry_text or "parse failed" in retry_text or "contained no valid" in retry_text) and "http 429" not in retry_text and "rate limit" not in retry_text and "budget exhausted" not in retry_text
-                if allow_split and len(prepared) > 1 and split_retryable and int(budget.get("used",0)) < int(budget.get("limit",48)):
+                if allow_split and len(prepared) > 1 and split_retryable and int(budget.get("used",0)) < int(budget.get("limit",50)):
                     # V32: balanced split reduces request amplification. A 5-post failure
                     # becomes 3+2 instead of 2+2+1; deeper splitting is only used if a
                     # child actually fails again. This preserves the V31 recovery path
@@ -1413,7 +1413,7 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
 
 def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str], budget: dict[str, Any] | None = None):
     if budget is None:
-        budget={"limit":48,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
+        budget={"limit":50,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     return _analyze_posts_batch_once(posts, recent_texts, allow_split=True, split_depth=0, budget=budget)
 
 def persist_lead(post: dict[str, Any], analysis: dict[str, Any], status: str = "draft") -> str:
@@ -1469,8 +1469,8 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         except Exception as exc:
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
 
-    batch_size=max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "10")))
-    ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "48")))
+    batch_size=max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "5")))
+    ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "50")))
     budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]
     ai_batches_attempted=0; ai_batches_succeeded=0; ai_error=None; ai_valid_results=0; ai_meta=[]
