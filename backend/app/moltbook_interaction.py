@@ -174,9 +174,17 @@ Never begin the question with: For, You report, The post, or How would you valid
 The question must be a complete sentence and must end with ?. Never end mid-clause or with a dangling conjunction/preposition.
 Do not expose proprietary EA source code, exact indicators, thresholds, parameters, entry/exit rules, secrets,
 credentials, or private data.
-For comment, self-evaluate the proposed question before returning it using relevance, evidence grounding, specificity/falsifiability, research value, naturalness, and domain match. Return vote=up only when it clearly passes; vote=down when clearly poor/generic/unsupported; vote=no_vote when evidence is insufficient or confidence is low. Confidence is 0..1. Keep judge_reason <= 90 characters.
-Output shape: {\"results\":[{\"post_id\":\"...\",\"decision\":\"ignore\"|\"comment\",\"question\":\"...\",\"vote\":\"up\"|\"down\"|\"no_vote\",\"confidence\":0.0,\"judge_reason\":\"...\"}]}
-For ignore, omit question/vote.
+Separate SCOPE from QUALITY. Never use DOWN merely because a post is outside the trading/research scope.
+For every post, self-classify scope as in_scope, out_of_scope, or uncertain.
+- out_of_scope -> decision=ignore, vote=no_vote. This is neutral/ignore, NOT a negative judgment.
+- uncertain scope or insufficient evidence -> decision=ignore, vote=no_vote.
+- in_scope + useful, specific, evidence-grounded, falsifiable research value -> decision=comment, vote=up.
+- in_scope + low-value, generic, spammy, repetitive, unsupported/unfalsifiable, misleading, or otherwise not useful -> decision=comment, vote=down.
+- credible content that promotes or meaningfully facilitates harm/threats to humans -> vote=down as a safety override.
+The DOWN vote must describe a quality/safety failure, never scope mismatch alone.
+For comment, self-evaluate the proposed question using evidence grounding, specificity/falsifiability, research value, naturalness, and domain match. Confidence is 0..1. Keep judge_reason <= 90 characters.
+Output shape: {\"results\":[{\"post_id\":\"...\",\"scope\":\"in_scope\"|\"out_of_scope\"|\"uncertain\",\"decision\":\"ignore\"|\"comment\",\"question\":\"...\",\"vote\":\"up\"|\"down\"|\"no_vote\",\"confidence\":0.0,\"judge_reason\":\"...\"}]}
+For out_of_scope or uncertain, use vote=no_vote and omit question.
 """
     # Keep the input bounded as well; the model has enough context to anchor a
     # question without reproducing entire long Moltbook posts.
@@ -313,6 +321,8 @@ For ignore, omit question/vote.
                 normalized["question"]=q
             else:
                 normalized["question_incomplete"]=True
+        scope=str(row.get("scope") or row.get("s") or "").strip().lower()
+        if scope in {"in_scope","out_of_scope","uncertain"}: normalized["judge_scope"]=scope
         vote=str(row.get("vote") or row.get("v") or "").strip().lower()
         if vote in {"up","down","no_vote"}:
             normalized["judge_vote"]=vote
@@ -1257,17 +1267,27 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
         try: result[k]=max(0.0,min(1.0,float(result.get(k, heuristic[k]))))
         except Exception: result[k]=heuristic[k]
     result["decision"]="comment" if str(result.get("decision","ignore")).lower()=="comment" else "ignore"
-    if result.get("decision") == "comment":
-        vote=str(ai.get("judge_vote") or "no_vote").lower()
-        if vote not in {"up","down","no_vote"}: vote="no_vote"
-        result["judge_vote"]=vote
-        try: result["judge_confidence"]=max(0.0,min(1.0,float(ai.get("judge_confidence",0.0) or 0.0)))
-        except Exception: result["judge_confidence"]=0.0
-        result["judge_reason"]=str(ai.get("judge_reason") or "AI self-evaluation completed")[:120]
+    # V37: scope is neutral. Out-of-scope/uncertain content is NO_VOTE, never DOWN.
+    vote=str(ai.get("judge_vote") or "").lower()
+    if vote not in {"up","down","no_vote"}: vote="no_vote"
+    result["judge_vote"]=vote
+    scope=str(ai.get("judge_scope") or "").lower()
+    if scope in {"in_scope","out_of_scope","uncertain"}: result["judge_scope"]=scope
+    try: result["judge_confidence"]=max(0.0,min(1.0,float(ai.get("judge_confidence",0.0) or 0.0)))
+    except Exception: result["judge_confidence"]=0.0
+    result["judge_reason"]=str(ai.get("judge_reason") or "AI self-evaluation completed")[:120]
+    if scope in {"out_of_scope","uncertain"} and vote == "down":
+        result["judge_vote"]="no_vote"
+        result["judge_reason"]="Out of scope/uncertain content is neutral; no vote."
+        vote="no_vote"
     title=str(result.get("title") or heuristic.get("title") or "")
     content=str(result.get("content") or heuristic.get("content") or "")
     if result["decision"] != "comment":
         result["comment"]=None; result["comment_source"]="none"; return result
+    if result.get("judge_scope") in {"out_of_scope","uncertain"}:
+        result["decision"]="ignore"; result["comment"]=None; result["comment_source"]="none"
+        result["reason"]="AI Judge no_vote: out-of-scope or uncertain content"
+        return result
     if bool(ai.get("question_incomplete")):
         result["decision"]="ignore"; result["comment"]=None; result["comment_source"]="none"
         result["reason"]="AI question rejected: incomplete or truncated sentence"
