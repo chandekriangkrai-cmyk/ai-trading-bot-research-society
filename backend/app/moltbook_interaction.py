@@ -135,6 +135,23 @@ def _self_name() -> str:
     return str(a.get("name") or a.get("username") or "")
 
 
+class OpenRouterDailyQuotaError(RuntimeError):
+    """Fatal provider quota error: retries/splits cannot recover until reset."""
+
+
+def _is_openrouter_daily_quota_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        AI_PROVIDER == "openrouter"
+        and ("http 429" in msg or "code\\\":429" in msg or "status 429" in msg)
+        and (
+            "free-models-per-day" in msg
+            or "openrouter_free_tier_daily" in msg
+            or "x-ratelimit-remaining\\\":\\\"0" in msg
+        )
+    )
+
+
 def _ai_json_batch(items: list[dict[str, Any]], retry: bool = False) -> dict[str, dict[str, Any]]:
     """Ask the LLM for a compact decision/question payload.
 
@@ -210,9 +227,16 @@ For ignore, omit question/vote.
             data = json.loads(r.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as e:
         detail = ""
-        try: detail = e.read().decode("utf-8", "replace")[:1000]
+        try: detail = e.read().decode("utf-8", "replace")[:2000]
         except Exception: pass
-        raise RuntimeError(f"{AI_PROVIDER.upper()} AI interaction batch failed HTTP {e.code}: {detail}") from e
+        message = f"{AI_PROVIDER.upper()} AI interaction batch failed HTTP {e.code}: {detail}"
+        if AI_PROVIDER == "openrouter" and e.code == 429 and (
+            "free-models-per-day" in detail.lower()
+            or "openrouter_free_tier_daily" in detail.lower()
+            or '"x-ratelimit-remaining":"0"' in detail.lower()
+        ):
+            raise OpenRouterDailyQuotaError(message) from e
+        raise RuntimeError(message) from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"{AI_PROVIDER.upper()} AI interaction batch failed: {e}") from e
 
@@ -1287,18 +1311,28 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
         heuristics[pid]=heuristic
         prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:6000],"heuristic":heuristic})
     if budget is None:
-        budget={"limit":48,"used":0,"exhausted":False}
+        budget={"limit":48,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False,"split_used":False,"split_children":0,"ai_requests_used":0,"budget_exhausted":False,"split_depth":split_depth,"incomplete_questions_rejected":0}
     if not prepared or not AI_KEY:
         return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,None,meta
     def _call_ai(items: list[dict[str, Any]], retry: bool = False):
+        if bool(budget.get("quota_exhausted")):
+            raise OpenRouterDailyQuotaError("OpenRouter daily free-model quota already exhausted")
         if int(budget.get("used",0)) >= int(budget.get("limit",48)):
             budget["exhausted"]=True
             meta["budget_exhausted"]=True
             raise RuntimeError(f"AI request budget exhausted at {budget.get('limit',48)} requests")
         budget["used"]=int(budget.get("used",0))+1
         meta["ai_requests_used"]=int(meta.get("ai_requests_used",0))+1
-        return _ai_json_batch(items, retry=retry)
+        try:
+            return _ai_json_batch(items, retry=retry)
+        except Exception as exc:
+            if _is_openrouter_daily_quota_error(exc) or isinstance(exc, OpenRouterDailyQuotaError):
+                budget["quota_exhausted"] = True
+                budget["quota_error"] = str(exc)
+                meta["quota_exhausted"] = True
+                meta["ai_stop_reason"] = "openrouter_daily_quota"
+            raise
 
     meta["attempted"]=True
     try:
@@ -1306,6 +1340,8 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
             ai_map=_call_ai(prepared)
         except Exception as first_exc:
             first_msg=str(first_exc)
+            if _is_openrouter_daily_quota_error(first_exc) or isinstance(first_exc, OpenRouterDailyQuotaError):
+                raise
             retryable=("truncated" in first_msg.lower() or "parse failed" in first_msg.lower() or "contained no valid" in first_msg.lower()) and "http 429" not in first_msg.lower() and "rate limit" not in first_msg.lower()
             if not retryable:
                 raise
@@ -1333,11 +1369,19 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
                     child_results=[]; child_meta=[]
                     all_ok=True; first_child_err=None
                     for chunk in chunks:
+                        if bool(budget.get("quota_exhausted")):
+                            all_ok=False
+                            first_child_err=budget.get("quota_error") or "OpenRouter daily free-model quota exhausted"
+                            break
                         cp,cu,ce,cm=_analyze_posts_batch_once(chunk,recent_texts,allow_split=True,split_depth=split_depth+1,budget=budget)
                         child_results.extend(cp); child_meta.append(cm)
                         if not cu:
                             all_ok=False
                             if first_child_err is None: first_child_err=ce
+                        if bool(budget.get("quota_exhausted")):
+                            all_ok=False
+                            first_child_err=budget.get("quota_error") or ce
+                            break
                     meta["attempted"]=True
                     meta["succeeded"]=all_ok
                     meta["valid_results"]=sum(int(x.get("valid_results",0)) for x in child_meta)
@@ -1360,12 +1404,16 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
     except Exception as exc:
         meta["error"]=str(exc)
         meta["budget_exhausted"]=bool(budget.get("exhausted"))
+        if _is_openrouter_daily_quota_error(exc) or isinstance(exc, OpenRouterDailyQuotaError) or bool(budget.get("quota_exhausted")):
+            budget["quota_exhausted"] = True
+            meta["quota_exhausted"] = True
+            meta["ai_stop_reason"] = "openrouter_daily_quota"
         return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,str(exc),meta
 
 
 def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str], budget: dict[str, Any] | None = None):
     if budget is None:
-        budget={"limit":48,"used":0,"exhausted":False}
+        budget={"limit":48,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     return _analyze_posts_batch_once(posts, recent_texts, allow_split=True, split_depth=0, budget=budget)
 
 def persist_lead(post: dict[str, Any], analysis: dict[str, Any], status: str = "draft") -> str:
@@ -1423,7 +1471,7 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
 
     batch_size=max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "10")))
     ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "48")))
-    budget={"limit":ai_request_budget,"used":0,"exhausted":False}
+    budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]
     ai_batches_attempted=0; ai_batches_succeeded=0; ai_error=None; ai_valid_results=0; ai_meta=[]
     for i in range(0, len(full_posts), batch_size):
@@ -1437,6 +1485,8 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         ai_valid_results += int(meta_ai.get("valid_results",0) or 0)
         ai_meta.append(meta_ai)
         if err and ai_error is None: ai_error=err
+        if bool(budget.get("quota_exhausted")):
+            break
 
     for full, analysis in all_pairs:
         if analysis.get("relevance_score",0) >= min_relevance:
@@ -1462,6 +1512,9 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         "ai_requests_used":int(budget.get("used",0)),
         "ai_requests_remaining":max(0, ai_request_budget-int(budget.get("used",0))),
         "ai_budget_exhausted":bool(budget.get("exhausted")),
+        "ai_quota_exhausted":bool(budget.get("quota_exhausted")),
+        "ai_stop_reason":("openrouter_daily_quota" if budget.get("quota_exhausted") else ("request_budget" if budget.get("exhausted") else None)),
+        "ai_error_type":("openrouter_daily_quota" if budget.get("quota_exhausted") else ("request_budget" if budget.get("exhausted") else None)),
         "ai_batch_meta":ai_meta,
         "candidates":sum(1 for x in results if x.get("decision")=="comment"),
         "ai_judge_up":sum(1 for x in results if x.get("judge_vote")=="up"),
