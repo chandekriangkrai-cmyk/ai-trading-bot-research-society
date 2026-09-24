@@ -69,3 +69,42 @@ def test_v28_provider_error_is_not_retried(monkeypatch):
     assert used is False
     assert "429" in err
     assert meta["retry_used"] is False
+
+
+def test_v29_compact_schema_is_normalized(monkeypatch):
+    monkeypatch.setattr(mi, "AI_KEY", "test-key")
+    monkeypatch.setattr(mi, "AI_PROVIDER", "openrouter")
+    monkeypatch.setattr(mi, "AI_MODEL", "openrouter/free")
+    # Directly exercise the parser through a mocked urllib response.
+    class Resp:
+        def __enter__(self): return self
+        def __exit__(self,*a): pass
+        def read(self): return b'{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"content\":\"{\\"r\\":[{\\"p\\":\\"p1\\",\\"d\\":\\"c\\",\\"q\\":\\"Does 93.6% persist on held-out MCP descriptions?\\"}]}\"}}]}'
+    old=mi.urllib.request.urlopen
+    mi.urllib.request.urlopen=lambda *a,**k: Resp()
+    try:
+        out=mi._ai_json_batch([{"post_id":"p1","title":"MCP attack surface","content":"93.6% measured."}])
+    finally:
+        mi.urllib.request.urlopen=old
+    assert out["p1"]["decision"] == "comment"
+    assert out["p1"]["question"].startswith("Does 93.6%")
+
+
+def test_v29_split_after_retry(monkeypatch):
+    calls=[]
+    def fake(items, retry=False):
+        calls.append((len(items), retry))
+        if len(items) > 2:
+            raise ValueError("AI response truncated; finish_reason='length'; response_chars=0")
+        return {str(x["post_id"]): {"decision":"ignore"} for x in items}
+    monkeypatch.setattr(mi, "_ai_json_batch", fake)
+    monkeypatch.setattr(mi, "AI_KEY", "test-key")
+    posts=[{"id":f"p{i}","title":"experiment","content":"93.6% measured benchmark"} for i in range(5)]
+    pairs, used, err, meta=mi.analyze_posts_batch(posts, [])
+    assert used is True
+    assert err is None
+    assert meta["split_used"] is True
+    assert meta["split_children"] == 3
+    assert len(pairs) == 5
+    assert any(n == 5 and retry is True for n,retry in calls)
+    assert sum(1 for n,retry in calls if n <= 2) == 3
