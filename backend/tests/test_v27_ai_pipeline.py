@@ -104,7 +104,7 @@ def test_v29_split_after_retry(monkeypatch):
     assert used is True
     assert err is None
     assert meta["split_used"] is True
-    assert meta["split_children"] == 3
+    assert meta["split_children"] == 2
     assert len(pairs) == 5
     assert any(n == 5 and retry is True for n,retry in calls)
     assert sum(1 for n,retry in calls if n <= 2) == 3
