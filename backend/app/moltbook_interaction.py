@@ -154,6 +154,7 @@ For comment, add question: one natural sentence, <= 220 characters.
 The question must mention a concrete anchor from the post and ask about replication, measurement validity,
 controls, boundary conditions, or falsification. Do not invent facts. Do not give trading signals.
 Never begin the question with: For, You report, The post, or How would you validate this claim.
+The question must be a complete sentence and must end with ?. Never end mid-clause or with a dangling conjunction/preposition.
 Do not expose proprietary EA source code, exact indicators, thresholds, parameters, entry/exit rules, secrets,
 credentials, or private data.
 Output shape: {\"results\":[{\"post_id\":\"...\",\"decision\":\"ignore\"|\"comment\",\"question\":\"...\"}]}
@@ -171,8 +172,8 @@ For ignore, omit question.
     user_text = json.dumps({"posts": user_items}, ensure_ascii=False)
     max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "650"))
     if retry:
-        max_tokens = min(max_tokens, 450)
-        system += "\nBe extremely compact: question <= 180 characters."
+        max_tokens = min(max_tokens, 420)
+        system += "\nBe extremely compact: question <= 180 characters; end every question with a question mark."
 
     if AI_PROVIDER == "openrouter":
         body = json.dumps({
@@ -282,7 +283,11 @@ For ignore, omit question.
         else: decision="ignore"
         normalized={"post_id":pid,"decision":decision}
         if row.get("question") or row.get("q"):
-            normalized["question"]=str(row.get("question") or row.get("q"))[:220]
+            q=str(row.get("question") or row.get("q") or "").strip()
+            if _question_complete(q):
+                normalized["question"]=q
+            else:
+                normalized["question_incomplete"]=True
         if pid and pid in valid_ids:
             out[pid]=normalized
     if not out:
@@ -1156,11 +1161,33 @@ def _recent_outbound_comments(db, limit: int = 30) -> list[str]:
     return [str(row[0]) for row in rows if row and row[0]]
 
 
+def _question_complete(question: str) -> bool:
+    """V32: reject truncated or structurally incomplete AI research questions."""
+    q=sanitize_public_text(question or "").strip()
+    if len(q) < 45 or len(q) > 240:
+        return False
+    if "?" not in q or not q.endswith("?"):
+        return False
+    if q.count("?") != 1:
+        return False
+    if re.search(r"(?:,|:|;|[-–—])\s*$", q):
+        return False
+    # Common truncation/dangling endings produced when a model hits its output limit.
+    if re.search(r"(?i)\b(?:and|or|but|with|without|for|to|of|from|by|under|versus|vs|that|which|whether|because|while|as|than|despite|including)\s*\?\s*$", q):
+        return False
+    # Unbalanced delimiters are another strong signal of a cut-off response.
+    for left, right in (("(", ")"), ("[", "]"), ("{", "}")):
+        if q.count(left) != q.count(right):
+            return False
+    return True
+
+
 def _ai_comment_safe(title: str, content: str, comment: str) -> bool:
     """V30 AI guard: grounded in the actual post, without requiring an evidence-gap extractor match."""
     if not comment: return False
     c=sanitize_public_text(comment).strip()
     if len(c) < 35 or len(c) > 500: return False
+    if not _question_complete(c): return False
     if re.match(r"(?i)^\s*(?:for\b|you report\b|the post\b|how would you validate this claim\b)", c): return False
     if "http://" in c.lower() or "https://" in c.lower(): return False
     if not _comment_domain_safe(title, content, c): return False
@@ -1201,6 +1228,10 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
     content=str(result.get("content") or heuristic.get("content") or "")
     if result["decision"] != "comment":
         result["comment"]=None; result["comment_source"]="none"; return result
+    if bool(ai.get("question_incomplete")):
+        result["decision"]="ignore"; result["comment"]=None; result["comment_source"]="none"
+        result["reason"]="AI question rejected: incomplete or truncated sentence"
+        return result
     ai_comment=sanitize_public_text(str(ai.get("comment") or ai.get("question") or "")).strip()
     if _ai_comment_safe(title, content, ai_comment):
         result["comment"]=ai_comment
@@ -1234,7 +1265,7 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
         prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:6000],"heuristic":heuristic})
     if budget is None:
         budget={"limit":48,"used":0,"exhausted":False}
-    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False,"split_used":False,"split_children":0,"ai_requests_used":0,"budget_exhausted":False}
+    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False,"split_used":False,"split_children":0,"ai_requests_used":0,"budget_exhausted":False,"split_depth":split_depth,"incomplete_questions_rejected":0}
     if not prepared or not AI_KEY:
         return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,None,meta
     def _call_ai(items: list[dict[str, Any]], retry: bool = False):
@@ -1265,7 +1296,15 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
                 retry_text=str(retry_exc).lower()
                 split_retryable=("truncated" in retry_text or "parse failed" in retry_text or "contained no valid" in retry_text) and "http 429" not in retry_text and "rate limit" not in retry_text and "budget exhausted" not in retry_text
                 if allow_split and len(prepared) > 1 and split_retryable and int(budget.get("used",0)) < int(budget.get("limit",48)):
-                    chunks=([posts[j:j+2] for j in range(0,len(posts),2)] if len(posts) > 2 else [[x] for x in posts])
+                    # V32: balanced split reduces request amplification. A 5-post failure
+                    # becomes 3+2 instead of 2+2+1; deeper splitting is only used if a
+                    # child actually fails again. This preserves the V31 recovery path
+                    # while avoiding unnecessary singleton calls.
+                    if len(posts) > 2:
+                        cut=(len(posts)+1)//2
+                        chunks=[posts[:cut], posts[cut:]]
+                    else:
+                        chunks=[[x] for x in posts]
                     meta["split_used"]=True
                     meta["split_children"]=len(chunks)
                     child_results=[]; child_meta=[]
