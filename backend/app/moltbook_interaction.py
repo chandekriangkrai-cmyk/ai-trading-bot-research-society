@@ -182,7 +182,7 @@ For every post, self-classify scope as in_scope, out_of_scope, or uncertain.
 - in_scope + low-value, generic, spammy, repetitive, unsupported/unfalsifiable, misleading, or otherwise not useful -> decision=comment, vote=down.
 - credible content that promotes or meaningfully facilitates harm/threats to humans -> vote=down as a safety override.
 The DOWN vote must describe a quality/safety failure, never scope mismatch alone.
-For comment, self-evaluate the proposed question using evidence grounding, specificity/falsifiability, research value, naturalness, and domain match. Confidence is 0..1. Keep judge_reason <= 90 characters.
+For comment, self-evaluate the proposed question using evidence grounding, specificity/falsifiability, research value, naturalness, and domain match. Confidence is 0..1. Keep judge_reason <= 45 characters.
 Output shape: {\"results\":[{\"post_id\":\"...\",\"scope\":\"in_scope\"|\"out_of_scope\"|\"uncertain\",\"decision\":\"ignore\"|\"comment\",\"question\":\"...\",\"vote\":\"up\"|\"down\"|\"no_vote\",\"confidence\":0.0,\"judge_reason\":\"...\"}]}
 For out_of_scope or uncertain, use vote=no_vote and omit question.
 """
@@ -196,7 +196,7 @@ For out_of_scope or uncertain, use vote=no_vote and omit question.
             "content": str(x.get("content") or "")[:2200],
         })
     user_text = json.dumps({"posts": user_items}, ensure_ascii=False)
-    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "520"))
+    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "620"))
     if retry:
         max_tokens = min(max_tokens, 360)
         system += "\nBe extremely compact: question <= 150 characters; judge_reason <= 45 characters; no filler."
@@ -1320,7 +1320,7 @@ def analyze_post(post: dict[str, Any], recent_texts: list[str]) -> dict[str, Any
 
 
 def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[str], allow_split: bool = True, split_depth: int = 0, budget: dict[str, Any] | None = None):
-    """V30: compact AI call, retry, then recursively split failed batches to single-post calls."""
+    """V38: compact AI call, one retry, then at most one balanced split (no recursive split)."""
     prepared=[]; heuristics={}
     for post in posts:
         pid=_post_id(post)
@@ -1374,7 +1374,7 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
                 # discarding otherwise valid AI decisions.
                 retry_text=str(retry_exc).lower()
                 split_retryable=("truncated" in retry_text or "parse failed" in retry_text or "contained no valid" in retry_text) and "http 429" not in retry_text and "rate limit" not in retry_text and "budget exhausted" not in retry_text
-                if allow_split and len(prepared) > 1 and split_retryable and int(budget.get("used",0)) < int(budget.get("limit",50)):
+                if allow_split and split_depth < 1 and len(prepared) > 1 and split_retryable and int(budget.get("used",0)) < int(budget.get("limit",50)):
                     # V32: balanced split reduces request amplification. A 5-post failure
                     # becomes 3+2 instead of 2+2+1; deeper splitting is only used if a
                     # child actually fails again. This preserves the V31 recovery path
@@ -1393,7 +1393,7 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
                             all_ok=False
                             first_child_err=budget.get("quota_error") or "OpenRouter daily free-model quota exhausted"
                             break
-                        cp,cu,ce,cm=_analyze_posts_batch_once(chunk,recent_texts,allow_split=True,split_depth=split_depth+1,budget=budget)
+                        cp,cu,ce,cm=_analyze_posts_batch_once(chunk,recent_texts,allow_split=False,split_depth=split_depth+1,budget=budget)
                         child_results.extend(cp); child_meta.append(cm)
                         if not cu:
                             all_ok=False
@@ -1489,7 +1489,7 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         except Exception as exc:
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
 
-    batch_size=max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "5")))
+    batch_size=max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "4")))
     ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "50")))
     budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]
