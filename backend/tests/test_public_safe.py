@@ -1,3 +1,4 @@
+import os
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from app.public_safety import sanitize_public_text, sanitize_public_payload
@@ -31,5 +32,5 @@ def test_payload_hides_internal_keys_by_default():
 
 def test_public_record_label():
     # Contract test: public build_post must use a public research label.
-    src = open("app/api/moltbook.py", encoding="utf-8").read()
+    src = open(os.path.join(os.path.dirname(__file__), "..", "app", "api", "moltbook.py"), encoding="utf-8").read()
     assert 'Experiment: Public Research Record' in src

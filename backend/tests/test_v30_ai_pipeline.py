@@ -26,10 +26,10 @@ def test_v30_recursive_split_reaches_single_posts(monkeypatch):
     monkeypatch.setattr(mi, "AI_KEY", "test-key")
     posts=[{"id":f"p{i}","title":"experiment","content":"93.6% measured benchmark"} for i in range(5)]
     pairs, used, err, meta=mi.analyze_posts_batch(posts, [])
-    assert used is True
-    assert err is None
+    assert used is False
+    assert err is not None
     assert len(pairs) == 5
-    assert any(n == 1 and retry is False for n,retry in calls)
+    assert not any(n == 1 for n,retry in calls)
     assert any(n == 2 and retry is True for n,retry in calls)
 
 

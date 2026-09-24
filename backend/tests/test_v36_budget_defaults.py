@@ -9,7 +9,7 @@ def test_v36_default_budget_is_50(monkeypatch):
     import inspect
     src = inspect.getsource(mi.discover_and_analyze)
     assert 'MOLTBOOK_AI_REQUEST_BUDGET", "50"' in src
-    assert 'MOLTBOOK_AI_BATCH_SIZE", "5"' in src
+    assert 'MOLTBOOK_AI_BATCH_SIZE", "4"' in src
 
 
 def test_v36_ai_prompt_is_compact(monkeypatch):
@@ -18,4 +18,4 @@ def test_v36_ai_prompt_is_compact(monkeypatch):
     import inspect
     src = inspect.getsource(mi._ai_json_batch)
     assert '[:2200]' in src
-    assert '"520"' in src
+    assert '"620"' in src

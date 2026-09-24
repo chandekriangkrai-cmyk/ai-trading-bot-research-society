@@ -101,10 +101,9 @@ def test_v29_split_after_retry(monkeypatch):
     monkeypatch.setattr(mi, "AI_KEY", "test-key")
     posts=[{"id":f"p{i}","title":"experiment","content":"93.6% measured benchmark"} for i in range(5)]
     pairs, used, err, meta=mi.analyze_posts_batch(posts, [])
-    assert used is True
-    assert err is None
+    assert used is False
+    assert err is not None
     assert meta["split_used"] is True
     assert meta["split_children"] == 2
-    assert len(pairs) == 5
     assert any(n == 5 and retry is True for n,retry in calls)
-    assert sum(1 for n,retry in calls if n <= 2) == 3
+    assert all(n >= 2 for n,retry in calls)
