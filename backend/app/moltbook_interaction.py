@@ -167,7 +167,7 @@ Return JSON ONLY. No markdown, no explanations, no extra keys.
 For every input post return exactly one object with post_id and decision.
 Use decision=\"ignore\" for social/promotional/opinion content or when no concrete research question is justified.
 Use decision=\"comment\" only when one specific, falsifiable research question is grounded in the post.
-For comment, add question: one natural sentence, <= 220 characters.
+For comment, add question: one natural sentence, <= 160 characters.
 The question must mention a concrete anchor from the post and ask about replication, measurement validity,
 controls, boundary conditions, or falsification. Do not invent facts. Do not give trading signals.
 Never begin the question with: For, You report, The post, or How would you validate this claim.
@@ -176,14 +176,15 @@ Do not expose proprietary EA source code, exact indicators, thresholds, paramete
 credentials, or private data.
 Separate SCOPE from QUALITY. Never use DOWN merely because a post is outside the trading/research scope.
 For every post, self-classify scope as in_scope, out_of_scope, or uncertain.
-- out_of_scope -> decision=ignore, vote=no_vote. This is neutral/ignore, NOT a negative judgment.
-- uncertain scope or insufficient evidence -> decision=ignore, vote=no_vote.
-- in_scope + useful, specific, evidence-grounded, falsifiable research value -> decision=comment, vote=up.
-- in_scope + low-value, generic, spammy, repetitive, unsupported/unfalsifiable, misleading, or otherwise not useful -> decision=comment, vote=down.
-- credible content that promotes or meaningfully facilitates harm/threats to humans -> vote=down as a safety override.
+- out_of_scope -> vote=no_vote. This is neutral/ignore, NOT a negative judgment.
+- uncertain scope or insufficient evidence -> vote=no_vote.
+- in_scope + useful, specific, evidence-grounded, falsifiable research value -> vote=up.
+- in_scope + low-value, generic, spammy, repetitive, unsupported/unfalsifiable, misleading, or otherwise not useful -> vote=down.
+- credible content that promotes or meaningfully facilitates harm/threats to humans -> h=true and vote=down as a safety override.
 The DOWN vote must describe a quality/safety failure, never scope mismatch alone.
-For comment, self-evaluate the proposed question using evidence grounding, specificity/falsifiability, research value, naturalness, and domain match. Confidence is 0..1. Keep judge_reason <= 45 characters.
-Output shape: {\"results\":[{\"post_id\":\"...\",\"scope\":\"in_scope\"|\"out_of_scope\"|\"uncertain\",\"decision\":\"ignore\"|\"comment\",\"question\":\"...\",\"vote\":\"up\"|\"down\"|\"no_vote\",\"confidence\":0.0,\"judge_reason\":\"...\"}]}
+For comment, self-evaluate the proposed question using evidence grounding, specificity/falsifiability, research value, naturalness, and domain match. Confidence is 0..1. Keep judge_reason <= 30 characters.
+Use compact keys only: p=post_id, s=scope, v=vote, q=question, c=confidence, j=judge_reason, h=harmful.
+Output shape: {"r":[{"p":"...","s":"in_scope","v":"up","q":"...","c":0.9,"j":"specific validation","h":false}]}
 For out_of_scope or uncertain, use vote=no_vote and omit question.
 """
     # Keep the input bounded as well; the model has enough context to anchor a
@@ -193,13 +194,13 @@ For out_of_scope or uncertain, use vote=no_vote and omit question.
         user_items.append({
             "post_id": x.get("post_id"),
             "title": str(x.get("title") or "")[:500],
-            "content": str(x.get("content") or "")[:2200],
+            "content": str(x.get("content") or "")[:1800],
         })
     user_text = json.dumps({"posts": user_items}, ensure_ascii=False)
-    max_tokens = int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "620"))
+    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "420")), 420)
     if retry:
-        max_tokens = min(max_tokens, 360)
-        system += "\nBe extremely compact: question <= 150 characters; judge_reason <= 45 characters; no filler."
+        max_tokens = min(max_tokens, 280)
+        system += "\nBe extremely compact: q <= 160 characters; j <= 30 characters; one JSON object per post; no filler."
 
     if AI_PROVIDER == "openrouter":
         body = json.dumps({
@@ -268,14 +269,14 @@ For out_of_scope or uncertain, use vote=no_vote and omit question.
                     if isinstance(c, dict) and c.get("text"): chunks.append(str(c["text"]))
             text="\n".join(chunks)
 
-    if finish_reason == "length":
-        raise ValueError(f"AI response truncated; finish_reason='length'; response_chars={len(text)}")
-
     def _parse_payload(raw: str):
         raw=(raw or "").strip()
         if not raw: return None
         candidates=[raw]
         candidates.extend(re.findall(r"```(?:json)?\s*(.*?)```", raw, re.S|re.I))
+        # Also salvage complete JSON objects from a response cut off after one or
+        # more valid rows. This avoids spending another request just because the
+        # final row was truncated.
         for opener, closer in (("{","}"),("[","]")):
             pos=raw.find(opener)
             while pos >= 0:
@@ -294,12 +295,17 @@ For out_of_scope or uncertain, use vote=no_vote and omit question.
                         if depth==0:
                             candidates.append(raw[pos:i+1]); break
                 pos=raw.find(opener, pos+1)
+        # Individual row extraction is deliberately broader than the outer
+        # payload parser, so a truncated results array can still yield rows.
+        for m in re.finditer(r"\{[^{}]{0,1200}\}", raw, re.S):
+            candidates.append(m.group(0))
         for candidate in candidates:
             try: obj=json.loads(candidate.strip())
             except Exception: continue
             if isinstance(obj, dict) and isinstance(obj.get("results"), list): return obj["results"]
             if isinstance(obj, dict) and isinstance(obj.get("r"), list): return obj["r"]
             if isinstance(obj, list): return obj
+            if isinstance(obj, dict) and (obj.get("p") or obj.get("post_id")): return [obj]
         return None
 
     parsed=_parse_payload(text)
@@ -311,29 +317,29 @@ For out_of_scope or uncertain, use vote=no_vote and omit question.
         if not isinstance(row, dict): continue
         # V29 compact schema: p=post_id, d=decision, q=question.
         pid=str(row.get("post_id") or row.get("p") or "")
-        decision=str(row.get("decision") or row.get("d") or "ignore").lower()
-        if decision in {"c", "comment"}: decision="comment"
-        else: decision="ignore"
-        normalized={"post_id":pid,"decision":decision}
+        vote=str(row.get("vote") or row.get("v") or "").strip().lower()
+        scope=str(row.get("scope") or row.get("s") or "").strip().lower()
+        harmful=bool(row.get("harmful") or row.get("h"))
+        if vote not in {"up","down","no_vote"}: vote="no_vote"
+        if scope not in {"in_scope","out_of_scope","uncertain"}: scope="uncertain"
+        decision="comment" if vote in {"up","down"} and (scope == "in_scope" or harmful) else "ignore"
+        normalized={"post_id":pid,"decision":decision,"judge_scope":scope,"judge_vote":vote,"harmful":harmful}
         if row.get("question") or row.get("q"):
             q=str(row.get("question") or row.get("q") or "").strip()
             if _question_complete(q):
                 normalized["question"]=q
             else:
                 normalized["question_incomplete"]=True
-        scope=str(row.get("scope") or row.get("s") or "").strip().lower()
-        if scope in {"in_scope","out_of_scope","uncertain"}: normalized["judge_scope"]=scope
-        vote=str(row.get("vote") or row.get("v") or "").strip().lower()
-        if vote in {"up","down","no_vote"}:
-            normalized["judge_vote"]=vote
-            try:
-                normalized["judge_confidence"]=max(0.0,min(1.0,float(row.get("confidence") if row.get("confidence") is not None else row.get("c",0.0))))
-            except Exception:
-                normalized["judge_confidence"]=0.0
-            normalized["judge_reason"]=str(row.get("judge_reason") or row.get("j") or "").strip()[:120]
+        try:
+            normalized["judge_confidence"]=max(0.0,min(1.0,float(row.get("confidence") if row.get("confidence") is not None else row.get("c",0.0))))
+        except Exception:
+            normalized["judge_confidence"]=0.0
+        normalized["judge_reason"]=str(row.get("judge_reason") or row.get("j") or "").strip()[:80]
         if pid and pid in valid_ids:
             out[pid]=normalized
     if not out:
+        if finish_reason == "length":
+            raise ValueError(f"AI response truncated; finish_reason='length'; response_chars={len(text)}")
         raise ValueError(f"AI response contained no valid post results; finish_reason={finish_reason!r}")
     return out
 
@@ -1276,15 +1282,17 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
     try: result["judge_confidence"]=max(0.0,min(1.0,float(ai.get("judge_confidence",0.0) or 0.0)))
     except Exception: result["judge_confidence"]=0.0
     result["judge_reason"]=str(ai.get("judge_reason") or "AI self-evaluation completed")[:120]
-    if scope in {"out_of_scope","uncertain"} and vote == "down":
+    harmful=bool(ai.get("harmful", False))
+    result["harmful"]=harmful
+    if scope in {"out_of_scope","uncertain"} and vote == "down" and not harmful:
         result["judge_vote"]="no_vote"
-        result["judge_reason"]="Out of scope/uncertain content is neutral; no vote."
+        result["judge_reason"]="Out of scope/uncertain; neutral."
         vote="no_vote"
     title=str(result.get("title") or heuristic.get("title") or "")
     content=str(result.get("content") or heuristic.get("content") or "")
     if result["decision"] != "comment":
         result["comment"]=None; result["comment_source"]="none"; return result
-    if result.get("judge_scope") in {"out_of_scope","uncertain"}:
+    if result.get("judge_scope") in {"out_of_scope","uncertain"} and not bool(result.get("harmful")):
         result["decision"]="ignore"; result["comment"]=None; result["comment_source"]="none"
         result["reason"]="AI Judge no_vote: out-of-scope or uncertain content"
         return result
@@ -1329,7 +1337,7 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
         heuristic=_heuristic_decision(title, content, _novelty(f"{title}\n{content}", recent_texts))
         heuristic["title"]=title; heuristic["content"]=content[:6000]
         heuristics[pid]=heuristic
-        prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:5000],"heuristic":heuristic})
+        prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:4200],"heuristic":heuristic})
     if budget is None:
         budget={"limit":50,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False,"split_used":False,"split_children":0,"ai_requests_used":0,"budget_exhausted":False,"split_depth":split_depth,"incomplete_questions_rejected":0}
@@ -1489,7 +1497,7 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         except Exception as exc:
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
 
-    batch_size=max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "4")))
+    batch_size=min(4, max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "4"))))
     ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "50")))
     budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]

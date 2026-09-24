@@ -31,3 +31,19 @@ def test_ai_judge_up_allows_comment():
     assert out["decision"] == "comment"
     assert out["comment_source"] == "ai"
     assert out["judge_vote"] == "up"
+
+
+def test_out_of_scope_down_is_neutral_no_vote():
+    heuristic={"title":"PostgreSQL beta","content":"database release","relevance_score":0.3,"novelty_score":0.9,"research_value_score":0.4,"decision":"comment","reason":"AI"}
+    ai={"decision":"comment","question":"Does this replicate?","judge_scope":"out_of_scope","judge_vote":"down","judge_confidence":0.9,"judge_reason":"Not trading research"}
+    out=mi._merge_analysis(heuristic, ai)
+    assert out["judge_vote"] == "no_vote"
+    assert out["decision"] == "ignore"
+
+
+def test_harmful_down_can_override_scope():
+    heuristic={"title":"Dangerous agent","content":"threat to humans","relevance_score":0.1,"novelty_score":0.9,"research_value_score":0.1,"decision":"comment","reason":"AI"}
+    ai={"decision":"comment","question":"Does this replicate?","judge_scope":"out_of_scope","judge_vote":"down","harmful":True,"judge_confidence":0.99,"judge_reason":"Human safety threat"}
+    out=mi._merge_analysis(heuristic, ai)
+    assert out["judge_vote"] == "down"
+    assert out["decision"] == "ignore"

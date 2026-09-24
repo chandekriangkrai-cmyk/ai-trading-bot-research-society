@@ -17,7 +17,7 @@ def test_v35_openrouter_daily_quota_is_fatal(monkeypatch):
     monkeypatch.setattr(mi, "AI_KEY", "test-key")
     monkeypatch.setattr(mi, "AI_PROVIDER", "openrouter")
 
-    budget = {"limit": 48, "used": 0, "exhausted": False,
+    budget = {"limit": 50, "used": 0, "exhausted": False,
               "quota_exhausted": False, "quota_error": None}
     posts = [{"id": f"p{i}", "title": "experiment",
               "content": "93.6% measured benchmark"} for i in range(5)]
