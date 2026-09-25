@@ -1730,4 +1730,77 @@ def run_cycle(auto_comment: bool = False, max_comments: int = 1, min_relevance: 
                 outputs.append({"post_id":pid,"status":"comment_failed","error":str(exc)})
         finally:
             db.close()
-    return {"status":"completed","feed_scan":scan,"comments_posted":posted,"outputs":outputs}
+    return {"status":"completed","feed_scan":scan,"comments_posted":posted,"outputs":outputs,"telemetry":_v42_5_classify_ai_failure(scan, posted, outputs)}
+
+# ==================== V42.5 TELEMETRY ====================
+def _v42_5_classify_ai_failure(scan: dict, posted: int = 0, outputs: list | None = None) -> dict:
+    values = []
+
+    def collect(value):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if k in {
+                    "ai_error", "error", "error_type", "ai_error_type",
+                    "ai_stop_reason", "quota_error", "reason"
+                } and v:
+                    values.append(str(v))
+                elif isinstance(v, (dict, list)):
+                    collect(v)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(scan)
+    blob = " ".join(values).lower()
+
+    failures = {
+        "parse_length": 0,
+        "timeout": 0,
+        "provider_error": 0,
+        "openrouter_402": 0,
+        "quota_error": 0,
+    }
+
+    if any(x in blob for x in ("finish_reason", "truncated", "parse failed", "contained no valid")):
+        failures["parse_length"] = 1
+    if "timeout" in blob or "timed out" in blob:
+        failures["timeout"] = 1
+    if "http 402" in blob or "in_flight_budget_exhausted" in blob:
+        failures["openrouter_402"] = 1
+    if "quota" in blob or "rate limit" in blob or "http 429" in blob:
+        failures["quota_error"] = 1
+    if any(x in blob for x in ("http 500", "http 502", "http 503", "http 504", "provider error")):
+        failures["provider_error"] = 1
+
+    return {
+        "version": "V42.5",
+        "ai_requests_used": int(scan.get("ai_requests_used", 0) or 0),
+        "ai_requests_remaining": int(scan.get("ai_requests_remaining", 0) or 0),
+        "valid_results": int(scan.get("ai_valid_results", 0) or 0),
+        "retry_count": int(scan.get("ai_retry_batches", 0) or 0),
+        "retry_successes": int(scan.get("ai_retry_successes", 0) or 0),
+        "failures": failures,
+        "research_candidates": int(scan.get("candidates", 0) or 0),
+        "judge_up": sum(
+            1 for x in scan.get("results", [])
+            if str(x.get("judge_vote") or "").lower() == "up"
+        ),
+        "judge_down": sum(
+            1 for x in scan.get("results", [])
+            if str(x.get("judge_vote") or "").lower() == "down"
+        ),
+        "judge_no_vote": sum(
+            1 for x in scan.get("results", [])
+            if str(x.get("judge_vote") or "").lower() == "no_vote"
+        ),
+        "comments_generated": sum(
+            1 for x in scan.get("results", [])
+            if x.get("draft_comment")
+        ),
+        "comments_posted": int(posted or 0),
+        "actions_failed": sum(
+            1 for x in (outputs or [])
+            if x.get("status") == "comment_failed"
+        ),
+    }
+# ================== END V42.5 TELEMETRY ==================
