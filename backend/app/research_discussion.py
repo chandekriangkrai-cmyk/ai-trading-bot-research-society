@@ -11,9 +11,9 @@ from app.database import SessionLocal
 from app.research_models import Experiment, ExperimentResult, MoltbookPostLink, ResearchDiscussion
 
 
-AI_BASE = os.getenv("RESEARCH_AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-AI_KEY = os.getenv("RESEARCH_AI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
-AI_MODEL = os.getenv("RESEARCH_AI_MODEL", "gpt-5.6-luna")
+AI_BASE = os.getenv("RESEARCH_AI_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+AI_KEY = os.getenv("RESEARCH_AI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
+AI_MODEL = os.getenv("RESEARCH_AI_MODEL", "google/gemini-3.8-flash")
 AI_TIMEOUT = float(os.getenv("RESEARCH_AI_TIMEOUT_SECONDS", "45"))
 
 
@@ -33,40 +33,59 @@ Keep replies conversational and useful for a research community, not promotional
 
 def _post_json(url: str, payload: dict[str, Any]) -> str:
     if not AI_KEY:
-        raise RuntimeError("RESEARCH_AI_API_KEY/OPENAI_API_KEY is not configured")
+        raise RuntimeError(
+            "RESEARCH_AI_API_KEY/OPENROUTER_API_KEY is not configured"
+        )
+
     body = json.dumps({
         "model": AI_MODEL,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
-            {"role": "user", "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}]},
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
         ],
-        "max_output_tokens": int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "700")),
+        "max_tokens": min(
+            int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "700")),
+            700,
+        ),
     }).encode("utf-8")
+
     req = urllib.request.Request(
-        f"{AI_BASE}/responses",
+        f"{AI_BASE}/chat/completions",
         data=body,
-        headers={"Authorization": f"Bearer {AI_KEY}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {AI_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/chandekriangkrai-cmyk/ai-trading-bot-research-society",
+            "X-Title": "AI Trading Bot Research Society",
+        },
         method="POST",
     )
+
     try:
         with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
+            data = json.loads(
+                r.read().decode("utf-8", "replace")
+            )
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
-        raise RuntimeError(f"Research AI HTTP {e.code}: {raw[:1200]}") from e
-    text = data.get("output_text")
-    if text:
-        return str(text).strip()
-    # Defensive parsing for compatible Responses implementations.
-    chunks = []
-    for item in data.get("output", []) or []:
-        for c in item.get("content", []) or []:
-            if isinstance(c, dict) and c.get("text"):
-                chunks.append(str(c["text"]))
-    if chunks:
-        return "\n".join(chunks).strip()
-    raise RuntimeError("Research AI returned no text")
+        raise RuntimeError(
+            f"Research AI HTTP {e.code}: {raw[:1200]}"
+        ) from e
 
+    choices = data.get("choices") or []
+    if choices:
+        message = choices[0].get("message") or {}
+        text = message.get("content")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+    raise RuntimeError("Research AI returned no text")
 
 def _result_context(experiment_id: str) -> dict[str, Any]:
     db = SessionLocal()
