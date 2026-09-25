@@ -188,19 +188,28 @@ def generate_reply(experiment_id: str, comment_text: str, author: str = "unknown
                 "reply": "A concise evidence-grounded reply if decision=reply; otherwise empty",
                 "next_research_question": "optional question for a future experiment",
             },
+                "format_rules": [
+                    "Return ONLY one valid JSON object.",
+                    "Do not use markdown code fences.",
+                    "Do not add prose before or after the JSON.",
+                    "The reply field must contain the actual research reply, not JSON or metadata.",
+                ],
         }
         try:
-            raw = _post_json(f"{AI_BASE}/responses", payload)
+            raw = _post_json(f"{AI_BASE}/chat/completions", payload)
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+                cleaned = re.sub(r"\s*```$", "", cleaned).strip()
             try:
-                match = re.search(r"\{.*\}", raw, re.S)
-                data = json.loads(match.group(0) if match else raw)
+                data = json.loads(cleaned)
             except Exception:
-                data = {
-                    "classification": "research_question",
-                    "decision": "reply",
-                    "reason": "AI produced a prose research response.",
-                    "reply": raw,
-                }
+                match = re.search(r"\{.*\}", cleaned, re.S)
+                if not match:
+                    raise RuntimeError("Research AI returned invalid JSON")
+                data = json.loads(match.group(0))
+            if not isinstance(data, dict):
+                raise RuntimeError("Research AI returned JSON that is not an object")
             data.setdefault("classification", "research_question")
             data.setdefault("decision", "reply")
             data.setdefault("reason", "AI research assessment")
