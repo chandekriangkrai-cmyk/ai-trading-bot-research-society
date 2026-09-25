@@ -208,3 +208,9 @@ def ensure_directories():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+EXTERNAL_CALLS_ENABLED = (
+    os.getenv("V44_EXTERNAL_CALLS_ENABLED", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)

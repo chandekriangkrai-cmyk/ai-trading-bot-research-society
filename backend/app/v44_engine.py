@@ -68,6 +68,7 @@ from .v44_config import (
     START_MINUTE,
     TIMEZONE,
     V44_ENABLED_DEFAULT,
+    EXTERNAL_CALLS_ENABLED,
     ensure_directories,
 )
 from .v44_firewall import HumanOnlyFeedPostFirewall
@@ -114,24 +115,19 @@ class V44Engine:
 
         self.worker_thread = None
 
-        existing = self.memory.get_state(
-            "enabled"
+        # Environment is authoritative at startup.
+        # A stale SQLite value must NEVER re-enable production.
+        self.enabled = bool(V44_ENABLED_DEFAULT)
+
+        self.memory.set_state(
+            "enabled",
+            "1" if self.enabled else "0",
         )
 
-        if existing is None:
-            self.enabled = (
-                V44_ENABLED_DEFAULT
-            )
-            self.memory.set_state(
-                "enabled",
-                "1"
-                if self.enabled
-                else "0",
-            )
-        else:
-            self.enabled = (
-                existing == "1"
-            )
+        self.memory.set_state(
+            "startup_master_switch",
+            "1" if self.enabled else "0",
+        )
 
         self.last_cycle_ts = 0.0
 
@@ -495,21 +491,36 @@ class V44Engine:
         # DRY RUN
         # ------------------------------------------------------------------
 
-        if DRY_RUN:
+        # Triple external-call safety gate.
+        #
+        # Production requires ALL THREE conditions:
+        # 1) V44_ENABLED=1
+        # 2) V44_DRY_RUN=0
+        # 3) V44_EXTERNAL_CALLS_ENABLED=1
+        #
+        # Any false condition blocks external AI/Moltbook calls.
+        if (
+            not V44_ENABLED_DEFAULT
+            or DRY_RUN
+            or not EXTERNAL_CALLS_ENABLED
+        ):
             return {
-                "status": "dry_run",
+                "status": "safe_mode",
                 "activity": activity,
                 "external_call": False,
                 "ai_requests_used": 0,
+                "gates": {
+                    "V44_ENABLED": bool(V44_ENABLED_DEFAULT),
+                    "V44_DRY_RUN": bool(DRY_RUN),
+                    "V44_EXTERNAL_CALLS_ENABLED": bool(
+                        EXTERNAL_CALLS_ENABLED
+                    ),
+                },
                 "message": (
-                    "DRY_RUN is enabled. "
-                    "No Moltbook/OpenRouter write was executed."
+                    "External autonomous activity is blocked "
+                    "by V44 safety gates."
                 ),
             }
-
-        # ------------------------------------------------------------------
-        # NON-AI LOCAL ACTIVITIES
-        # ------------------------------------------------------------------
 
         if activity in {
             "research_memory",
@@ -641,15 +652,24 @@ class V44Engine:
                 discussion_results = []
                 ai_used = 0
 
-                for experiment_id in experiment_ids:
+                # V44.15 HARD QUOTA RULE:
+                #
+                # One V44 cycle has one reserved AI request.
+                # Therefore only one experiment may enter the
+                # AI-backed discussion scanner per cycle.
 
-                    if ai_used >= 1:
-                        break
+                selected_experiment = (
+                    experiment_ids[0]
+                    if experiment_ids
+                    else None
+                )
+
+                if selected_experiment:
 
                     discussion_result = (
                         asyncio.run(
                             scan_discussion(
-                                experiment_id=experiment_id,
+                                experiment_id=selected_experiment,
                                 post_id=None,
                                 auto_reply=True,
                                 max_replies=1,
@@ -662,12 +682,15 @@ class V44Engine:
                         discussion_result
                     )
 
-                    ai_used += int(
-                        discussion_result.get(
-                            "ai_requests_used",
-                            0,
-                        )
-                        or 0
+                    ai_used = min(
+                        1,
+                        int(
+                            discussion_result.get(
+                                "ai_requests_used",
+                                0,
+                            )
+                            or 0
+                        ),
                     )
 
                 result = {
@@ -675,9 +698,15 @@ class V44Engine:
                     "activity":
                         activity,
                     "experiments_checked":
+                        1
+                        if selected_experiment
+                        else 0,
+                    "experiments_available":
                         len(experiment_ids),
                     "ai_requests_used":
                         ai_used,
+                    "hard_cycle_ai_cap":
+                        1,
                     "results":
                         discussion_results,
                 }

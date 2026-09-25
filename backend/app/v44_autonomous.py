@@ -308,38 +308,46 @@ class DailyBudget:
             )
 
     def reserve(self, amount: int = 1) -> None:
-        amount = max(1, int(amount))
+        amount = int(amount)
 
-        with _connect() as conn:
-            self._ensure_row(conn)
+        if amount <= 0:
+            return True
 
-            row = conn.execute(
-                """
-                SELECT reserved
-                FROM ai_budget
-                WHERE day = ?
-                """,
-                (_utc_day(),),
-            ).fetchone()
+        today = self.today()
 
-            reserved = int(row["reserved"] or 0)
+        conn = sqlite3.connect(self.db_path)
 
-            if reserved + amount > self.limit:
-                raise BudgetExhausted(
-                    f"Daily AI budget exhausted: "
-                    f"{reserved}/{self.limit}"
-                )
+        try:
+            self._ensure(conn)
 
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE ai_budget
                 SET reserved = reserved + ?
                 WHERE day = ?
+                  AND reserved + ? <= ?
                 """,
-                (amount, _utc_day()),
+                (
+                    amount,
+                    today,
+                    amount,
+                    self.limit,
+                ),
             )
 
+            if cur.rowcount != 1:
+                conn.rollback()
+                raise BudgetExhausted(
+                    "Daily AI budget exhausted or "
+                    "reservation rejected: "
+                    f"limit={self.limit}"
+                )
+
             conn.commit()
+            return True
+
+        finally:
+            conn.close()
 
     def complete(self) -> None:
         with _connect() as conn:

@@ -1,4 +1,3 @@
-from .api import v44_autonomous
 from contextlib import asynccontextmanager
 import threading
 from fastapi import FastAPI
@@ -7,8 +6,35 @@ from app.config import settings
 from app.database import Base, engine
 from app import models, research_models, ea_files
 from app.api import health, agents, moltbook, interactions, discussion
-from app.api import v44_relationships
 from app import unified_research, discussion_watcher
+from app.v44_engine import V44Engine
+
+# V44.13 autonomous engine singleton.
+v44_engine = V44Engine()
+
+
+def _start_v44_worker():
+    try:
+        from app.v44_config import V44_ENABLED_DEFAULT
+
+        if V44_ENABLED_DEFAULT:
+            v44_engine.ensure_worker()
+            print(
+                "[V44.13] autonomous worker started",
+                flush=True,
+            )
+        else:
+            print(
+                "[V44.13] autonomous worker disabled",
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            f"[V44.13] worker startup blocked: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
 
 def _background_recovery():
     # Recovery can scan many experiment folders. Do not block Render's startup
@@ -39,7 +65,5 @@ app.include_router(unified_research.router,prefix="/api")
 app.include_router(moltbook.router,prefix="/api")
 app.include_router(interactions.router,prefix="/api")
 app.include_router(discussion.router, prefix="/api")
-app.include_router(v44_autonomous.router,prefix="/api")
-app.include_router(v44_relationships.router, prefix="/api")
 @app.get("/",tags=["System"])
 def root(): return {"service":settings.app_name,"version":settings.app_version,"status":"running","docs":"/docs","research_flow":["upload","run","inspect","publish"]}
