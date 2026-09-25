@@ -202,9 +202,12 @@ For s=o or s=u, use v=n and omit q.
     user_text = json.dumps({"posts": user_items}, ensure_ascii=False)
     # V42.1: never ask the free router for a large multi-row response.
 
-    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "220")), 220)
+    # V42.2: 220 tokens was still too small for some OpenRouter/free
+    # models even with only two posts per request.  Keep the JSON compact,
+    # but give the provider enough output room to finish the object.
+    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "480")), 480)
     if retry:
-        max_tokens = min(max_tokens, 140)
+        max_tokens = min(max_tokens, 320)
         system += "\nRETRY MODE: output ONLY compact JSON. q <= 100 chars; j <= 16 chars; one row per post; no explanations; no markdown; no filler."
 
     if AI_PROVIDER == "openrouter":
@@ -315,7 +318,13 @@ For s=o or s=u, use v=n and omit q.
 
     parsed=_parse_payload(text)
     if parsed is None:
-        raise ValueError(f"AI response parse failed; finish_reason={finish_reason!r}; response_chars={len(text)}")
+        # V42.2: retain a tiny diagnostic preview. Never expose the full
+        # provider response because it may contain unexpected/private data.
+        preview = re.sub(r"\s+", " ", text or "")[:180]
+        raise ValueError(
+            f"AI response parse failed; finish_reason={finish_reason!r}; "
+            f"response_chars={len(text)}; preview={preview!r}"
+        )
     out: dict[str, dict[str, Any]] = {}
     valid_ids={str(x.get("post_id")) for x in items if x.get("post_id")}
     for row in parsed:
@@ -347,7 +356,11 @@ For s=o or s=u, use v=n and omit q.
             out[pid]=normalized
     if not out:
         if finish_reason == "length":
-            raise ValueError(f"AI response truncated; finish_reason='length'; response_chars={len(text)}")
+            preview = re.sub(r"\s+", " ", text or "")[:180]
+            raise ValueError(
+                f"AI response truncated; finish_reason='length'; "
+                f"response_chars={len(text)}; preview={preview!r}"
+            )
         raise ValueError(f"AI response contained no valid post results; finish_reason={finish_reason!r}")
     return out
 
@@ -1533,7 +1546,9 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         except Exception as exc:
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
 
-    batch_size=min(2, max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "2"))))
+    # V42.2: default remains 2 for request efficiency.
+    # Operators can lower it to 1 on problematic free-model runs.
+    batch_size=max(1, min(2, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "2"))))
     ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "50")))
     budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]
