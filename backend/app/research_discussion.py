@@ -27,17 +27,107 @@ HYPOTHESIS, and TEST. You may introduce a new research question when the evidenc
 Do not claim causality from a backtest. Do not invent missing market data, indicator values, exit reasons,
 trade states, or statistical tests. If evidence is insufficient, say so plainly.
 For numerical claims, use only numbers explicitly present in the supplied research context. Do not invent,
-estimate, interpolate, or recall performance figures from outside the supplied context. This includes
-percentages, win rates, returns, drawdowns, trade counts, prices, dates used as statistics, and benchmark
-figures. If the supplied context does not contain a number needed to support a claim, state the claim
-qualitatively or say that the evidence is insufficient. Never fabricate a precise number to make an argument
-more convincing.
+estimate, interpolate, infer, calculate, or recall performance figures from outside the supplied context. This includes
+percentages, win rates, returns, drawdowns, trade counts, prices, dates used as statistics, benchmark
+figures, sample sizes, ratios, or any other quantitative claim. If the supplied context does not contain
+a number needed to support a claim, state the claim qualitatively or say that the evidence is insufficient.
+
+IMPORTANT NUMERIC SAFETY RULE:
+For the reply field, prefer zero numeric claims unless a number is explicitly necessary to answer the
+comment and that exact number is visibly present in the supplied research context. Never introduce a
+number merely to make the reply more specific, persuasive, or technical. Never use remembered values
+from previous conversations, previous API calls, hidden model knowledge, or assumptions about the
+experiment. If there is any doubt about whether a number is supported, omit the number and express the
+point qualitatively.
+
+The reply must remain valid even if numerical metrics are removed from the discussion context.
 The EA is proprietary: never reveal, infer, reconstruct, or guess exact indicators, parameter values,
 thresholds, entry/exit rules, source-code details, or other implementation secrets. Discuss only the
 high-level architecture and evidence explicitly supplied in the research context.
 Return ONLY one valid JSON object matching the requested output schema. Do not use markdown fences or add prose outside the JSON.
 Keep replies conversational and useful for a research community, not promotional.
 """
+
+
+def _normalize_numeric_token(token: str) -> str:
+    token = token.strip()
+
+    if not token:
+        return ""
+
+    # Normalize commas in large numbers.
+    token = token.replace(",", "")
+
+    # Normalize percentages while preserving the numeric value.
+    if token.endswith("%"):
+        token = token[:-1]
+
+    try:
+        value = float(token)
+
+        # Decimal normalization:
+        # 0.1000 -> 0.1
+        # 475.0 -> 475
+        if value.is_integer():
+            return str(int(value))
+
+        return format(value, ".15g")
+    except Exception:
+        return token.lower()
+
+
+def _validate_reply_numeric_evidence(
+    reply_text: str,
+    context: Any,
+) -> None:
+    if not reply_text:
+        return
+
+    try:
+        context_text = json.dumps(
+            context,
+            ensure_ascii=False,
+            default=str,
+        )
+    except Exception:
+        context_text = str(context)
+
+    # Extract explicit numeric tokens from the AI reply.
+    reply_numbers = re.findall(
+        r"(?<![A-Za-z])[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)%?",
+        reply_text,
+    )
+
+    if not reply_numbers:
+        return
+
+    # Extract numeric tokens from the supplied research context.
+    context_numbers = re.findall(
+        r"(?<![A-Za-z])[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)%?",
+        context_text,
+    )
+
+    normalized_context = {
+        _normalize_numeric_token(x)
+        for x in context_numbers
+        if _normalize_numeric_token(x)
+    }
+
+    unsupported = []
+
+    for token in reply_numbers:
+        normalized = _normalize_numeric_token(token)
+
+        if normalized and normalized not in normalized_context:
+            unsupported.append(token)
+
+    if unsupported:
+        unique = list(dict.fromkeys(unsupported))
+
+        raise RuntimeError(
+            "AI reply contains unsupported numeric claim(s): "
+            + ", ".join(unique[:20])
+        )
 
 
 def _post_json(url: str, payload: dict[str, Any]) -> str:
@@ -251,6 +341,11 @@ def generate_reply(experiment_id: str, comment_text: str, author: str = "unknown
             data.setdefault("decision", "reply")
             data.setdefault("reason", "AI research assessment")
             data["reply"] = str(data.get("reply") or "").strip() or None
+            if data.get("reply"):
+                _validate_reply_numeric_evidence(
+                    data["reply"],
+                    context,
+                )
             data["ai_status"] = "ok"
             return data
         except Exception as exc:
