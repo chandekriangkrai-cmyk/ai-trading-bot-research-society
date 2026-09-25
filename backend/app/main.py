@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import Base, engine
 from app import models, research_models, ea_files
-from app.api import health, agents, moltbook, interactions, discussion
+from app.api import (health, agents, moltbook, interactions, discussion, v44_autonomous, v44_relationships)
 from app import unified_research, discussion_watcher
 from app.v44_engine import V44Engine
 
@@ -65,5 +65,7 @@ app.include_router(unified_research.router,prefix="/api")
 app.include_router(moltbook.router,prefix="/api")
 app.include_router(interactions.router,prefix="/api")
 app.include_router(discussion.router, prefix="/api")
+app.include_router(v44_autonomous.router, prefix="/api")
+app.include_router(v44_relationships.router, prefix="/api")
 @app.get("/",tags=["System"])
 def root(): return {"service":settings.app_name,"version":settings.app_version,"status":"running","docs":"/docs","research_flow":["upload","run","inspect","publish"]}
