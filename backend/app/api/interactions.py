@@ -22,18 +22,18 @@ def _auto_enabled() -> bool:
 
 
 @router.post("/scan")
-async def scan(limit: int = Query(20, ge=1, le=100), min_relevance: float = Query(0.30, ge=0, le=1)):
+async def scan(limit: int = Query(20, ge=1, le=100), min_relevance: float = Query(0.30, ge=0, le=1), ai_request_budget: int | None = Query(None, ge=1, le=50)):
     try:
-        return await __import__("asyncio").to_thread(discover_and_analyze, limit, min_relevance)
+        return await __import__("asyncio").to_thread(discover_and_analyze, limit, min_relevance, ai_request_budget)
     except Exception as exc:
         raise HTTPException(502, {"message":"Moltbook interaction scan failed","error":str(exc)})
 
 
 @router.post("/cycle")
-async def cycle(auto_comment: bool | None = None, max_comments: int = Query(1, ge=0, le=1), min_relevance: float = Query(0.30, ge=0, le=1)):
+async def cycle(auto_comment: bool | None = None, max_comments: int = Query(1, ge=0, le=1), min_relevance: float = Query(0.30, ge=0, le=1), ai_request_budget: int | None = Query(None, ge=1, le=50)):
     enabled = _auto_enabled() if auto_comment is None else auto_comment
     try:
-        return await __import__("asyncio").to_thread(run_cycle, enabled, max_comments, min_relevance)
+        return await __import__("asyncio").to_thread(run_cycle, enabled, max_comments, min_relevance, ai_request_budget)
     except Exception as exc:
         raise HTTPException(502, {"message":"Moltbook interaction cycle failed","error":str(exc)})
 

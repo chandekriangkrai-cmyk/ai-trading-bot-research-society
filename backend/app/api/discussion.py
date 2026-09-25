@@ -11,6 +11,12 @@ from app.research_models import Experiment, MoltbookPostLink, ResearchDiscussion
 from app.api.moltbook import BASE, TIMEOUT, req, _solve_challenge
 from app.research_discussion import generate_reply
 from app.public_safety import sanitize_public_text, sanitize_public_payload
+from ..v44_verified_comment import (
+    post_comment_auto_verify_sync,
+    is_verified_result,
+    is_pending_result,
+    is_failed_result,
+)
 
 router = APIRouter(prefix="/research-discussion", tags=["Research AI Discussion"])
 
@@ -265,8 +271,183 @@ async def verify_comment(comment_id: str, payload: dict[str, Any]):
     }
 
 
+
+def _post_comment_auto_verify_sync(
+    post_id: str,
+    content: str,
+    parent_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Autonomous comment writer.
+
+    IMPORTANT:
+    - This function can only create a COMMENT.
+    - It cannot create a top-level Feed Post.
+    - Verification uses the existing V43.6 solver.
+    - verification_code is never returned.
+    """
+
+    safe_content = sanitize_public_text(
+        str(content or "")
+    )[:10000]
+
+    payload = {
+        "content": safe_content
+    }
+
+    if parent_id:
+        payload["parent_id"] = str(
+            parent_id
+        )
+
+    status, response = req(
+        "POST",
+        f"{BASE}/posts/{post_id}/comments",
+        _headers(),
+        payload,
+    )
+
+    if status >= 400:
+        raise RuntimeError(
+            f"Moltbook reply failed HTTP {status}: {response}"
+        )
+
+    posted = (
+        response.get("comment", response)
+        if isinstance(response, dict)
+        else response
+    )
+
+    if not isinstance(posted, dict):
+        return {
+            "status": "posted_pending_verification",
+            "verified": False,
+            "comment": posted,
+            "verification_attempted": False,
+            "reason": "Unexpected Moltbook response shape",
+        }
+
+    comment_id = posted.get("id")
+
+    verification = (
+        posted.get("verification")
+        if isinstance(
+            posted.get("verification"),
+            dict,
+        )
+        else None
+    )
+
+    if not verification:
+        return {
+            "status": "posted_pending_verification",
+            "verified": False,
+            "comment_id": (
+                str(comment_id)
+                if comment_id
+                else None
+            ),
+            "comment": posted,
+            "verification_attempted": False,
+            "reason": (
+                "No fresh verification challenge returned"
+            ),
+        }
+
+    challenge = (
+        verification.get("challenge_text")
+        or verification.get("challenge")
+    )
+
+    code = (
+        verification.get("verification_code")
+        or verification.get("code")
+    )
+
+    if not comment_id or not challenge or not code:
+        return {
+            "status": "posted_pending_verification",
+            "verified": False,
+            "comment_id": (
+                str(comment_id)
+                if comment_id
+                else None
+            ),
+            "comment": posted,
+            "verification_attempted": False,
+            "reason": (
+                "Verification data incomplete"
+            ),
+        }
+
+    try:
+        answer, parsed = _solve_challenge(
+            str(challenge)
+        )
+
+    except Exception as exc:
+        return {
+            "status": "posted_pending_verification",
+            "verified": False,
+            "comment_id": str(comment_id),
+            "comment": posted,
+            "verification_attempted": False,
+            "reason": (
+                "V43.6 solver rejected challenge: "
+                + str(exc)
+            ),
+            "challenge_text": str(
+                challenge
+            ),
+        }
+
+    verify_body = {
+        "answer": answer,
+        "verification_code": str(code),
+    }
+
+    verify_status, verify_response = req(
+        "POST",
+        f"{BASE}/verify",
+        _headers(),
+        verify_body,
+    )
+
+    verified = (
+        verify_status < 400
+        and isinstance(
+            verify_response,
+            dict,
+        )
+        and verify_response.get(
+            "success"
+        )
+        is True
+    )
+
+    return {
+        "status": (
+            "verified"
+            if verified
+            else "posted_pending_verification"
+        ),
+        "verified": verified,
+        "comment_id": str(comment_id),
+        "comment": posted,
+        "verification_attempted": True,
+        "answer": answer,
+        "parsed": parsed,
+        "verification_status_code":
+            verify_status,
+        "challenge_text":
+            str(challenge),
+        "verification_response":
+            verify_response,
+    }
+
+
 @router.post("/research/{experiment_id}/scan")
-async def scan_discussion(experiment_id: str, post_id: str | None = Query(None), auto_reply: bool = Query(False), max_replies: int = Query(2, ge=0, le=10)):
+async def scan_discussion(experiment_id: str, post_id: str | None = Query(None), auto_reply: bool = Query(False), max_replies: int = Query(2, ge=0, le=10), ai_request_budget: int | None = Query(None, ge=1, le=50)):
     db = SessionLocal()
     try:
         e = db.query(Experiment).filter(Experiment.id == experiment_id).first()
@@ -285,6 +466,7 @@ async def scan_discussion(experiment_id: str, post_id: str | None = Query(None),
     comments = _extract_comments(body)
     results = []
     reply_count = 0
+    ai_requests_used = 0
 
     for c in comments:
         cid = _comment_id(c)
@@ -297,9 +479,13 @@ async def scan_discussion(experiment_id: str, post_id: str | None = Query(None),
             if existing:
                 results.append({"comment_id": cid, "status": "already_processed", "decision": existing.decision, "reply_comment_id": existing.reply_comment_id})
                 continue
+            if (                ai_request_budget is not None                 and ai_requests_used >= ai_request_budget            ):
+                break
+
             author = _author(c)
             parent = _parent(c)
             result = await asyncio.to_thread(generate_reply, experiment_id, text, author, "")
+            ai_requests_used += 1
             if result.get("reply"):
                 result["reply"] = sanitize_public_text(result["reply"])
             row = ResearchDiscussion(
@@ -320,29 +506,81 @@ async def scan_discussion(experiment_id: str, post_id: str | None = Query(None),
 
             should_reply = auto_reply and result.get("ai_status") == "ok" and row.decision == "reply" and row.draft_reply and reply_count < max_replies
             if should_reply:
-                payload = {"content": row.draft_reply}
-                if parent:
-                    payload["parent_id"] = parent
-                pstatus, pbody = await asyncio.to_thread(req, "POST", f"{BASE}/posts/{resolved_post}/comments", _headers(), payload)
-                if pstatus >= 400:
-                    row.decision = "reply_failed"
-                    row.reason = (row.reason or "") + f" Moltbook reply failed with HTTP {pstatus}."
-                    db.commit()
-                    item["reply_status"] = "failed"
-                    item["reply_response"] = pbody
-                else:
-                    posted = pbody.get("comment", pbody) if isinstance(pbody, dict) else {}
-                    row.reply_comment_id = str(posted.get("id")) if isinstance(posted, dict) and posted.get("id") else None
+                verification_result = await asyncio.to_thread(
+                    _post_comment_auto_verify_sync,
+                    resolved_post,
+                    row.draft_reply,
+                    parent,
+                )
+
+                row.reply_comment_id = (
+                    str(
+                        verification_result.get(
+                            "comment_id"
+                        )
+                    )
+                    if verification_result.get(
+                        "comment_id"
+                    )
+                    else None
+                )
+
+                if verification_result.get(
+                    "verified"
+                ):
                     row.decision = "replied"
-                    db.commit()
-                    reply_count += 1
-                    item["reply_status"] = "posted"
-                    item["reply_comment_id"] = row.reply_comment_id
+                    row.reason = (
+                        row.reason or ""
+                    ) + " Autonomous reply verified by V43.6."
+                    item["reply_status"] = "verified"
+                else:
+                    row.decision = "reply_pending_verification"
+                    row.reason = (
+                        row.reason or ""
+                    ) + " Reply created but verification did not complete."
+                    item["reply_status"] = "pending_verification"
+
+                db.commit()
+
+                reply_count += 1
+
+                item["reply_comment_id"] = (
+                    row.reply_comment_id
+                )
+
+                item["verification"] = {
+                    "attempted":
+                        verification_result.get(
+                            "verification_attempted",
+                            False,
+                        ),
+                    "verified":
+                        verification_result.get(
+                            "verified",
+                            False,
+                        ),
+                    "answer":
+                        verification_result.get(
+                            "answer"
+                        ),
+                    "parsed":
+                        verification_result.get(
+                            "parsed"
+                        ),
+                    "status_code":
+                        verification_result.get(
+                            "verification_status_code"
+                        ),
+                    "reason":
+                        verification_result.get(
+                            "reason"
+                        ),
+                }
             results.append(item)
         finally:
             db.close()
 
-    return {"status": "scanned", "experiment_id": experiment_id, "post_id": resolved_post, "comments_seen": len(comments), "replies_posted": reply_count, "results": results}
+    return {"status": "scanned", "experiment_id": experiment_id, "post_id": resolved_post, "comments_seen": len(comments), "replies_posted": reply_count, "ai_requests_used": ai_requests_used, "results": results}
 
 
 @router.get("/research/{experiment_id}/discussions")

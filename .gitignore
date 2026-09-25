@@ -16,3 +16,7 @@ backend/*.db
 backend/**/*.db
 *.pyc
 backend/**/__pycache__/
+backend/logs/
+backend/reports/*.private
+backend/app/*.pre-v44-9-*
+backend/app/api/*.pre-v44-9-*

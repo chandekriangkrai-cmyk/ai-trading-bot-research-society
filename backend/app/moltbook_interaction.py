@@ -13,6 +13,12 @@ from app.api.moltbook import BASE, TIMEOUT, req
 from app.database import SessionLocal
 from app.public_safety import sanitize_public_text
 from app.research_models import MoltbookInteraction, MoltbookInteractionLead, MoltbookInteractionFeedback
+from .v44_verified_comment import (
+    post_comment_auto_verify_sync,
+    is_verified_result,
+    is_pending_result,
+    is_failed_result,
+)
 
 # Explicit provider selection. Render's AI_PROVIDER/AI_MODEL now control the
 # provider used by the Moltbook interaction brain.
@@ -1574,7 +1580,7 @@ def _configured_ai_request_budget() -> int:
     return max(1, min(AI_REQUEST_BUDGET_MAX, value))
 
 
-def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[str, Any]:
+def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30, ai_request_budget_override: int | None = None) -> dict[str, Any]:
     source, cards, meta=discover_feed(limit=limit)
     me=_self_name()
     recent_texts=[]
@@ -1599,7 +1605,7 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
     # Operators can explicitly set batch size 2, but never above the hard cap.
     batch_size=_configured_batch_size()
     # V42.4: the cycle budget is hard-capped at 50 even if Render env is set higher.
-    ai_request_budget=_configured_ai_request_budget()
+    ai_request_budget=(max(1, min(AI_REQUEST_BUDGET_MAX, int(ai_request_budget_override))) if ai_request_budget_override is not None else _configured_ai_request_budget())
     budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]
     ai_batches_attempted=0; ai_batches_succeeded=0; ai_error=None; ai_valid_results=0; ai_meta=[]
@@ -1667,11 +1673,11 @@ def post_comment(post_id: str, content: str, parent_id: str | None = None) -> di
     return body if isinstance(body,dict) else {"raw":body}
 
 
-def run_cycle(auto_comment: bool = False, max_comments: int = 1, min_relevance: float = 0.30) -> dict[str, Any]:
+def run_cycle(auto_comment: bool = False, max_comments: int = 1, min_relevance: float = 0.30, ai_request_budget_override: int | None = None) -> dict[str, Any]:
     # V15 deliberately allows at most ONE public comment per cycle. This keeps
     # the agent research-focused and makes accidental burst-commenting impossible.
     max_comments=1
-    scan=discover_and_analyze(limit=int(os.getenv("MOLTBOOK_INTERACTION_FEED_LIMIT","40")),min_relevance=min_relevance)
+    scan=discover_and_analyze(limit=int(os.getenv("MOLTBOOK_INTERACTION_FEED_LIMIT","40")),min_relevance=min_relevance,ai_request_budget_override=ai_request_budget_override)
     posted=0
     outputs=[]
     for item in scan["results"]:
@@ -1709,11 +1715,11 @@ def run_cycle(auto_comment: bool = False, max_comments: int = 1, min_relevance: 
                     outputs.append({"post_id":pid,"status":"skipped_duplicate","similarity":round(_comment_similarity(lead.draft_comment, duplicate),4)})
                     continue
 
-                body=post_comment(pid,lead.draft_comment)
+                body = post_comment_auto_verify_sync(pid, lead.draft_comment)
                 posted_obj=body.get("comment",body) if isinstance(body,dict) else {}
                 cid=str(posted_obj.get("id")) if isinstance(posted_obj,dict) and posted_obj.get("id") else None
                 interaction=MoltbookInteraction(post_id=pid,comment_id=cid,direction="outbound",content=lead.draft_comment,
-                    classification=str(item.get("classification") or "research_question"),status="posted",reason=str(item.get("reason") or ""))
+                    classification=str(item.get("classification") or "research_question"),status=("verified" if is_verified_result(body) else "pending_verification" if is_pending_result(body) else "failed"),reason=str(item.get("reason") or ""))
                 db.add(interaction)
                 lead.status="commented"
                 db.commit()
