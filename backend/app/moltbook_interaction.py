@@ -196,14 +196,16 @@ For s=o or s=u, use v=n and omit q.
     for x in items:
         user_items.append({
             "post_id": x.get("post_id"),
-            "title": str(x.get("title") or "")[:500],
-            "content": str(x.get("content") or "")[:1400],
+            "title": str(x.get("title") or "")[:320],
+            "content": str(x.get("content") or "")[:1000],
         })
     user_text = json.dumps({"posts": user_items}, ensure_ascii=False)
-    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "300")), 300)
+    # V42.1: never ask the free router for a large multi-row response.
+
+    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "220")), 220)
     if retry:
-        max_tokens = min(max_tokens, 180)
-        system += "\nBe extremely compact: q <= 120 characters; j <= 20 characters; one object per post; use only compact enum values; no filler."
+        max_tokens = min(max_tokens, 140)
+        system += "\nRETRY MODE: output ONLY compact JSON. q <= 100 chars; j <= 16 chars; one row per post; no explanations; no markdown; no filler."
 
     if AI_PROVIDER == "openrouter":
         body = json.dumps({
@@ -1531,7 +1533,7 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         except Exception as exc:
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
 
-    batch_size=min(3, max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "3"))))
+    batch_size=min(2, max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "2"))))
     ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "50")))
     budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]
