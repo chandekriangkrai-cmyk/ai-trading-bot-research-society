@@ -199,6 +199,8 @@ def generate_reply(experiment_id: str, comment_text: str, author: str = "unknown
                     "The reply field must contain the actual research reply, not JSON or metadata.",
                 ],
         }
+
+        raw = ""
         try:
             raw = _post_json(f"{AI_BASE}/chat/completions", payload)
             cleaned = raw.strip()
@@ -224,6 +226,13 @@ def generate_reply(experiment_id: str, comment_text: str, author: str = "unknown
             fallback = _heuristic_reply(comment_text, context)
             fallback["ai_status"] = "fallback"
             fallback["ai_error"] = str(exc)[:1200]
+
+            # V43.0 diagnostic: expose only bounded model output.
+            # Never expose API keys, headers, or credentials.
+            if raw:
+                fallback["ai_raw_length"] = len(raw)
+                fallback["ai_raw_preview"] = raw[:2000]
+
             return fallback
 
     fallback = _heuristic_reply(comment_text, context)
