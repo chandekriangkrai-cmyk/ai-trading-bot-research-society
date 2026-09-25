@@ -40,6 +40,87 @@ Keep replies conversational and useful for a research community, not promotional
 """
 
 
+def _normalize_numeric_token(token: str) -> str:
+    token = token.strip()
+
+    if not token:
+        return ""
+
+    # Normalize commas in large numbers.
+    token = token.replace(",", "")
+
+    # Normalize percentages while preserving the numeric value.
+    if token.endswith("%"):
+        token = token[:-1]
+
+    try:
+        value = float(token)
+
+        # Decimal normalization:
+        # 0.1000 -> 0.1
+        # 475.0 -> 475
+        if value.is_integer():
+            return str(int(value))
+
+        return format(value, ".15g")
+    except Exception:
+        return token.lower()
+
+
+def _validate_reply_numeric_evidence(
+    reply_text: str,
+    context: Any,
+) -> None:
+    if not reply_text:
+        return
+
+    try:
+        context_text = json.dumps(
+            context,
+            ensure_ascii=False,
+            default=str,
+        )
+    except Exception:
+        context_text = str(context)
+
+    # Extract explicit numeric tokens from the AI reply.
+    reply_numbers = re.findall(
+        r"(?<![A-Za-z])[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)%?",
+        reply_text,
+    )
+
+    if not reply_numbers:
+        return
+
+    # Extract numeric tokens from the supplied research context.
+    context_numbers = re.findall(
+        r"(?<![A-Za-z])[-+]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)%?",
+        context_text,
+    )
+
+    normalized_context = {
+        _normalize_numeric_token(x)
+        for x in context_numbers
+        if _normalize_numeric_token(x)
+    }
+
+    unsupported = []
+
+    for token in reply_numbers:
+        normalized = _normalize_numeric_token(token)
+
+        if normalized and normalized not in normalized_context:
+            unsupported.append(token)
+
+    if unsupported:
+        unique = list(dict.fromkeys(unsupported))
+
+        raise RuntimeError(
+            "AI reply contains unsupported numeric claim(s): "
+            + ", ".join(unique[:20])
+        )
+
+
 def _post_json(url: str, payload: dict[str, Any]) -> str:
     if not AI_KEY:
         raise RuntimeError(
@@ -251,6 +332,11 @@ def generate_reply(experiment_id: str, comment_text: str, author: str = "unknown
             data.setdefault("decision", "reply")
             data.setdefault("reason", "AI research assessment")
             data["reply"] = str(data.get("reply") or "").strip() or None
+            if data.get("reply"):
+                _validate_reply_numeric_evidence(
+                    data["reply"],
+                    context,
+                )
             data["ai_status"] = "ok"
             return data
         except Exception as exc:
