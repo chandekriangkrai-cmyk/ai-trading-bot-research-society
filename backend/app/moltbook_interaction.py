@@ -171,7 +171,7 @@ For comment, add question: one natural sentence, <= 160 characters.
 The question must mention a concrete anchor from the post and ask about replication, measurement validity,
 controls, boundary conditions, or falsification. Do not invent facts. Do not give trading signals.
 Never begin the question with: For, You report, The post, or How would you validate this claim.
-The question must be a complete sentence and must end with ?. Never end mid-clause or with a dangling conjunction/preposition.
+The question must be a complete sentence, end with ?, and contain only the question itself. Never copy lead-in prose such as "You report", "Then I read", "I caught myself", or narrative about reading the post. Never end mid-clause or with a dangling conjunction/preposition.
 Do not expose proprietary EA source code, exact indicators, thresholds, parameters, entry/exit rules, secrets,
 credentials, or private data.
 Separate SCOPE from QUALITY. Never use DOWN merely because a post is outside the trading/research scope.
@@ -200,9 +200,9 @@ For s=o or s=u, use v=n and omit q.
             "content": str(x.get("content") or "")[:1400],
         })
     user_text = json.dumps({"posts": user_items}, ensure_ascii=False)
-    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "360")), 360)
+    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "300")), 300)
     if retry:
-        max_tokens = min(max_tokens, 220)
+        max_tokens = min(max_tokens, 180)
         system += "\nBe extremely compact: q <= 120 characters; j <= 20 characters; one object per post; use only compact enum values; no filler."
 
     if AI_PROVIDER == "openrouter":
@@ -1237,6 +1237,33 @@ def _question_complete(question: str) -> bool:
     return True
 
 
+def _normalize_ai_question(title: str, content: str, question: str) -> str:
+    # V42: keep only a clean, single research question. Fail closed.
+    q = re.sub(r"\s+", " ", str(question or "")).strip()
+    q = q.replace("```", "").strip()
+    if not q:
+        return ""
+    q = re.sub(r"^(?:You report|Then I read|I read|I caught myself|The post reports|The author reports)\s*[:,\-]?\s*", "", q, flags=re.I)
+    m = re.search(r"(.{20,260}?\?)", q)
+    if not m:
+        return ""
+    q = m.group(1).strip()
+    if q.lower().startswith(("you report", "then i read", "i caught myself", "the post reports")):
+        return ""
+    if "```" in q or "{" in q or "}" in q:
+        return ""
+    if not q.endswith("?"):
+        return ""
+    if len(q) > 120:
+        q = q[:120].rsplit(" ", 1)[0].rstrip(" ,;:-") + "?"
+    if len(q) < 25:
+        return ""
+    if re.search(r"(?:\b(?:and|or|but|because|with|to|of|for|from|than|that)\s*)\?$", q, re.I):
+        return ""
+    if not _comment_matches_title_domain(title, q):
+        return ""
+    return q
+
 def _ai_comment_safe(title: str, content: str, comment: str) -> bool:
     """V30 AI guard: grounded in the actual post, without requiring an evidence-gap extractor match."""
     if not comment: return False
@@ -1306,7 +1333,8 @@ def _merge_analysis(heuristic: dict[str, Any], ai: dict[str, Any] | None) -> dic
         result["decision"]="ignore"; result["comment"]=None; result["comment_source"]="none"
         result["reason"]="AI question rejected: incomplete or truncated sentence"
         return result
-    ai_comment=sanitize_public_text(str(ai.get("comment") or ai.get("question") or "")).strip()
+    ai_comment=_normalize_ai_question(title, content, str(ai.get("comment") or ai.get("question") or ""))
+    ai_comment=sanitize_public_text(ai_comment).strip()
     if _ai_comment_safe(title, content, ai_comment):
         vote=str(result.get("judge_vote") or "no_vote")
         if vote != "up":
@@ -1448,7 +1476,7 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
 def analyze_posts_batch(posts: list[dict[str, Any]], recent_texts: list[str], budget: dict[str, Any] | None = None):
     if budget is None:
         budget={"limit":50,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
-    return _analyze_posts_batch_once(posts, recent_texts, allow_split=True, split_depth=0, budget=budget)
+    return _analyze_posts_batch_once(posts, recent_texts, allow_split=False, split_depth=0, budget=budget)
 
 def persist_lead(post: dict[str, Any], analysis: dict[str, Any], status: str = "draft") -> str:
     db=SessionLocal()
@@ -1503,7 +1531,7 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         except Exception as exc:
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
 
-    batch_size=min(5, max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "5"))))
+    batch_size=min(3, max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "3"))))
     ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "50")))
     budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]
