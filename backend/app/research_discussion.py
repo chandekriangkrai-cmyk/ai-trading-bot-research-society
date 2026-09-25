@@ -16,6 +16,8 @@ AI_KEY = os.getenv("RESEARCH_AI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY",
 AI_MODEL = os.getenv("RESEARCH_AI_MODEL", "google/gemini-3.8-flash")
 AI_TIMEOUT = float(os.getenv("RESEARCH_AI_TIMEOUT_SECONDS", "45"))
 
+_AI_LAST_META: dict[str, object] = {}
+
 
 SYSTEM_PROMPT = """You are the independent research scientist for an AI Trading Bot Research Society.
 Your personality is curious, skeptical, technically rigorous, and willing to disagree.
@@ -82,7 +84,27 @@ def _post_json(url: str, payload: dict[str, Any]) -> str:
             f"Research AI HTTP {e.code}: {raw[:1200]}"
         ) from e
 
+    global _AI_LAST_META
+
     choices = data.get("choices") or []
+
+    usage = data.get("usage") or {}
+    choice_meta = {}
+
+    if choices:
+        choice_meta = choices[0] or {}
+
+    completion_details = usage.get("completion_tokens_details") or {}
+
+    _AI_LAST_META = {
+        "finish_reason": choice_meta.get("finish_reason"),
+        "usage": usage,
+        "reasoning_tokens": (
+            usage.get("reasoning_tokens")
+            or completion_details.get("reasoning_tokens")
+        ),
+    }
+
     if choices:
         message = choices[0].get("message") or {}
         text = message.get("content")
@@ -232,6 +254,9 @@ def generate_reply(experiment_id: str, comment_text: str, author: str = "unknown
             if raw:
                 fallback["ai_raw_length"] = len(raw)
                 fallback["ai_raw_preview"] = raw[:2000]
+
+            if _AI_LAST_META:
+                fallback["ai_response_meta"] = _AI_LAST_META
 
             return fallback
 
