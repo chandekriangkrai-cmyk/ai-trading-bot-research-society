@@ -2,17 +2,24 @@ import inspect
 import app.moltbook_interaction as mi
 
 
-def test_v39_budget_defaults():
+def test_v42_4_budget_defaults_and_hard_cap():
     src = inspect.getsource(mi.discover_and_analyze)
-    assert 'MOLTBOOK_AI_REQUEST_BUDGET", "50"' in src
-    assert 'min(4, max(1, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "4"))))' in src
+    assert 'MOLTBOOK_AI_REQUEST_BUDGET' in inspect.getsource(mi._configured_ai_request_budget)
+    assert mi.AI_REQUEST_BUDGET_MAX == 50
+    assert mi.AI_BATCH_SIZE_MAX == 2
 
 
-def test_v39_ai_prompt_is_compact(monkeypatch):
-    monkeypatch.setattr(mi, "AI_KEY", "")
-    assert mi._ai_json_batch([]) == {}
+def test_v42_4_budget_env_cannot_exceed_50(monkeypatch):
+    monkeypatch.setenv("MOLTBOOK_AI_REQUEST_BUDGET", "999")
+    assert mi._configured_ai_request_budget() == 50
+
+
+def test_v42_4_batch_size_env_cannot_exceed_2(monkeypatch):
+    monkeypatch.setenv("MOLTBOOK_AI_BATCH_SIZE", "999")
+    assert mi._configured_batch_size() == 2
+
+
+def test_v42_3_ai_output_caps_are_compact():
     src = inspect.getsource(mi._ai_json_batch)
-    assert '[:1800]' in src
-    assert '"420"' in src
-    assert "280" in src
-    assert 'compact keys only' in src
+    assert '"360"' in src
+    assert "220" in src

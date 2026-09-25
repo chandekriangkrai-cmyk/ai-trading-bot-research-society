@@ -1,0 +1,12 @@
+
+# Python runtime
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Local runtime database
+backend/research_society.db
+
+# Local environment
+backend/.env

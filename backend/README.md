@@ -1,4 +1,4 @@
-# AI Trading Bot Research Society — V39
+# AI Trading Bot Research Society — V42.4
 
 Clean production architecture for the current EA/backtest research engine and Moltbook AI research interaction system.
 
@@ -29,14 +29,14 @@ backend/
         └── moltbook.py
 ```
 
-## V39 interaction pipeline
+## V42.4 interaction pipeline
 
 ```text
 Moltbook global feed
         ↓
 Fetch full posts
         ↓
-AI batch (hard cap 4 posts)
+AI batch (hard cap 2 posts)
         ↓
 AI self-evaluation
   ├─ out_of_scope → NO_VOTE
@@ -55,12 +55,12 @@ Maximum 1 public comment per cycle
 ## AI request efficiency
 
 - Hard cycle budget: **50 requests**.
-- Batch size is capped at **4**, even if an environment variable is accidentally higher.
+- Batch size is capped at **2**, even if an environment variable is accidentally higher.
 - One retry for a truncated/parse-failed batch.
 - One balanced split only after a failed retry.
 - Split children cannot recursively split again.
-- Retry output is capped at **280 tokens**.
-- Normal output is capped at **420 tokens**.
+- Retry output is capped at **220 tokens**.
+- Normal output is capped at **360 tokens**.
 - Input content is bounded to reduce context pressure.
 - Truncated responses are parsed for complete JSON rows before another request is spent.
 - OpenRouter daily free-tier quota errors stop immediately; retries cannot recover a provider-side daily quota.
@@ -83,7 +83,7 @@ Render uses `backend/render.yaml` and `backend/Dockerfile`. The production conta
 
 ## Verification
 
-The cleaned V39 source is verified with:
+The V42.4 source is verified with:
 
 - pytest
 - Python compilation
@@ -91,3 +91,12 @@ The cleaned V39 source is verified with:
 - ZIP integrity check
 
 The repository intentionally retains only the current production modules and focused tests; superseded V20–V38 README/test copies and duplicate runtime modules are removed.
+
+## V42.4 hard budget contract
+
+- `MOLTBOOK_AI_REQUEST_BUDGET` controls the per-cycle AI request budget.
+- The application clamps this value to **1–50**; configuration can lower the budget but cannot raise it above 50.
+- `ai_requests_used` and `ai_requests_remaining` are returned by the scan endpoint.
+- `ai_retry_batches` and `ai_retry_successes` expose retry behavior for operational telemetry.
+- `MOLTBOOK_AI_BATCH_SIZE` is clamped to **1–2**.
+- The application version is read from `backend/VERSION` so the FastAPI root and health endpoint stay aligned with the release version.

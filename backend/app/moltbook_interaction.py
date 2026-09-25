@@ -34,6 +34,11 @@ elif AI_PROVIDER == "gemini":
     AI_BASE = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
 AI_TIMEOUT = float(os.getenv("RESEARCH_AI_TIMEOUT_SECONDS", "45"))
 
+# V42.4: hard safety ceiling. Environment configuration may lower the budget,
+# but can never raise it above 50 AI requests per scan cycle.
+AI_REQUEST_BUDGET_MAX = 50
+AI_BATCH_SIZE_MAX = 2
+
 TOPICS = tuple(x.strip().lower() for x in os.getenv(
     "MOLTBOOK_INTERACTION_TOPICS",
     "trading,backtest,backtesting,forex,quant,quantitative,research,ai,agent,agents,benchmark,benchmarking,evaluation,experiment,methodology,reproducibility,replication,simulation,evidence,dataset,model,inference,verification,robustness,walk-forward,out-of-sample,risk,drawdown,spread,ea,expert advisor"
@@ -1413,7 +1418,7 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
         prepared.append({"post_id":pid,"author":_author_name(post),"title":title,"content":content[:4200],"heuristic":heuristic})
     if budget is None:
         budget={"limit":50,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
-    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False,"split_used":False,"split_children":0,"ai_requests_used":0,"budget_exhausted":False,"split_depth":split_depth,"incomplete_questions_rejected":0}
+    meta={"provider":AI_PROVIDER,"model":AI_MODEL,"attempted":False,"succeeded":False,"valid_results":0,"error":None,"retry_used":False,"retry_succeeded":False,"split_used":False,"split_children":0,"ai_requests_used":0,"budget_exhausted":False,"split_depth":split_depth,"incomplete_questions_rejected":0}
     if not prepared or not AI_KEY:
         return [(p,heuristics.get(_post_id(p),{})) for p in posts if _post_id(p)],False,None,meta
     def _call_ai(items: list[dict[str, Any]], retry: bool = False):
@@ -1449,6 +1454,7 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
             meta["retry_used"]=True
             try:
                 ai_map=_call_ai(prepared, retry=True)
+                meta["retry_succeeded"]=True
             except Exception as retry_exc:
                 # V30: recursively split after retry. A failed pair is split
                 # into single-post calls, preventing one oversized response from
@@ -1487,6 +1493,7 @@ def _analyze_posts_batch_once(posts: list[dict[str, Any]], recent_texts: list[st
                     meta["succeeded"]=all_ok
                     meta["valid_results"]=sum(int(x.get("valid_results",0)) for x in child_meta)
                     meta["retry_used"]=True
+                    meta["retry_succeeded"]=all(bool(x.get("retry_succeeded")) for x in child_meta) if child_meta else False
                     meta["error"] = None if all_ok else (first_child_err or str(retry_exc))
                     meta["children"]=child_meta
                     meta["ai_requests_used"]=sum(int(x.get("ai_requests_used",0) or 0) for x in child_meta)
@@ -1549,6 +1556,24 @@ def record_ai_feedback(post_id: str, comment_id: str | None, rating: str, confid
     finally: db.close()
 
 
+def _configured_batch_size() -> int:
+    """Return the configured batch size within the V42.4 hard cap."""
+    try:
+        value = int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "1"))
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, min(AI_BATCH_SIZE_MAX, value))
+
+
+def _configured_ai_request_budget() -> int:
+    """Return the per-cycle AI budget within the non-negotiable 50-request cap."""
+    try:
+        value = int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", str(AI_REQUEST_BUDGET_MAX)))
+    except (TypeError, ValueError):
+        value = AI_REQUEST_BUDGET_MAX
+    return max(1, min(AI_REQUEST_BUDGET_MAX, value))
+
+
 def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[str, Any]:
     source, cards, meta=discover_feed(limit=limit)
     me=_self_name()
@@ -1570,12 +1595,11 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         except Exception as exc:
             results.append({"post_id":pid,"status":"read_failed","error":str(exc)})
 
-    # V42.2: default remains 2 for request efficiency.
-    # Operators can lower it to 1 on problematic free-model runs.
     # V42.3: free-router reliability mode defaults to one post per AI request.
-# Operators can still set MOLTBOOK_AI_BATCH_SIZE=2 explicitly.
-    batch_size=max(1, min(2, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "1"))))
-    ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "50")))
+    # Operators can explicitly set batch size 2, but never above the hard cap.
+    batch_size=_configured_batch_size()
+    # V42.4: the cycle budget is hard-capped at 50 even if Render env is set higher.
+    ai_request_budget=_configured_ai_request_budget()
     budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]
     ai_batches_attempted=0; ai_batches_succeeded=0; ai_error=None; ai_valid_results=0; ai_meta=[]
@@ -1612,8 +1636,12 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
         "ai_provider":AI_PROVIDER,
         "ai_model":AI_MODEL,
         "ai_valid_results":ai_valid_results,
+        "ai_retry_batches":sum(1 for x in ai_meta if x.get("retry_used")),
+        "ai_retry_successes":sum(1 for x in ai_meta if x.get("retry_succeeded")),
         "ai_batch_size":batch_size,
+        "ai_batch_size_max":AI_BATCH_SIZE_MAX,
         "ai_request_budget":ai_request_budget,
+        "ai_request_budget_max":AI_REQUEST_BUDGET_MAX,
         "ai_requests_used":int(budget.get("used",0)),
         "ai_requests_remaining":max(0, ai_request_budget-int(budget.get("used",0))),
         "ai_budget_exhausted":bool(budget.get("exhausted")),
