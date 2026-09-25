@@ -189,6 +189,13 @@ v=u for up, d for down, n for no_vote; h=1 or 0; c=0..1; j<=20 chars.
 q must be <=120 characters when present.
 Output shape: {"r":[{"p":"...","s":"i","v":"u","q":"...","c":0.9,"j":"specific","h":0}]}
 For s=o or s=u, use v=n and omit q.
+
+V42.3 FINAL CONTRACT:
+The ONLY allowed response is the JSON object.
+Never emit analysis, reasoning, commentary, safety notices, headings, or explanations.
+For one input post, return exactly one row.
+Keep q and j as short as possible.
+Close all JSON brackets before stopping.
 """
     # Keep the input bounded as well; the model has enough context to anchor a
     # question without reproducing entire long Moltbook posts.
@@ -205,10 +212,26 @@ For s=o or s=u, use v=n and omit q.
     # V42.2: 220 tokens was still too small for some OpenRouter/free
     # models even with only two posts per request.  Keep the JSON compact,
     # but give the provider enough output room to finish the object.
-    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "480")), 480)
+    # V42.3: one-post requests need far less output room.
+# Smaller output reduces free-router wandering/truncation.
+    max_tokens = min(int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "360")), 360)
     if retry:
-        max_tokens = min(max_tokens, 320)
-        system += "\nRETRY MODE: output ONLY compact JSON. q <= 100 chars; j <= 16 chars; one row per post; no explanations; no markdown; no filler."
+        max_tokens = min(max_tokens, 220)
+        system += """\nV42.3 RETRY HARD CONTRACT:
+Return exactly ONE compact JSON object for this ONE post.
+Do not explain your reasoning.
+Do not write analysis.
+Do not write prose before JSON.
+Do not write prose after JSON.
+No markdown.
+No code fence.
+No safety preamble.
+No filler.
+Use exactly the compact schema already specified.
+q <= 100 chars.
+j <= 16 chars.
+If the post is out of scope or uncertain, use s=u/o and v=n and omit q.
+Finish the JSON object completely before stopping."""
 
     if AI_PROVIDER == "openrouter":
         body = json.dumps({
@@ -218,6 +241,7 @@ For s=o or s=u, use v=n and omit q.
                 {"role": "user", "content": user_text},
             ],
             "max_tokens": max_tokens,
+            "temperature": 0,
         }).encode("utf-8")
         endpoint = f"{AI_BASE}/chat/completions"
         request_headers = {
@@ -1548,7 +1572,9 @@ def discover_and_analyze(limit: int = 40, min_relevance: float = 0.30) -> dict[s
 
     # V42.2: default remains 2 for request efficiency.
     # Operators can lower it to 1 on problematic free-model runs.
-    batch_size=max(1, min(2, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "2"))))
+    # V42.3: free-router reliability mode defaults to one post per AI request.
+# Operators can still set MOLTBOOK_AI_BATCH_SIZE=2 explicitly.
+    batch_size=max(1, min(2, int(os.getenv("MOLTBOOK_AI_BATCH_SIZE", "1"))))
     ai_request_budget=max(1, int(os.getenv("MOLTBOOK_AI_REQUEST_BUDGET", "50")))
     budget={"limit":ai_request_budget,"used":0,"exhausted":False,"quota_exhausted":False,"quota_error":None}
     all_pairs=[]
