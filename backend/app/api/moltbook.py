@@ -413,7 +413,92 @@ def _extract_number_words(text: str) -> list[int]:
             continue
         selected.append(item)
     selected.sort(key=lambda x:x[0])
-    return [x[2] for x in selected]
+    values = [x[2] for x in selected]
+
+    # V43.6 normalized-stream fallback:
+    # Some Moltbook challenges split a number word into punctuation-separated
+    # fragments and repeat letters, e.g. "tW/eNn tY ThReE" for "twenty three".
+    # If the strict obfuscated-word matcher cannot recover two numbers, build a
+    # conservative letter-only stream, collapse repeated letters, and look for
+    # number phrases there. This fallback never replaces successful strict
+    # extraction.
+    # V43.6 normalized-stream fallback
+    if len(values) < 2:
+        normalized = re.sub(r"[^A-Za-z]", "", text).lower()
+        collapsed = re.sub(r"(.)\\1+", r"\\1", normalized)
+
+        fallback = []
+
+        def _edit_distance(a: str, b: str, limit: int = 1) -> int:
+            if abs(len(a) - len(b)) > limit:
+                return limit + 1
+            prev = list(range(len(b) + 1))
+            for i, ca in enumerate(a, 1):
+                cur = [i]
+                row_min = i
+                for j, cb in enumerate(b, 1):
+                    cost = 0 if ca == cb else 1
+                    value = min(
+                        cur[-1] + 1,
+                        prev[j] + 1,
+                        prev[j - 1] + cost,
+                    )
+                    cur.append(value)
+                    row_min = min(row_min, value)
+                if row_min > limit:
+                    return limit + 1
+                prev = cur
+            return prev[-1]
+
+        for phrase, value in sorted(
+            _NUMBER_PHRASES.items(),
+            key=lambda kv: (-len(kv[0]), kv[0]),
+        ):
+            target = phrase.replace(" ", "")
+            if not target:
+                continue
+
+            # Exact match first.
+            if target in collapsed:
+                fallback.append((collapsed.find(target), value, phrase))
+                continue
+
+            # Then allow one missing/repeated character caused by obfuscation.
+            window_min = max(1, len(target) - 1)
+            window_max = len(target) + 1
+
+            best = None
+            for width in range(window_min, window_max + 1):
+                for pos in range(0, max(0, len(collapsed) - width + 1)):
+                    candidate = collapsed[pos:pos + width]
+                    distance = _edit_distance(target, candidate, limit=1)
+                    if distance <= 1:
+                        best = (pos, distance, value, phrase)
+                        break
+                if best is not None:
+                    break
+
+            if best is not None:
+                fallback.append((best[0], value, phrase))
+
+        fallback.sort(key=lambda x: x[0])
+
+        used_positions = []
+        fallback_values = []
+
+        for pos, value, phrase in fallback:
+            if any(abs(pos - old_pos) < max(2, len(phrase.replace(" ", "")) // 2)
+                   for old_pos in used_positions):
+                continue
+            used_positions.append(pos)
+            fallback_values.append(value)
+            if len(fallback_values) >= 2:
+                break
+
+        if len(fallback_values) >= 2:
+            values = fallback_values[:2]
+
+    return values
 
 
 _OP_PHRASES = [
