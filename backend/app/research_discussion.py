@@ -53,9 +53,12 @@ def _post_json(url: str, payload: dict[str, Any]) -> str:
             },
         ],
         "max_tokens": min(
-            int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "360")),
-            360,
+            int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "700")),
+            700,
         ),
+        "reasoning": {
+            "max_tokens": 220
+        },
         "response_format": {
             "type": "json_object"
         },
