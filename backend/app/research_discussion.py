@@ -51,9 +51,12 @@ def _post_json(url: str, payload: dict[str, Any]) -> str:
             },
         ],
         "max_tokens": min(
-            int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "700")),
-            700,
+            int(os.getenv("RESEARCH_AI_MAX_OUTPUT_TOKENS", "360")),
+            360,
         ),
+        "response_format": {
+            "type": "json_object"
+        },
     }).encode("utf-8")
 
     req = urllib.request.Request(
