@@ -1,3 +1,4 @@
+from .api import v44_autonomous
 from contextlib import asynccontextmanager
 import threading
 from fastapi import FastAPI
@@ -37,5 +38,6 @@ app.include_router(unified_research.router,prefix="/api")
 app.include_router(moltbook.router,prefix="/api")
 app.include_router(interactions.router,prefix="/api")
 app.include_router(discussion.router, prefix="/api")
+app.include_router(v44_autonomous.router,prefix="/api")
 @app.get("/",tags=["System"])
 def root(): return {"service":settings.app_name,"version":settings.app_version,"status":"running","docs":"/docs","research_flow":["upload","run","inspect","publish"]}

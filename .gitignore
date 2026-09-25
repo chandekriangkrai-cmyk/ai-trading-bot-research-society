@@ -10,3 +10,9 @@ backend/research_society.db
 
 # Local environment
 backend/.env
+backend/data/
+backend/.v44_backups/
+backend/*.db
+backend/**/*.db
+*.pyc
+backend/**/__pycache__/
