@@ -1,5 +1,5 @@
 """
-V44.9 Autonomous Adaptive Engine.
+V44.27 Autonomous Adaptive Engine.
 
 Responsibilities:
 - persistent ON/OFF state
@@ -717,7 +717,7 @@ class V44Engine:
 
             else:
                 raise RuntimeError(
-                    "V44.9 has no adapter for activity: "
+                    "V44.27 has no adapter for activity: "
                     + str(activity)
                 )
 
@@ -987,7 +987,7 @@ class V44Engine:
         now = self.now()
 
         return {
-            "version": "V44.9",
+            "version": "V44.27",
             "enabled": self.enabled,
             "dry_run": DRY_RUN,
             "human_only_top_level_feed_post": True,
@@ -1033,7 +1033,7 @@ class V44Engine:
         )
 
         return {
-            "version": "V44.9",
+            "version": "V44.27",
             "database": "PASS",
             "memory": "PASS",
             "adaptive_engine": "PASS",

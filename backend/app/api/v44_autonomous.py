@@ -57,7 +57,7 @@ def autonomous_status() -> dict[str, Any]:
         }
 
     return {
-        "version": "V44.8",
+        "version": "V44.27",
         "mode": (
             "LIVE"
             if _external_enabled()
@@ -82,7 +82,7 @@ def autonomous_plan() -> dict[str, Any]:
 
         return {
             "status": "planned",
-            "version": "V44.8",
+            "version": "V44.27",
             "external_calls": False,
             "plan": plan,
         }
@@ -91,7 +91,7 @@ def autonomous_plan() -> dict[str, Any]:
 
         return {
             "status": "planning_error",
-            "version": "V44.8",
+            "version": "V44.27",
             "external_calls": False,
             "error": repr(exc),
         }
@@ -235,7 +235,7 @@ def autonomous_self_test() -> dict[str, Any]:
 
         return {
             "status": "completed",
-            "version": "V44.8",
+            "version": "V44.27",
             "external_calls": False,
             "result": result,
         }
@@ -244,7 +244,7 @@ def autonomous_self_test() -> dict[str, Any]:
 
         return {
             "status": "failed",
-            "version": "V44.8",
+            "version": "V44.27",
             "external_calls": False,
             "error": repr(exc),
         }

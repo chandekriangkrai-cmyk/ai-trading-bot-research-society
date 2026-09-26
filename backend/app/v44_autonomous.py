@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "V44.0"
+VERSION = "V44.27"
 
 DAILY_AI_LIMIT = max(
     1,
@@ -1144,10 +1144,14 @@ def status() -> dict[str, Any]:
     return {
         "version": VERSION,
         "agent_mode": os.getenv(
-            "V44_AUTONOMOUS_ENABLED",
-            "false",
-        ).lower()
-        == "true",
+            "V44_ENABLED",
+            "0",
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        },
         "daily_ai_budget": DAILY_AI_LIMIT,
         "budget": budget.snapshot(),
         "replies_today": replies_today(),
