@@ -50,7 +50,7 @@ class V45DailyBatch:
     The batch delegates each cycle to the V44 adaptive execution path.
     """
 
-    VERSION = "V45.5"
+    VERSION = "V45.6"
 
     DEFAULT_MAX_MINUTES = 5
 
