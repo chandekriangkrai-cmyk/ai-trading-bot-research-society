@@ -332,20 +332,38 @@ class V45DailyBatch:
 
     def status(self) -> dict[str, Any]:
         with self.lock:
-            elapsed = (
-                self.elapsed()
-                if self.running
-                else 0.0
-            )
+            if self.running:
+                elapsed = self.elapsed()
+                remaining = self.remaining_seconds()
+            elif self.started_at and self.finished_at:
+                try:
+                    started_dt = datetime.fromisoformat(
+                        self.started_at.replace("Z", "+00:00")
+                    )
+                    finished_dt = datetime.fromisoformat(
+                        self.finished_at.replace("Z", "+00:00")
+                    )
 
-            remaining = (
-                self.remaining_seconds()
-                if self.running
-                else max(
+                    elapsed = max(
+                        0.0,
+                        (
+                            finished_dt - started_dt
+                        ).total_seconds(),
+                    )
+
+                    remaining = max(
+                        0.0,
+                        self.max_seconds - elapsed,
+                    )
+                except Exception:
+                    elapsed = 0.0
+                    remaining = 0.0
+            else:
+                elapsed = 0.0
+                remaining = max(
                     0,
                     self.max_seconds,
                 )
-            )
 
             completed = sum(
                 1
