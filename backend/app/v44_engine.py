@@ -999,6 +999,292 @@ class V44Engine:
                 "error": str(exc),
             }
 
+
+    # ------------------------------------------------------------------
+    # V45 BATCH CYCLE
+    # ------------------------------------------------------------------
+    #
+    # V44 normal worker uses MIN_SECONDS_BETWEEN_CYCLES.
+    #
+    # V45 Daily Batch needs to execute multiple adaptive V44 cycles
+    # inside one bounded five-minute window.
+    #
+    # IMPORTANT:
+    # This method deliberately duplicates ONLY the orchestration of
+    # run_once(). It does NOT duplicate invoke_existing_cycle().
+    #
+    # The V44 activity adapters, AI quota, firewall, memory, reward,
+    # adaptive learning, and failure accounting remain authoritative.
+    # ------------------------------------------------------------------
+
+    def run_once_for_batch(self):
+        """
+        Execute exactly one V44 adaptive cycle for V45.
+
+        This is intentionally separate from run_once() so the normal
+        V44 15-minute cooldown remains unchanged.
+
+        Returns the same high-level result contract as run_once().
+        """
+
+        cycle_started = (
+            datetime.now(timezone.utc).isoformat()
+        )
+
+        self._telemetry_update(
+            last_cycle_started=cycle_started,
+            last_cycle_finished=None,
+            last_cycle_result="running",
+            last_error=None,
+            cycle_count=(
+                self._telemetry.get(
+                    "cycle_count",
+                    0,
+                )
+                + 1
+            ),
+        )
+
+        # --------------------------------------------------------------
+        # CONTROL / SCHEDULE / RESET
+        # --------------------------------------------------------------
+
+        with self.lock:
+
+            now = self.now()
+
+            if not self.enabled:
+                result = {
+                    "status": "stopped",
+                    "batch_mode": True,
+                }
+
+                self._telemetry_update(
+                    last_cycle_finished=(
+                        datetime.now(
+                            timezone.utc
+                        ).isoformat()
+                    ),
+                    last_cycle_result=result,
+                )
+
+                return result
+
+            self.reset_day_if_needed()
+
+            if not self.schedule_allows_run():
+                result = {
+                    "status":
+                        "waiting_for_start_time",
+                    "local_time":
+                        now.isoformat(),
+                    "batch_mode": True,
+                }
+
+                self._telemetry_update(
+                    last_cycle_finished=(
+                        datetime.now(
+                            timezone.utc
+                        ).isoformat()
+                    ),
+                    last_cycle_result=result,
+                )
+
+                return result
+
+        # --------------------------------------------------------------
+        # IMPORTANT:
+        #
+        # There is intentionally NO:
+        #
+        #   MIN_SECONDS_BETWEEN_CYCLES
+        #
+        # check here.
+        #
+        # This is the only behavioral difference from normal V44
+        # run_once() scheduling.
+        # --------------------------------------------------------------
+
+        activity = self.choose_activity()
+
+        started = time.time()
+
+        try:
+
+            result = self.invoke_existing_cycle(
+                activity
+            )
+
+            duration = int(
+                (time.time() - started)
+                * 1000
+            )
+
+            success, useful, reward = (
+                self.calculate_reward(
+                    result
+                )
+            )
+
+            # ----------------------------------------------------------
+            # V44 adaptive learning remains active.
+            # ----------------------------------------------------------
+
+            self.adaptive.learn(
+                activity,
+                success,
+                useful,
+                reward,
+            )
+
+            # ----------------------------------------------------------
+            # V44 activity telemetry remains active.
+            # ----------------------------------------------------------
+
+            self.memory.record_activity(
+                day_key=self.day_key(),
+                hour=self.now().hour,
+                activity=activity,
+                status=result.get(
+                    "status",
+                    "unknown",
+                ),
+                ai_reserved=(
+                    1
+                    if (
+                        not DRY_RUN
+                        and result.get(
+                            "external_call",
+                            False,
+                        )
+                    )
+                    else 0
+                ),
+                duration_ms=duration,
+                details=result,
+            )
+
+            self.memory.update_time_window(
+                hour=self.now().hour,
+                success=success,
+                useful=useful,
+                ai_requests=(
+                    1
+                    if (
+                        not DRY_RUN
+                        and result.get(
+                            "external_call",
+                            False,
+                        )
+                    )
+                    else 0
+                ),
+                replies=0,
+                verified=0,
+                reward=reward,
+            )
+
+            final_result = {
+                "status": "completed",
+                "activity": activity,
+                "result": result,
+                "reward": reward,
+                "duration_ms": duration,
+                "batch_mode": True,
+            }
+
+            self._telemetry_update(
+                last_activity=activity,
+                last_cycle_finished=(
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                ),
+                last_cycle_result=final_result,
+                last_ai_reserved=(
+                    1
+                    if (
+                        not DRY_RUN
+                        and result.get(
+                            "external_call",
+                            False,
+                        )
+                    )
+                    else 0
+                ),
+            )
+
+            return final_result
+
+        except Exception as exc:
+
+            duration = int(
+                (time.time() - started)
+                * 1000
+            )
+
+            # ----------------------------------------------------------
+            # V44 failure accounting.
+            # ----------------------------------------------------------
+
+            self.memory.record_activity(
+                day_key=self.day_key(),
+                hour=self.now().hour,
+                activity=activity,
+                status="failed",
+                ai_reserved=(
+                    1
+                    if (
+                        not DRY_RUN
+                        and result.get(
+                            "ai_reserved",
+                            False,
+                        )
+                    )
+                    else 0
+                ),
+                duration_ms=duration,
+                details={
+                    "error": str(exc),
+                    "batch_mode": True,
+                },
+            )
+
+            self.memory.record_failure(
+                category="AUTONOMOUS_CYCLE",
+                activity=activity,
+                message=str(exc),
+            )
+
+            self.adaptive.learn(
+                activity,
+                False,
+                False,
+                -1.0,
+            )
+
+            final_result = {
+                "status": "failed",
+                "activity": activity,
+                "error": str(exc),
+                "duration_ms": duration,
+                "batch_mode": True,
+            }
+
+            self._telemetry_update(
+                last_activity=activity,
+                last_cycle_finished=(
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                ),
+                last_cycle_result=final_result,
+                last_error=str(exc),
+            )
+
+            return final_result
+
+
     # ------------------------------------------------------------------
     # TICK
     # ------------------------------------------------------------------

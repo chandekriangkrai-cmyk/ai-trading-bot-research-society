@@ -268,3 +268,100 @@ def worker_telemetry():
             "telemetry": {},
             "error": f"{type(exc).__name__}: {exc}",
         }
+
+
+# ============================================================
+# V45 DAILY BATCH
+# ============================================================
+
+@router.post("/daily-batch")
+def v45_daily_batch(force: bool = False):
+    """
+    Start the V45 bounded daily autonomous batch.
+
+    The HTTP request starts the server-side worker and returns.
+    Closing the browser does not stop the batch.
+    """
+
+    try:
+        from app.main import v45_daily_batch_engine
+
+        return v45_daily_batch_engine.start(
+            force=force
+        )
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "version": "V45.0",
+            "error": (
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+
+
+@router.get("/daily-batch/status")
+def v45_daily_batch_status():
+    """
+    Read-only V45 batch telemetry.
+    """
+
+    try:
+        from app.main import v45_daily_batch_engine
+
+        return {
+            "status": "ok",
+            "batch": v45_daily_batch_engine.status(),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "batch": {},
+            "error": (
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+
+
+@router.post("/daily-batch/stop")
+def v45_daily_batch_stop():
+    """
+    Request a safe batch stop.
+    """
+
+    try:
+        from app.main import v45_daily_batch_engine
+
+        return v45_daily_batch_engine.stop()
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": (
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+
+
+@router.post("/daily-batch/reset")
+def v45_daily_batch_reset():
+    """
+    Reset V45 checkpoint when the batch is not running.
+    """
+
+    try:
+        from app.main import v45_daily_batch_engine
+
+        return (
+            v45_daily_batch_engine
+            .reset()
+        )
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": (
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }

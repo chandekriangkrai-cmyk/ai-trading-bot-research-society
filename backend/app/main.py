@@ -12,6 +12,14 @@ from app.v44_engine import V44Engine
 # V44.13 autonomous engine singleton.
 v44_engine = V44Engine()
 
+# V45 Daily Batch Layer.
+# Reuses the existing V44 engine and safety gates.
+from app.v45_daily_batch import V45DailyBatch
+
+v45_daily_batch_engine = V45DailyBatch(
+    v44_engine
+)
+
 
 def _start_v44_worker():
     try:
