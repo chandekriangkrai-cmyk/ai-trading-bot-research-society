@@ -115,6 +115,22 @@ class V44Engine:
 
         self.worker_thread = None
 
+        # V44 worker telemetry.
+        # Read-only diagnostics; does not perform external calls.
+        self._telemetry_lock = threading.Lock()
+        self._telemetry = {
+            "worker_alive": False,
+            "last_worker_tick": None,
+            "last_cycle_started": None,
+            "last_cycle_finished": None,
+            "last_activity": None,
+            "last_cycle_result": None,
+            "last_error": None,
+            "last_ai_reserved": 0,
+            "cycle_count": 0,
+            "error_count": 0,
+        }
+
         # Environment is authoritative at startup.
         # A stale SQLite value must NEVER re-enable production.
         self.enabled = bool(V44_ENABLED_DEFAULT)
@@ -221,6 +237,25 @@ class V44Engine:
     # ------------------------------------------------------------------
     # THREAD
     # ------------------------------------------------------------------
+
+    def _telemetry_update(self, **kwargs):
+        try:
+            with self._telemetry_lock:
+                self._telemetry.update(kwargs)
+        except Exception:
+            pass
+
+    def telemetry(self):
+        try:
+            with self._telemetry_lock:
+                data = dict(self._telemetry)
+        except Exception:
+            data = {}
+        data["worker_thread_alive"] = bool(
+            self.worker_thread is not None
+            and self.worker_thread.is_alive()
+        )
+        return data
 
     def ensure_worker(self):
 
@@ -820,6 +855,14 @@ class V44Engine:
     # ------------------------------------------------------------------
 
     def run_once(self):
+        cycle_started = datetime.now(timezone.utc).isoformat()
+        self._telemetry_update(
+            last_cycle_started=cycle_started,
+            last_cycle_finished=None,
+            last_cycle_result="running",
+            last_error=None,
+            cycle_count=self._telemetry.get("cycle_count", 0) + 1,
+        )
 
         with self.lock:
 
@@ -961,6 +1004,10 @@ class V44Engine:
     # ------------------------------------------------------------------
 
     def tick(self):
+        self._telemetry_update(
+            last_worker_tick=datetime.now(timezone.utc).isoformat(),
+            worker_alive=True,
+        )
 
         self.reset_day_if_needed()
 

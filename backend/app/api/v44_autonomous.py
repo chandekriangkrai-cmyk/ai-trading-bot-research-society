@@ -248,3 +248,23 @@ def autonomous_self_test() -> dict[str, Any]:
             "external_calls": False,
             "error": repr(exc),
         }
+
+
+@router.get("/worker-telemetry")
+def worker_telemetry():
+    """
+    Read-only V44 worker diagnostics.
+    No AI request. No Moltbook request. No external call.
+    """
+    try:
+        from app.main import v44_engine
+        return {
+            "status": "ok",
+            "telemetry": v44_engine.telemetry(),
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "telemetry": {},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
