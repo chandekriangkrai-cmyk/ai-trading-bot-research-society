@@ -287,6 +287,12 @@ class V44Engine:
 
             except Exception as exc:
 
+                self._telemetry_update(
+                    worker_alive=True,
+                    last_error=str(exc),
+                    last_cycle_result="worker_error",
+                )
+
                 self.memory.record_failure(
                     category="ENGINE_TICK",
                     message=str(exc),
@@ -296,6 +302,11 @@ class V44Engine:
             self.stop_event.wait(
                 30
             )
+
+        self._telemetry_update(
+            worker_alive=False,
+            last_cycle_result="stopped",
+        )
 
     # ------------------------------------------------------------------
     # DAILY RESET
@@ -859,9 +870,8 @@ class V44Engine:
         self._telemetry_update(
             last_cycle_started=cycle_started,
             last_cycle_finished=None,
-            last_cycle_result="running",
+            last_cycle_result="checking",
             last_error=None,
-            cycle_count=self._telemetry.get("cycle_count", 0) + 1,
         )
 
         with self.lock:
@@ -869,6 +879,12 @@ class V44Engine:
             now = self.now()
 
             if not self.enabled:
+                self._telemetry_update(
+                    last_cycle_finished=datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    last_cycle_result="stopped",
+                )
                 return {
                     "status": "stopped"
                 }
@@ -876,6 +892,12 @@ class V44Engine:
             self.reset_day_if_needed()
 
             if not self.schedule_allows_run():
+                self._telemetry_update(
+                    last_cycle_finished=datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    last_cycle_result="waiting_for_start_time",
+                )
                 return {
                     "status": "waiting_for_start_time",
                     "local_time":
@@ -887,6 +909,12 @@ class V44Engine:
                 - self.last_cycle_ts
                 < MIN_SECONDS_BETWEEN_CYCLES
             ):
+                self._telemetry_update(
+                    last_cycle_finished=datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    last_cycle_result="cooldown",
+                )
                 return {
                     "status": "cooldown"
                 }
@@ -895,6 +923,15 @@ class V44Engine:
 
         activity = (
             self.choose_activity()
+        )
+
+        self._telemetry_update(
+            last_activity=activity,
+            last_cycle_result="running",
+            cycle_count=self._telemetry.get(
+                "cycle_count",
+                0,
+            ) + 1,
         )
 
         started = time.time()
@@ -952,6 +989,14 @@ class V44Engine:
                 reward=reward,
             )
 
+            self._telemetry_update(
+                last_cycle_finished=datetime.now(
+                    timezone.utc
+                ).isoformat(),
+                last_cycle_result="completed",
+                last_error=None,
+            )
+
             return {
                 "status": "completed",
                 "activity": activity,
@@ -991,6 +1036,14 @@ class V44Engine:
                 False,
                 False,
                 -1.0,
+            )
+
+            self._telemetry_update(
+                last_cycle_finished=datetime.now(
+                    timezone.utc
+                ).isoformat(),
+                last_cycle_result="failed",
+                last_error=str(exc),
             )
 
             return {
