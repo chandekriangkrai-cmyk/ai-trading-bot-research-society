@@ -1381,7 +1381,7 @@ class V44Engine:
             "local_time": now.isoformat(),
             "timezone": TIMEZONE,
             "daily_reset": "07:00",
-            "autonomous_start": "07:10",
+            "autonomous_start": "00:00",
             "ai_budget": self.budget(),
             "max_replies_per_day":
                 MAX_REPLIES_PER_DAY,

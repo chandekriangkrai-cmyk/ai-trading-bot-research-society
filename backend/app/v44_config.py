@@ -100,15 +100,19 @@ MAX_RETRY_ATTEMPTS = max(
 # ---------------------------------------------------------------------------
 # SCHEDULE
 # Thailand = UTC+7
-# 07:00 Thailand = 00:00 UTC
-# 07:10 Thailand = 00:10 UTC
+#
+# Autonomous activity window:
+# 00:00 Thailand -> 00:00 Thailand next day
+#
+# Daily AI budget reset remains separate at 07:00 Thailand,
+# matching the existing provider-day accounting.
 # ---------------------------------------------------------------------------
 
 RESET_HOUR = 7
 RESET_MINUTE = 0
 
-START_HOUR = 7
-START_MINUTE = 10
+START_HOUR = 0
+START_MINUTE = 0
 
 TIMEZONE = os.getenv(
     "V44_TIMEZONE",
