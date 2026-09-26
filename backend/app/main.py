@@ -55,6 +55,11 @@ async def lifespan(app: FastAPI):
     t.start()
     discussion_watcher.start_if_enabled()
     discussion_watcher.start_interaction_if_enabled()
+
+    # V44 autonomous worker startup.
+    # Environment V44_ENABLED remains the authoritative master switch.
+    _start_v44_worker()
+
     yield
 
 app=FastAPI(title=settings.app_name,version=settings.app_version,description="Unified EA + MT5 Backtest Research Engine",lifespan=lifespan)
