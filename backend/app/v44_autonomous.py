@@ -308,17 +308,23 @@ class DailyBudget:
             )
 
     def reserve(self, amount: int = 1) -> None:
+        """
+        Atomically reserve AI quota.
+
+        A reservation is made BEFORE the external AI request.
+        The SQL UPDATE itself enforces the hard daily limit,
+        preventing concurrent callers from overspending quota.
+        """
+
         amount = int(amount)
 
         if amount <= 0:
             return True
 
-        today = self.today()
+        today = _utc_day()
 
-        conn = sqlite3.connect(self.db_path)
-
-        try:
-            self._ensure(conn)
+        with _connect() as conn:
+            self._ensure_row(conn)
 
             cur = conn.execute(
                 """
@@ -337,6 +343,7 @@ class DailyBudget:
 
             if cur.rowcount != 1:
                 conn.rollback()
+
                 raise BudgetExhausted(
                     "Daily AI budget exhausted or "
                     "reservation rejected: "
@@ -344,10 +351,8 @@ class DailyBudget:
                 )
 
             conn.commit()
-            return True
 
-        finally:
-            conn.close()
+            return True
 
     def complete(self) -> None:
         with _connect() as conn:
